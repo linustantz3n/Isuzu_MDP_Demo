@@ -37,6 +37,10 @@ import argparse
 import requests
 from typing import List, Dict, Tuple
 from itertools import permutations
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 # =============================================================================

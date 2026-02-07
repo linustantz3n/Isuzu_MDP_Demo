@@ -20,6 +20,10 @@ from itertools import permutations
 from functools import lru_cache
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -147,33 +151,44 @@ def get_directions(locations: list, order: list) -> dict:
 # TSP Solvers
 # =============================================================================
 
-def solve_tsp_brute_force(matrix: list) -> dict:
+def solve_tsp_brute_force(matrix: list, return_to_start: bool = False) -> dict:
     """
     Solve TSP by checking all permutations.
     Only practical for n <= 10.
-    
+
     Returns optimal order and distance (starting from index 0).
+
+    Args:
+        matrix: Distance/time matrix
+        return_to_start: If True, adds return cost to start
     """
     n = len(matrix)
     if n <= 1:
         return {"order": [0], "cost": 0, "algorithm": "brute_force"}
     if n == 2:
-        return {"order": [0, 1], "cost": matrix[0][1], "algorithm": "brute_force"}
-    
+        cost = matrix[0][1]
+        if return_to_start:
+            cost += matrix[1][0]
+        return {"order": [0, 1], "cost": cost, "algorithm": "brute_force"}
+
     # Generate all permutations of nodes 1 to n-1 (keeping 0 as start)
     other_nodes = list(range(1, n))
-    
+
     best_order = None
     best_cost = float('inf')
-    
+
     for perm in permutations(other_nodes):
         order = [0] + list(perm)
         cost = sum(matrix[order[i]][order[i+1]] for i in range(len(order)-1))
-        
+
+        # Add return cost if closed TSP
+        if return_to_start:
+            cost += matrix[order[-1]][order[0]]
+
         if cost < best_cost:
             best_cost = cost
             best_order = order
-    
+
     return {
         "order": best_order,
         "cost": best_cost,
@@ -181,21 +196,28 @@ def solve_tsp_brute_force(matrix: list) -> dict:
     }
 
 
-def solve_tsp_held_karp(matrix: list) -> dict:
+def solve_tsp_held_karp(matrix: list, return_to_start: bool = False) -> dict:
     """
     Solve TSP using Held-Karp dynamic programming algorithm.
     Optimal solution in O(n^2 * 2^n) time.
     Practical for n <= 20.
+
+    Args:
+        matrix: Distance/time matrix
+        return_to_start: If True, finds closed TSP (return to start). If False, open TSP.
     """
     n = len(matrix)
     if n <= 1:
         return {"order": [0], "cost": 0, "algorithm": "held_karp"}
     if n == 2:
-        return {"order": [0, 1], "cost": matrix[0][1], "algorithm": "held_karp"}
-    
+        cost = matrix[0][1]
+        if return_to_start:
+            cost += matrix[1][0]
+        return {"order": [0, 1], "cost": cost, "algorithm": "held_karp"}
+
     # For small n, brute force is simpler
     if n <= 8:
-        result = solve_tsp_brute_force(matrix)
+        result = solve_tsp_brute_force(matrix, return_to_start)
         result["algorithm"] = "held_karp (via brute_force)"
         return result
     
@@ -227,15 +249,25 @@ def solve_tsp_held_karp(matrix: list) -> dict:
                     dp[new_mask][next_node] = new_cost
                     parent[new_mask][next_node] = last
     
-    # Find best ending node (open TSP - no return to start)
+    # Find best ending node
     full_mask = (1 << n) - 1
     best_cost = INF
     best_end = -1
-    
-    for i in range(1, n):
-        if dp[full_mask][i] < best_cost:
-            best_cost = dp[full_mask][i]
-            best_end = i
+
+    if return_to_start:
+        # Closed TSP: must return to start (node 0)
+        # Find minimum cost to visit all nodes and return to 0
+        for i in range(1, n):
+            cost_with_return = dp[full_mask][i] + matrix[i][0]
+            if cost_with_return < best_cost:
+                best_cost = cost_with_return
+                best_end = i
+    else:
+        # Open TSP: end at best node (no return)
+        for i in range(1, n):
+            if dp[full_mask][i] < best_cost:
+                best_cost = dp[full_mask][i]
+                best_end = i
     
     # Reconstruct path
     order = []
@@ -414,7 +446,8 @@ def optimize_route():
     locations = data.get('locations', [])
     mode = data.get('mode', 'distance')
     algorithms = data.get('algorithms', ['held_karp', 'nearest_neighbor', '2opt'])
-    
+    return_to_start = data.get('return_to_start', False)  # Closed TSP mode
+
     if len(locations) < 2:
         return jsonify({"status": "error", "message": "Need at least 2 locations"}), 400
     
@@ -431,7 +464,7 @@ def optimize_route():
         
         if 'held_karp' in algorithms or 'optimal' in algorithms:
             start = time.time()
-            results['optimal'] = solve_tsp_held_karp(matrix)
+            results['optimal'] = solve_tsp_held_karp(matrix, return_to_start)
             results['optimal']['solve_time_ms'] = (time.time() - start) * 1000
         
         if 'nearest_neighbor' in algorithms or 'greedy' in algorithms:
@@ -447,25 +480,31 @@ def optimize_route():
         # Calculate full metrics for each result
         for key, result in results.items():
             order = result['order']
-            
+
             # Calculate both distance and time for the route
             total_distance = sum(
-                matrices['distance'][order[i]][order[i+1]] 
+                matrices['distance'][order[i]][order[i+1]]
                 for i in range(len(order)-1)
             )
             total_time = sum(
-                matrices['time'][order[i]][order[i+1]] 
+                matrices['time'][order[i]][order[i+1]]
                 for i in range(len(order)-1)
             )
-            
+
+            # Add return to start if in depot mode
+            if return_to_start:
+                total_distance += matrices['distance'][order[-1]][order[0]]
+                total_time += matrices['time'][order[-1]][order[0]]
+
             result['total_distance_m'] = total_distance
             result['total_distance_mi'] = total_distance / 1609.34
             result['total_time_s'] = total_time
             result['total_time_min'] = total_time / 60
-            
+            result['return_to_start'] = return_to_start
+
             # Build ordered locations list
             result['ordered_locations'] = [locations[i] for i in order]
-            
+
             # Build leg-by-leg breakdown
             legs = []
             for i in range(len(order) - 1):
@@ -477,6 +516,19 @@ def optimize_route():
                     "time_s": matrices['time'][order[i]][order[i+1]],
                     "time_min": matrices['time'][order[i]][order[i+1]] / 60
                 })
+
+            # Add return leg if depot mode
+            if return_to_start:
+                legs.append({
+                    "from": locations[order[-1]],
+                    "to": locations[order[0]],
+                    "distance_m": matrices['distance'][order[-1]][order[0]],
+                    "distance_mi": matrices['distance'][order[-1]][order[0]] / 1609.34,
+                    "time_s": matrices['time'][order[-1]][order[0]],
+                    "time_min": matrices['time'][order[-1]][order[0]] / 60,
+                    "return_leg": True
+                })
+
             result['legs'] = legs
         
         # Calculate savings if we have both optimal and greedy
@@ -501,8 +553,16 @@ def optimize_route():
         for key in results:
             ordered = results[key]['ordered_locations']
             origin = f"{ordered[0]['lat']},{ordered[0]['lng']}"
-            dest = f"{ordered[-1]['lat']},{ordered[-1]['lng']}"
-            waypoints = "|".join(f"{loc['lat']},{loc['lng']}" for loc in ordered[1:-1])
+
+            if return_to_start:
+                # Closed loop: last destination is back to start
+                dest = origin
+                # All locations are waypoints (except first which is origin)
+                waypoints = "|".join(f"{loc['lat']},{loc['lng']}" for loc in ordered[1:])
+            else:
+                # Open route: end at last location
+                dest = f"{ordered[-1]['lat']},{ordered[-1]['lng']}"
+                waypoints = "|".join(f"{loc['lat']},{loc['lng']}" for loc in ordered[1:-1])
 
             maps_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}"
             if waypoints:
