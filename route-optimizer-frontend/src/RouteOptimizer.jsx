@@ -27,6 +27,11 @@ function RouteOptimizer() {
   const [validating, setValidating] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
+  const [energyParams, setEnergyParams] = useState({
+    temperature_c: 20,
+    vehicle_weight_tonnes: 7.0,
+    has_climate_control: true
+  });
 
   const loadDemoAddresses = () => {
     setAddresses(DEMO_ADDRESSES);
@@ -164,7 +169,8 @@ function RouteOptimizer() {
         body: JSON.stringify({
           locations: locationsToOptimize,
           mode: 'distance',
-          return_to_start: useDepot  // Return to depot if using depot mode
+          return_to_start: useDepot,  // Return to depot if using depot mode
+          energy_params: energyParams  // Include energy model parameters
         })
       });
 
@@ -265,6 +271,79 @@ function RouteOptimizer() {
                   )}
                 </div>
               )}
+            </div>
+
+            {/* Energy Parameters Section */}
+            <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
+              <h2 className="text-lg font-semibold text-white mb-4">
+                Energy Model (Mercedes eActros)
+              </h2>
+
+              <div className="space-y-4">
+                {/* Temperature */}
+                <div>
+                  <div className="flex justify-between mb-2">
+                    <label className="text-sm text-slate-300">Temperature</label>
+                    <span className="text-sm text-slate-400">
+                      {energyParams.temperature_c}°C ({(energyParams.temperature_c * 9/5 + 32).toFixed(0)}°F)
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="-10"
+                    max="40"
+                    value={energyParams.temperature_c}
+                    onChange={(e) => setEnergyParams({...energyParams, temperature_c: parseInt(e.target.value)})}
+                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-yellow-500"
+                  />
+                  <div className="flex justify-between text-xs text-slate-500 mt-1">
+                    <span>-10°C</span>
+                    <span>40°C</span>
+                  </div>
+                </div>
+
+                {/* Vehicle Weight */}
+                <div>
+                  <div className="flex justify-between mb-2">
+                    <label className="text-sm text-slate-300">Vehicle Weight</label>
+                    <span className="text-sm text-slate-400">
+                      {energyParams.vehicle_weight_tonnes} tonnes ({(energyParams.vehicle_weight_tonnes * 2204.62).toFixed(0)} lbs)
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="3"
+                    max="15"
+                    step="0.5"
+                    value={energyParams.vehicle_weight_tonnes}
+                    onChange={(e) => setEnergyParams({...energyParams, vehicle_weight_tonnes: parseFloat(e.target.value)})}
+                    className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-yellow-500"
+                  />
+                  <div className="flex justify-between text-xs text-slate-500 mt-1">
+                    <span>3t (Light)</span>
+                    <span>15t (Heavy)</span>
+                  </div>
+                </div>
+
+                {/* Climate Control */}
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-slate-300">Climate Control (HVAC)</label>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={energyParams.has_climate_control}
+                      onChange={(e) => setEnergyParams({...energyParams, has_climate_control: e.target.checked})}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-yellow-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-yellow-500"></div>
+                  </label>
+                </div>
+              </div>
+
+              <div className="mt-4 p-3 bg-slate-700/50 rounded-lg text-xs text-slate-400">
+                <p>Energy model based on real-world Mercedes eActros study (R²=0.474)</p>
+                <p className="mt-1">Accounts for speed, temperature, weight, elevation & climate control</p>
+              </div>
             </div>
 
             {/* Delivery Stops Section */}
@@ -420,6 +499,20 @@ function RouteOptimizer() {
                       <span className="text-slate-400">Total Time:</span>
                       <span className="text-white font-semibold">{formatTime(results.optimal.total_time_s)}</span>
                     </div>
+                    {results.optimal.total_energy_kwh !== undefined && (
+                      <>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-slate-400">Total Energy:</span>
+                          <span className="text-yellow-400 font-semibold">{results.optimal.total_energy_kwh.toFixed(2)} kWh</span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-slate-400">Efficiency:</span>
+                          <span className="text-yellow-400 font-semibold">
+                            {(results.optimal.total_distance_mi / results.optimal.total_energy_kwh).toFixed(2)} mi/kWh
+                          </span>
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   <a
@@ -450,6 +543,20 @@ function RouteOptimizer() {
                         <span className="text-slate-400">Total Time:</span>
                         <span className="text-white font-semibold">{formatTime(results.greedy.total_time_s)}</span>
                       </div>
+                      {results.greedy.total_energy_kwh !== undefined && (
+                        <>
+                          <div className="flex justify-between text-sm">
+                            <span className="text-slate-400">Total Energy:</span>
+                            <span className="text-yellow-400 font-semibold">{results.greedy.total_energy_kwh.toFixed(2)} kWh</span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span className="text-slate-400">Efficiency:</span>
+                            <span className="text-yellow-400 font-semibold">
+                              {(results.greedy.total_distance_mi / results.greedy.total_energy_kwh).toFixed(2)} mi/kWh
+                            </span>
+                          </div>
+                        </>
+                      )}
                     </div>
 
                     <a
@@ -484,6 +591,14 @@ function RouteOptimizer() {
                           {formatTime(results.comparison.time_saved_s)} ({results.comparison.time_saved_percent.toFixed(1)}%)
                         </span>
                       </div>
+                      {results.comparison.energy_saved_kwh !== undefined && (
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Energy Saved:</span>
+                          <span className="text-green-400 font-semibold">
+                            {results.comparison.energy_saved_kwh.toFixed(2)} kWh ({results.comparison.energy_saved_percent.toFixed(1)}%)
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

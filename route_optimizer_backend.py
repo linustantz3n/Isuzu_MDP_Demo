@@ -147,6 +147,128 @@ def get_directions(locations: list, order: list) -> dict:
     return response.json()
 
 
+def get_elevation_data(locations: list) -> list:
+    """
+    Get elevation data for a list of locations using Google Elevation API.
+
+    Args:
+        locations: List of dicts with 'lat' and 'lng' keys
+
+    Returns:
+        List of elevations in meters (same order as input)
+    """
+    coords = "|".join([f"{loc['lat']},{loc['lng']}" for loc in locations])
+
+    url = "https://maps.googleapis.com/maps/api/elevation/json"
+    params = {
+        "locations": coords,
+        "key": GOOGLE_API_KEY
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    if data["status"] != "OK":
+        # If elevation API fails, return zeros (graceful degradation)
+        return [0.0] * len(locations)
+
+    return [result["elevation"] for result in data["results"]]
+
+
+# =============================================================================
+# Energy Consumption Model (Based on Mercedes eActros Study)
+# =============================================================================
+
+def calculate_energy_consumption_mercedes(
+    distance_km: float,
+    avg_speed_kmh: float,
+    temperature_c: float,
+    vehicle_weight_tonnes: float,
+    altitude_diff_m: float,
+    has_climate_control: bool = True
+) -> dict:
+    """
+    Calculate energy consumption using Mercedes eActros validated regression model.
+
+    Model: Ĉ = m₁·e^(-k₁·s) + m₂·t + m₃·w + m₄·a + m₅
+
+    Based on real-world study of 19 Mercedes eActros trucks (5,431 data points)
+    R² = 0.474, validated within -1.03% of manufacturer specs
+
+    Args:
+        distance_km: Distance traveled in kilometers
+        avg_speed_kmh: Average speed in km/h
+        temperature_c: Ambient temperature in Celsius
+        vehicle_weight_tonnes: Total vehicle weight (curb + cargo) in tonnes
+        altitude_diff_m: Altitude difference (positive = uphill, negative = downhill)
+        has_climate_control: Whether temperature control unit (TCU) is active
+
+    Returns:
+        Dict with energy consumption metrics
+    """
+    # Mercedes eActros regression coefficients (from study)
+    m1 = 5.1304  # Speed exponential coefficient
+    k1 = 0.104   # Speed decay constant
+    m2 = -0.0132 # Temperature coefficient (kWh/km per °C)
+    m3 = 0.0183  # Weight coefficient (kWh/km per tonne)
+    m4 = 0.0015  # Altitude coefficient (kWh/km per meter)
+    m5 = 0.7091  # Constant term
+
+    # Calculate energy consumption per km
+    speed_term = m1 * math.exp(-k1 * avg_speed_kmh)
+    temp_term = m2 * temperature_c
+    weight_term = m3 * vehicle_weight_tonnes
+    altitude_term = m4 * altitude_diff_m
+
+    energy_per_km = speed_term + temp_term + weight_term + altitude_term + m5
+
+    # Add climate control overhead if active
+    if has_climate_control:
+        energy_per_km += 0.092  # kWh/km
+
+    # Total energy for the segment
+    total_energy_kwh = energy_per_km * distance_km
+
+    # Calculate equivalent miles per kWh (for comparison)
+    miles = distance_km * 0.621371
+    miles_per_kwh = miles / total_energy_kwh if total_energy_kwh > 0 else 0
+
+    return {
+        "energy_kwh": total_energy_kwh,
+        "energy_per_km": energy_per_km,
+        "energy_per_mile": energy_per_km / 0.621371,
+        "miles_per_kwh": miles_per_kwh,
+        "kwh_per_mile": 1 / miles_per_kwh if miles_per_kwh > 0 else 0,
+        "breakdown": {
+            "speed_component_kwh": speed_term * distance_km,
+            "temperature_component_kwh": temp_term * distance_km,
+            "weight_component_kwh": weight_term * distance_km,
+            "altitude_component_kwh": altitude_term * distance_km,
+            "climate_control_kwh": 0.092 * distance_km if has_climate_control else 0,
+            "base_constant_kwh": m5 * distance_km
+        }
+    }
+
+
+def estimate_average_speed(distance_m: float, time_s: float) -> float:
+    """
+    Estimate average speed from distance and time.
+
+    Args:
+        distance_m: Distance in meters
+        time_s: Time in seconds
+
+    Returns:
+        Average speed in km/h
+    """
+    if time_s == 0:
+        return 0.0
+
+    distance_km = distance_m / 1000
+    time_h = time_s / 3600
+    return distance_km / time_h
+
+
 # =============================================================================
 # TSP Solvers
 # =============================================================================
@@ -458,7 +580,16 @@ def optimize_route():
         # Get distance matrix from Google
         matrices = get_distance_matrix(locations)
         matrix = matrices['distance'] if mode == 'distance' else matrices['time']
-        
+
+        # Get elevation data for energy calculations
+        elevations = get_elevation_data(locations)
+
+        # Extract energy model parameters from request (with defaults)
+        energy_params = data.get('energy_params', {})
+        temperature_c = energy_params.get('temperature_c', 20.0)  # Default 20°C
+        vehicle_weight_tonnes = energy_params.get('vehicle_weight_tonnes', 7.0)  # Default ~7 tonnes (ISUZU medium truck)
+        has_climate_control = energy_params.get('has_climate_control', True)
+
         # Run requested algorithms
         results = {}
         
@@ -505,31 +636,102 @@ def optimize_route():
             # Build ordered locations list
             result['ordered_locations'] = [locations[i] for i in order]
 
-            # Build leg-by-leg breakdown
+            # Build leg-by-leg breakdown with energy calculations
             legs = []
+            total_energy_kwh = 0
+
             for i in range(len(order) - 1):
+                from_idx = order[i]
+                to_idx = order[i+1]
+
+                distance_m = matrices['distance'][from_idx][to_idx]
+                time_s = matrices['time'][from_idx][to_idx]
+                distance_km = distance_m / 1000
+
+                # Calculate average speed for this leg
+                avg_speed_kmh = estimate_average_speed(distance_m, time_s)
+
+                # Calculate altitude difference
+                altitude_diff_m = elevations[to_idx] - elevations[from_idx]
+
+                # Calculate energy consumption for this leg
+                energy_data = calculate_energy_consumption_mercedes(
+                    distance_km=distance_km,
+                    avg_speed_kmh=avg_speed_kmh,
+                    temperature_c=temperature_c,
+                    vehicle_weight_tonnes=vehicle_weight_tonnes,
+                    altitude_diff_m=altitude_diff_m,
+                    has_climate_control=has_climate_control
+                )
+
+                total_energy_kwh += energy_data['energy_kwh']
+
                 legs.append({
-                    "from": locations[order[i]],
-                    "to": locations[order[i+1]],
-                    "distance_m": matrices['distance'][order[i]][order[i+1]],
-                    "distance_mi": matrices['distance'][order[i]][order[i+1]] / 1609.34,
-                    "time_s": matrices['time'][order[i]][order[i+1]],
-                    "time_min": matrices['time'][order[i]][order[i+1]] / 60
+                    "from": locations[from_idx],
+                    "to": locations[to_idx],
+                    "distance_m": distance_m,
+                    "distance_mi": distance_m / 1609.34,
+                    "distance_km": distance_km,
+                    "time_s": time_s,
+                    "time_min": time_s / 60,
+                    "avg_speed_kmh": avg_speed_kmh,
+                    "avg_speed_mph": avg_speed_kmh * 0.621371,
+                    "elevation_from_m": elevations[from_idx],
+                    "elevation_to_m": elevations[to_idx],
+                    "elevation_gain_m": altitude_diff_m,
+                    "energy_kwh": energy_data['energy_kwh'],
+                    "energy_per_km": energy_data['energy_per_km'],
+                    "energy_per_mile": energy_data['energy_per_mile'],
+                    "energy_breakdown": energy_data['breakdown']
                 })
 
             # Add return leg if depot mode
             if return_to_start:
+                from_idx = order[-1]
+                to_idx = order[0]
+
+                distance_m = matrices['distance'][from_idx][to_idx]
+                time_s = matrices['time'][from_idx][to_idx]
+                distance_km = distance_m / 1000
+
+                avg_speed_kmh = estimate_average_speed(distance_m, time_s)
+                altitude_diff_m = elevations[to_idx] - elevations[from_idx]
+
+                energy_data = calculate_energy_consumption_mercedes(
+                    distance_km=distance_km,
+                    avg_speed_kmh=avg_speed_kmh,
+                    temperature_c=temperature_c,
+                    vehicle_weight_tonnes=vehicle_weight_tonnes,
+                    altitude_diff_m=altitude_diff_m,
+                    has_climate_control=has_climate_control
+                )
+
+                total_energy_kwh += energy_data['energy_kwh']
+
                 legs.append({
-                    "from": locations[order[-1]],
-                    "to": locations[order[0]],
-                    "distance_m": matrices['distance'][order[-1]][order[0]],
-                    "distance_mi": matrices['distance'][order[-1]][order[0]] / 1609.34,
-                    "time_s": matrices['time'][order[-1]][order[0]],
-                    "time_min": matrices['time'][order[-1]][order[0]] / 60,
+                    "from": locations[from_idx],
+                    "to": locations[to_idx],
+                    "distance_m": distance_m,
+                    "distance_mi": distance_m / 1609.34,
+                    "distance_km": distance_km,
+                    "time_s": time_s,
+                    "time_min": time_s / 60,
+                    "avg_speed_kmh": avg_speed_kmh,
+                    "avg_speed_mph": avg_speed_kmh * 0.621371,
+                    "elevation_from_m": elevations[from_idx],
+                    "elevation_to_m": elevations[to_idx],
+                    "elevation_gain_m": altitude_diff_m,
+                    "energy_kwh": energy_data['energy_kwh'],
+                    "energy_per_km": energy_data['energy_per_km'],
+                    "energy_per_mile": energy_data['energy_per_mile'],
+                    "energy_breakdown": energy_data['breakdown'],
                     "return_leg": True
                 })
 
             result['legs'] = legs
+            result['total_energy_kwh'] = total_energy_kwh
+            result['avg_energy_per_km'] = total_energy_kwh / (result['total_distance_m'] / 1000) if result['total_distance_m'] > 0 else 0
+            result['avg_energy_per_mile'] = total_energy_kwh / result['total_distance_mi'] if result['total_distance_mi'] > 0 else 0
         
         # Calculate savings if we have both optimal and greedy
         comparison = {}
@@ -547,6 +749,11 @@ def optimize_route():
                     (results['greedy']['total_time_s'] - results['optimal']['total_time_s']) /
                     results['greedy']['total_time_s'] * 100
                 ) if results['greedy']['total_time_s'] > 0 else 0,
+                "energy_saved_kwh": results['greedy']['total_energy_kwh'] - results['optimal']['total_energy_kwh'],
+                "energy_saved_percent": (
+                    (results['greedy']['total_energy_kwh'] - results['optimal']['total_energy_kwh']) /
+                    results['greedy']['total_energy_kwh'] * 100
+                ) if results['greedy']['total_energy_kwh'] > 0 else 0,
             }
         
         # Generate Google Maps URLs for all routes
@@ -576,6 +783,14 @@ def optimize_route():
             "num_locations": len(locations),
             "results": results,
             "comparison": comparison,
+            "energy_params": {
+                "temperature_c": temperature_c,
+                "temperature_f": temperature_c * 9/5 + 32,
+                "vehicle_weight_tonnes": vehicle_weight_tonnes,
+                "vehicle_weight_lbs": vehicle_weight_tonnes * 2204.62,
+                "has_climate_control": has_climate_control,
+                "model": "Mercedes eActros (validated, R²=0.474)"
+            },
             "matrices": {
                 "distance": matrices['distance'],
                 "time": matrices['time']
