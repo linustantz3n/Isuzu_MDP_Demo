@@ -1,6 +1,20 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pem
+
+# Environment
 .env
+.env.local
+
+# Logs
 *.log
+
+# OS
 .DS_Store
+
+# Frontend build (deploy separately)
+route-optimizer-frontend/build/
+route-optimizer-frontend/node_modules/

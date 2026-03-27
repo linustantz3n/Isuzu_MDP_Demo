@@ -289,3 +289,4 @@ When comparing your advanced routing against this baseline:
 - **Single vehicle:** Does not handle fleet assignment (VRP)
 
 These limitations are intentional - this is a **baseline**. Your project extends beyond these constraints.
+# Isuzu_MDP_Demo
