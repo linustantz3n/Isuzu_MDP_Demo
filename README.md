@@ -121,6 +121,7 @@ python route_optimizer_backend.py
 | `/api/geocode_batch` | POST | Geocode multiple addresses |
 | `/api/optimize` | POST | **Main endpoint** - optimize route |
 | `/api/directions` | POST | Get turn-by-turn directions |
+| `/api/replan_leg` | POST | Reroute one leg around a simulated accident (demo) |
 
 **Example - Optimize Route:**
 ```bash
@@ -275,8 +276,8 @@ When comparing your advanced routing against this baseline:
 - Python 3.8+
 - Google Maps API key with:
   - Geocoding API
-  - Distance Matrix API
-  - Directions API
+  - Routes API (replaces the legacy Distance Matrix and Directions APIs)
+  - Elevation API (used by the energy model)
 - Python packages: `requests`, `flask`, `flask-cors`
 
 ---

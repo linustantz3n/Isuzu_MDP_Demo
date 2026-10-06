@@ -50,7 +50,8 @@ def geocode_address(address: str) -> dict:
     data = response.json()
     
     if data["status"] != "OK":
-        raise Exception(f"Geocoding failed for '{address}': {data['status']}")
+        detail = f" ({data['error_message']})" if data.get("error_message") else ""
+        raise Exception(f"Geocoding failed for '{address}': {data['status']}{detail}")
     
     result = data["results"][0]
     location = result["geometry"]["location"]
@@ -67,8 +68,9 @@ def get_distance_matrix(locations: list) -> dict:
     """
     Get distance and time matrices between all locations.
 
-    Batches requests in 10x10 chunks to stay within the Google Distance Matrix
-    API limit of 100 elements per request (25 origins, 25 destinations).
+    Uses the Routes API computeRouteMatrix endpoint (the legacy Distance Matrix
+    API cannot be enabled on new projects). Batches requests in 25x25 chunks to
+    stay within the limit of 625 elements per request.
 
     Args:
         locations: List of dicts with 'lat' and 'lng' keys
@@ -77,45 +79,50 @@ def get_distance_matrix(locations: list) -> dict:
         Dict with 'distance' and 'time' matrices (values in meters and seconds)
     """
     n = len(locations)
-    coords = [f"{loc['lat']},{loc['lng']}" for loc in locations]
+    waypoints = [_routes_waypoint(loc) for loc in locations]
 
     distance_matrix = [[0] * n for _ in range(n)]
     time_matrix = [[0] * n for _ in range(n)]
 
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    chunk_size = 10  # 10x10 = 100 elements, exactly at the API limit
+    url = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "originIndex,destinationIndex,status,condition,distanceMeters,duration",
+    }
+    chunk_size = 25  # 25x25 = 625 elements, exactly at the API limit
 
     for i_start in range(0, n, chunk_size):
         i_end = min(i_start + chunk_size, n)
-        origin_coords = coords[i_start:i_end]
 
         for j_start in range(0, n, chunk_size):
             j_end = min(j_start + chunk_size, n)
-            dest_coords = coords[j_start:j_end]
 
-            params = {
-                "origins": "|".join(origin_coords),
-                "destinations": "|".join(dest_coords),
-                "key": GOOGLE_API_KEY,
-                "units": "imperial"
+            body = {
+                "origins": [{"waypoint": w} for w in waypoints[i_start:i_end]],
+                "destinations": [{"waypoint": w} for w in waypoints[j_start:j_end]],
+                "travelMode": "DRIVE",
             }
 
-            response = requests.get(url, params=params)
+            response = requests.post(url, json=body, headers=headers)
             data = response.json()
+            # Errors come back as {"error": ...}, sometimes wrapped in a list
+            error = data.get("error") if isinstance(data, dict) else (
+                data[0].get("error") if data and "error" in data[0] else None)
+            if response.status_code != 200 or error:
+                message = (error or {}).get("message", response.text)
+                raise Exception(f"Routes API (route matrix) error: {message}")
 
-            if data["status"] != "OK":
-                raise Exception(f"Distance Matrix API error: {data['status']}")
-
-            for ri, row in enumerate(data["rows"]):
-                for rj, element in enumerate(row["elements"]):
-                    gi = i_start + ri
-                    gj = j_start + rj
-                    if element["status"] == "OK":
-                        distance_matrix[gi][gj] = element["distance"]["value"]
-                        time_matrix[gi][gj] = element["duration"]["value"]
-                    else:
-                        distance_matrix[gi][gj] = float('inf')
-                        time_matrix[gi][gj] = float('inf')
+            for element in data:
+                # Zero-valued fields (index 0, 0 meters) are omitted from the JSON
+                gi = i_start + element.get("originIndex", 0)
+                gj = j_start + element.get("destinationIndex", 0)
+                if element.get("condition") == "ROUTE_EXISTS":
+                    distance_matrix[gi][gj] = element.get("distanceMeters", 0)
+                    time_matrix[gi][gj] = round(float(element.get("duration", "0s").rstrip("s")))
+                else:
+                    distance_matrix[gi][gj] = float('inf')
+                    time_matrix[gi][gj] = float('inf')
 
     return {
         "distance": distance_matrix,
@@ -132,29 +139,199 @@ def get_directions(locations: list, order: list) -> dict:
         order: Optimized order indices
     
     Returns:
-        Directions API response with route details
+        Routes API computeRoutes response with route details
     """
     ordered_locs = [locations[i] for i in order]
-    
-    origin = f"{ordered_locs[0]['lat']},{ordered_locs[0]['lng']}"
-    destination = f"{ordered_locs[-1]['lat']},{ordered_locs[-1]['lng']}"
-    
-    waypoints = []
-    for loc in ordered_locs[1:-1]:
-        waypoints.append(f"{loc['lat']},{loc['lng']}")
-    
-    url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": origin,
-        "destination": destination,
-        "key": GOOGLE_API_KEY
+
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,"
+                            "routes.polyline.encodedPolyline,routes.legs",
     }
-    
-    if waypoints:
-        params["waypoints"] = "|".join(waypoints)
-    
-    response = requests.get(url, params=params)
-    return response.json()
+    body = {
+        "origin": _routes_waypoint(ordered_locs[0]),
+        "destination": _routes_waypoint(ordered_locs[-1]),
+        "intermediates": [_routes_waypoint(loc) for loc in ordered_locs[1:-1]],
+        "travelMode": "DRIVE",
+    }
+
+    response = requests.post(url, json=body, headers=headers)
+    data = response.json()
+    if response.status_code != 200:
+        message = data.get("error", {}).get("message", response.text)
+        raise Exception(f"Routes API (directions) error: {message}")
+    return data
+
+
+def _routes_waypoint(loc: dict) -> dict:
+    """Build a Routes API waypoint from a dict with 'lat' and 'lng' keys."""
+    return {"location": {"latLng": {"latitude": loc['lat'], "longitude": loc['lng']}}}
+
+
+# =============================================================================
+# Incident Replanning (demo: simulated accident on a single leg)
+# =============================================================================
+
+ACCIDENT_AVOID_RADIUS_M = 500    # a route is blocked if it passes this close to the accident
+DETOUR_OFFSETS_M = [2000, 4000]  # sideways distances tried when forcing a detour
+
+
+def compute_leg_routes(origin: dict, destination: dict, via: dict = None,
+                       alternatives: bool = False) -> list:
+    """
+    Get driving routes for one leg via the Routes API computeRoutes endpoint.
+
+    Args:
+        origin, destination: Dicts with 'lat' and 'lng' keys
+        via: Optional pass-through point (no stop) used to force a detour
+        alternatives: Also return Google's alternative routes (ignored with via)
+
+    Returns:
+        List of dicts with 'distance_m', 'time_s' and 'path' ([{lat, lng}, ...]),
+        Google's default route first
+    """
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline",
+    }
+    body = {
+        "origin": _routes_waypoint(origin),
+        "destination": _routes_waypoint(destination),
+        "travelMode": "DRIVE",
+    }
+    if via:
+        body["intermediates"] = [{**_routes_waypoint(via), "via": True}]
+    elif alternatives:
+        body["computeAlternativeRoutes"] = True
+
+    response = requests.post(url, json=body, headers=headers)
+    data = response.json()
+    if response.status_code != 200:
+        message = data.get("error", {}).get("message", response.text)
+        raise Exception(f"Routes API (leg routes) error: {message}")
+
+    return [
+        {
+            "distance_m": r.get("distanceMeters", 0),
+            "time_s": round(float(r.get("duration", "0s").rstrip("s"))),
+            "path": _decode_polyline(r["polyline"]["encodedPolyline"]),
+        }
+        for r in data.get("routes", [])
+    ]
+
+
+def replan_leg_around_accident(origin: dict, destination: dict) -> dict:
+    """
+    Simulate an accident on a leg's current route and find a route around it.
+
+    The accident is placed at the midpoint of Google's default route. Google's
+    alternative routes are tried first; if all of them pass the accident, a
+    detour is forced through a point offset sideways from the accident.
+
+    Returns:
+        Dict with 'accident' ({lat, lng}), 'original' and 'rerouted' routes
+        (see compute_leg_routes), and 'method' ('alternative' or 'detour')
+    """
+    routes = compute_leg_routes(origin, destination, alternatives=True)
+    if not routes:
+        raise Exception("No route found for this leg")
+    original = routes[0]
+    accident, (ux, uy) = _point_along_path(original['path'], 0.5)
+
+    def avoids_accident(route):
+        return _distance_to_path_m(accident, route['path']) > ACCIDENT_AVOID_RADIUS_M
+
+    candidates = [r for r in routes[1:] if avoids_accident(r)]
+    method = "alternative"
+
+    for offset in DETOUR_OFFSETS_M:
+        if candidates:
+            break
+        method = "detour"
+        # Try a pass-through point on each side, perpendicular to the direction of travel
+        for side in (1, -1):
+            via = _offset_point(accident, -uy * offset * side, ux * offset * side)
+            candidates += [r for r in compute_leg_routes(origin, destination, via=via)
+                           if avoids_accident(r)]
+
+    if not candidates:
+        raise Exception("No route found that avoids the accident")
+
+    return {
+        "accident": accident,
+        "original": original,
+        "rerouted": min(candidates, key=lambda r: r['time_s']),
+        "method": method,
+    }
+
+
+def _decode_polyline(encoded: str) -> list:
+    """Decode a Google encoded polyline into [{lat, lng}, ...]."""
+    points, index, lat, lng = [], 0, 0, 0
+    while index < len(encoded):
+        deltas = []
+        for _ in range(2):
+            shift, result = 0, 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1f) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            deltas.append(~(result >> 1) if result & 1 else result >> 1)
+        lat += deltas[0]
+        lng += deltas[1]
+        points.append({"lat": lat / 1e5, "lng": lng / 1e5})
+    return points
+
+
+def _to_local_m(point: dict, ref: dict) -> tuple:
+    """Project a point to (x, y) meters east/north of ref (fine over tens of km)."""
+    return ((point['lng'] - ref['lng']) * 111320 * math.cos(math.radians(ref['lat'])),
+            (point['lat'] - ref['lat']) * 110540)
+
+
+def _offset_point(ref: dict, x_m: float, y_m: float) -> dict:
+    """Inverse of _to_local_m: the point x_m east and y_m north of ref."""
+    return {"lat": ref['lat'] + y_m / 110540,
+            "lng": ref['lng'] + x_m / (111320 * math.cos(math.radians(ref['lat'])))}
+
+
+def _point_along_path(path: list, fraction: float) -> tuple:
+    """
+    Find the point at a fraction of a path's length.
+
+    Returns:
+        ({lat, lng}, (ux, uy)) where (ux, uy) is the unit direction of travel there
+    """
+    xy = [_to_local_m(p, path[0]) for p in path]
+    seg_lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(xy, xy[1:])]
+    target = sum(seg_lengths) * fraction
+    for (a, b), length in zip(zip(xy, xy[1:]), seg_lengths):
+        if length > 0 and target <= length:
+            t = target / length
+            point = _offset_point(path[0], a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+            return point, ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
+        target -= length
+    return path[-1], (0.0, 1.0)
+
+
+def _distance_to_path_m(point: dict, path: list) -> float:
+    """Shortest distance in meters from a point to any segment of a path."""
+    best = float('inf')
+    for a, b in zip(path, path[1:]):
+        ax, ay = _to_local_m(a, point)  # point itself sits at the origin
+        bx, by = _to_local_m(b, point)
+        dx, dy = bx - ax, by - ay
+        seg_sq = dx * dx + dy * dy
+        t = 0.0 if seg_sq == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg_sq))
+        best = min(best, math.hypot(ax + t * dx, ay + t * dy))
+    return best
 
 
 def get_elevation_data(locations: list) -> list:
@@ -1174,6 +1351,50 @@ def get_route_directions():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/api/replan_leg', methods=['POST'])
+def replan_leg():
+    """
+    Demo replanning: simulate an accident on one leg and reroute around it.
+
+    The delivery order stays fixed; only the leg's from -> to route changes.
+
+    Request body:
+    {
+        "leg": {...},  // one entry of results.optimal.legs
+        "energy_params": {"temperature_c": 20, "has_climate_control": true}
+    }
+
+    Returns the accident location plus the original and rerouted leg, each with
+    distance_m, time_s, energy_kwh and path ([{lat, lng}, ...]).
+    """
+    data = request.json
+    leg = data.get('leg')
+    energy_params = data.get('energy_params', {})
+
+    if not leg or 'from' not in leg or 'to' not in leg:
+        return jsonify({"status": "error", "message": "Need a leg with 'from' and 'to'"}), 400
+
+    try:
+        replan = replan_leg_around_accident(leg['from'], leg['to'])
+
+        # Same energy model as /api/optimize, with the leg's weight and elevation
+        for key in ('original', 'rerouted'):
+            route = replan[key]
+            route['energy_kwh'] = calculate_energy_consumption(
+                distance_km=route['distance_m'] / 1000,
+                avg_speed_kmh=estimate_average_speed(route['distance_m'], route['time_s']),
+                temperature_c=energy_params.get('temperature_c', 20.0),
+                vehicle_weight_tonnes=leg.get('vehicle_weight_tonnes', 13000 / 2204.62),
+                altitude_diff_m=leg.get('elevation_gain_m', 0.0),
+                altitude_m=leg.get('elevation_from_m', 0.0),
+                has_climate_control=energy_params.get('has_climate_control', True)
+            )['energy_kwh']
+
+        return jsonify({"status": "ok", **replan})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1190,6 +1411,7 @@ if __name__ == '__main__':
     print("  POST /api/geocode_batch  - Geocode multiple addresses")
     print("  POST /api/optimize       - Optimize route (main endpoint)")
     print("  POST /api/directions     - Get turn-by-turn directions")
+    print("  POST /api/replan_leg     - Reroute one leg around a simulated accident")
     print("  GET  /api/health         - Health check")
     print()
     print("Starting server on http://localhost:5001")

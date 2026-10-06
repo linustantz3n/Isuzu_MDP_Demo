@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, TriangleAlert, RotateCcw } from 'lucide-react';
 import RouteMap from './RouteMap';
 import FleetCharts from './FleetCharts';
 
 const API_BASE = 'http://localhost:5001/api';
+
+// Demo replanning: the accident is always placed on this Held-Karp leg (Stop 1 → Stop 2)
+const DEMO_ACCIDENT_LEG = 1;
 
 const DEMO_ADDRESSES = [
   'Detroit, MI',
@@ -32,6 +35,9 @@ function RouteOptimizer() {
     { id: 1, name: 'Vehicle 1', weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 }
   ]);
   const [lastLocations, setLastLocations] = useState([]);
+  const [replan, setReplan] = useState(null);
+  const [replanning, setReplanning] = useState(false);
+  const [replanError, setReplanError] = useState(null);
   const [energyParams, setEnergyParams] = useState({
     temperature_c: 20,
     total_weight_lbs: 19500,
@@ -228,10 +234,41 @@ function RouteOptimizer() {
 
       setResults(data.results);
       setLastLocations(locationsToOptimize);
+      setReplan(null);
+      setReplanError(null);
     } catch (err) {
       setError(err.message || 'Failed to optimize route');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Simulate an accident on the demo leg and reroute it (delivery order unchanged)
+  const simulateAccident = async () => {
+    setReplanning(true);
+    setReplanError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/replan_leg`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leg: results.optimal.legs[DEMO_ACCIDENT_LEG],
+          energy_params: energyParams
+        })
+      });
+
+      const data = await response.json();
+
+      if (data.status === 'error') {
+        throw new Error(data.message);
+      }
+
+      setReplan({ ...data, legIndex: DEMO_ACCIDENT_LEG });
+    } catch (err) {
+      setReplanError(err.message || 'Failed to replan route');
+    } finally {
+      setReplanning(false);
     }
   };
 
@@ -841,8 +878,78 @@ function RouteOptimizer() {
                 </div>
               </div>
 
+              {/* Incident replanning — demo for single vehicle only */}
+              {!fleet && hk.legs.length > DEMO_ACCIDENT_LEG && (() => {
+                const n = hk.ordered_locations.length;
+                const stopLabel = (i) => (i === 0 || i === n ? 'Depot' : `Stop ${i}`);
+                const shortAddress = (loc) => (loc.formatted_address || loc.address).split(',')[0];
+                const leg = hk.legs[DEMO_ACCIDENT_LEG];
+                const diffClass = (d) => (d > 0 ? 'text-red-400' : 'text-green-400');
+                const sign = (d) => (d > 0 ? '+' : '−');
+                return (
+                  <div className="bg-slate-900 border border-red-500/25 rounded-xl p-4">
+                    <div className="flex items-center gap-2">
+                      <TriangleAlert className="w-4 h-4 text-red-400" />
+                      <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Incident Replanning</span>
+                      <span className="text-[10px] text-slate-600">delivery order fixed · reroute one leg</span>
+                      <div className="ml-auto flex gap-2">
+                        {replan && (
+                          <button
+                            onClick={() => setReplan(null)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
+                          >
+                            <RotateCcw className="w-3 h-3" /> Reset
+                          </button>
+                        )}
+                        <button
+                          onClick={simulateAccident}
+                          disabled={replanning || replan !== null}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-red-500/30 text-red-400 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          {replanning
+                            ? <><Loader2 className="w-3 h-3 animate-spin" /> Replanning...</>
+                            : <><TriangleAlert className="w-3 h-3" /> Simulate Accident</>
+                          }
+                        </button>
+                      </div>
+                    </div>
+
+                    {replanError && (
+                      <p className="mt-3 text-xs text-red-400">{replanError}</p>
+                    )}
+
+                    {replan && (
+                      <div className="mt-4 space-y-3">
+                        <p className="text-xs text-slate-400">
+                          Accident detected on <span className="text-white font-medium">{stopLabel(replan.legIndex)} → {stopLabel(replan.legIndex + 1)}</span>
+                          <span className="text-slate-600"> ({shortAddress(leg.from)} → {shortAddress(leg.to)})</span>.
+                          {' '}Rerouted via {replan.method === 'alternative' ? 'Google alternative route' : 'forced detour'}.
+                        </p>
+                        <div className="grid grid-cols-2 gap-3">
+                          {[
+                            ['Distance', MapPin, replan.original.distance_m, replan.rerouted.distance_m, formatDistance,
+                              (d) => `${sign(d)}${formatDistance(Math.abs(d))}`],
+                            // Round (not floor like formatTime) so before/after match the diff
+                            ['Time', Clock, replan.original.time_s, replan.rerouted.time_s, (s) => `${Math.round(s / 60)} min`,
+                              (d) => `${sign(d)}${Math.round(Math.abs(d) / 60)} min`],
+                          ].map(([label, Icon, before, after, fmt, fmtDiff]) => (
+                            <div key={label} className="bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2.5">
+                              <p className="text-[10px] text-slate-500 flex items-center gap-1.5 mb-1"><Icon className="w-3 h-3" />{label}</p>
+                              <p className="text-sm text-white font-semibold">
+                                <span className="text-slate-500 line-through font-normal">{fmt(before)}</span> → {fmt(after)}
+                              </p>
+                              <p className={`text-[11px] font-semibold mt-0.5 ${diffClass(after - before)}`}>{fmtDiff(after - before)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Map */}
-              <RouteMap results={results} locations={lastLocations} />
+              <RouteMap results={results} locations={lastLocations} replan={replan} />
 
               {/* Charts */}
               <FleetCharts results={results} />

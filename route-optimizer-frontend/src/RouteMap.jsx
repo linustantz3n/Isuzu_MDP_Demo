@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, InfoWindow } from '@react-google-maps/api';
+import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, MarkerF, PolylineF, InfoWindow } from '@react-google-maps/api';
 
 const VEHICLE_COLORS = [
   '#a855f7', '#3b82f6', '#10b981', '#f59e0b',
   '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16', '#f97316'
 ];
 const SINGLE_COLOR = '#facc15';
+const BLOCKED_COLOR = '#ef4444';
+const REROUTE_COLOR = '#22c55e';
 
 const MAP_CONTAINER_STYLE = { width: '100%', height: '500px' };
 
@@ -27,7 +29,7 @@ const MAP_STYLES = [
   { featureType: 'landscape', elementType: 'geometry', stylers: [{ color: '#1e293b' }] },
 ];
 
-export default function RouteMap({ results, locations }) {
+export default function RouteMap({ results, locations, replan }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -146,6 +148,14 @@ export default function RouteMap({ results, locations }) {
     });
   }, [isLoaded, results, locations]);
 
+  // Zoom to the replanned leg so the accident and detour are visible
+  useEffect(() => {
+    if (!isLoaded || !replan || !mapRef.current) return;
+    const bounds = new window.google.maps.LatLngBounds();
+    [...replan.original.path, ...replan.rerouted.path].forEach(pt => bounds.extend(pt));
+    mapRef.current.fitBounds(bounds, 48);
+  }, [isLoaded, replan]);
+
   if (loadError) return (
     <div className="bg-slate-800 rounded-xl p-6 border border-red-500/30 text-red-400 text-sm">
       Google Maps failed to load: {loadError.message}
@@ -200,6 +210,23 @@ export default function RouteMap({ results, locations }) {
             </button>
           );
         })}
+        {/* Replanning legend */}
+        {replan && (
+          <>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-red-400">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={BLOCKED_COLOR} strokeWidth="3" strokeDasharray="4 3" />
+              </svg>
+              Blocked
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-green-400">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={REROUTE_COLOR} strokeWidth="3" />
+              </svg>
+              Reroute
+            </span>
+          </>
+        )}
         {fetchingRoutes && (
           <span className="ml-auto text-xs text-slate-500 animate-pulse">Loading routes...</span>
         )}
@@ -228,6 +255,42 @@ export default function RouteMap({ results, locations }) {
               }}
             />
           ))}
+
+          {/* Replanned leg: blocked original (dashed), reroute, accident marker */}
+          {replan && (
+            <>
+              <PolylineF
+                path={replan.original.path}
+                options={{
+                  strokeOpacity: 0,
+                  zIndex: 10,
+                  icons: [{
+                    icon: { path: 'M 0,-1 0,1', strokeColor: BLOCKED_COLOR, strokeOpacity: 1, scale: 3 },
+                    offset: '0',
+                    repeat: '12px',
+                  }],
+                }}
+              />
+              <PolylineF
+                path={replan.rerouted.path}
+                options={{ strokeColor: REROUTE_COLOR, strokeOpacity: 0.95, strokeWeight: 5, zIndex: 11 }}
+              />
+              <MarkerF
+                position={replan.accident}
+                icon={{
+                  path: window.google.maps.SymbolPath.CIRCLE,
+                  scale: 12,
+                  fillColor: BLOCKED_COLOR,
+                  fillOpacity: 1,
+                  strokeColor: '#ffffff',
+                  strokeWeight: 2,
+                }}
+                label={{ text: '!', color: '#ffffff', fontSize: '14px', fontWeight: 'bold' }}
+                title="Accident"
+                zIndex={30}
+              />
+            </>
+          )}
 
           {/* Stop markers */}
           {locations.map((loc, idx) => (
