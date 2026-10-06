@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3 } from 'lucide-react';
 import RouteMap from './RouteMap';
 import FleetCharts from './FleetCharts';
-
-const API_BASE = 'http://localhost:5001/api';
+import BenchmarkPanel from './BenchmarkPanel';
+import { API_BASE } from './api';
 
 const DEMO_ADDRESSES = [
   'Detroit, MI',
@@ -19,6 +19,7 @@ const DEMO_ADDRESSES = [
 ];
 
 function RouteOptimizer() {
+  const [activeTab, setActiveTab] = useState('solver');
   const [addresses, setAddresses] = useState(['', '', '']);
   const [depot, setDepot] = useState('');
   const useDepot = true;
@@ -270,6 +271,11 @@ function RouteOptimizer() {
     return { better: diff > 0, p, sign: diff > 0 ? '−' : '+' };
   };
 
+  const TABS = [
+    { id: 'solver', label: 'Solver', icon: Route },
+    { id: 'benchmark', label: 'Benchmark', icon: BarChart3 },
+  ];
+
   return (
     <div className="h-screen flex flex-col bg-slate-950">
       {/* ── Top navbar ─────────────────────────────────────── */}
@@ -284,8 +290,21 @@ function RouteOptimizer() {
           </div>
         </div>
         <div className="h-6 w-px bg-slate-800 mx-1" />
-        <span className="text-xs text-slate-600 hidden md:block">Held-Karp TSP · OR-Tools CVRP · Mercedes eActros Energy Model</span>
-        <div className="ml-auto flex items-center gap-3">
+        <nav className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+          {TABS.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+                activeTab === id ? 'bg-[#C8002F] text-white' : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" /> {label}
+            </button>
+          ))}
+        </nav>
+        <span className="text-xs text-slate-600 hidden lg:block">Held-Karp TSP · OR-Tools CVRP · Mercedes eActros Energy Model</span>
+        <div className={`ml-auto flex items-center gap-3 ${activeTab === 'solver' ? '' : 'hidden'}`}>
           {loading && (
             <span className="text-xs text-blue-400 flex items-center gap-1.5">
               <Loader2 className="w-3 h-3 animate-spin" /> Optimizing...
@@ -299,8 +318,13 @@ function RouteOptimizer() {
         </div>
       </header>
 
+      {/* ── Benchmark tab (kept mounted so results survive tab switches) ── */}
+      <div className={`flex flex-1 min-h-0 ${activeTab === 'benchmark' ? '' : 'hidden'}`}>
+        <BenchmarkPanel />
+      </div>
+
       {/* ── Body ───────────────────────────────────────────── */}
-      <div className="flex flex-1 min-h-0">
+      <div className={`flex flex-1 min-h-0 ${activeTab === 'solver' ? '' : 'hidden'}`}>
 
         {/* ── Sidebar ──────────────────────────────────────── */}
         <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0">
