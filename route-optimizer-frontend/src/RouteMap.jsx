@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, InfoWindow } from '@react-google-maps/api';
 
-const VEHICLE_COLORS = [
+export const VEHICLE_COLORS = [
   '#a855f7', '#3b82f6', '#10b981', '#f59e0b',
   '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16', '#f97316'
 ];
@@ -10,7 +10,7 @@ const SINGLE_COLOR = '#facc15';
 const MAP_CONTAINER_STYLE = { width: '100%', height: '500px' };
 
 // Dark map theme to match the app
-const MAP_STYLES = [
+export const MAP_STYLES = [
   { elementType: 'geometry', stylers: [{ color: '#1e293b' }] },
   { elementType: 'labels.text.fill', stylers: [{ color: '#94a3b8' }] },
   { elementType: 'labels.text.stroke', stylers: [{ color: '#1e293b' }] },

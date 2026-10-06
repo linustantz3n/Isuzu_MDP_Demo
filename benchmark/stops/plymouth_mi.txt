@@ -1,0 +1,21 @@
+# Case 1 - Plymouth, MI: depot + 19 customers (address | lat, lng | demand | name)
+46401 Commerce Center Dr, Plymouth, MI 48170 | 42.397072, -83.502906 |  | Isuzu Technical Center / Plymouth Depot
+14900 Beck Rd, Plymouth, MI 48170 | 42.370474, -83.488067 | 8 | USA Hockey Arena
+41640 Ford Rd, Canton, MI 48187 | 42.324813, -83.448679 | 12 | IKEA Canton
+20000 Haggerty Rd, Livonia, MI 48152 | 42.439538, -83.433207 | 10 | Costco Livonia
+43670 Ford Rd, Canton, MI 48187 | 42.323956, -83.468657 | 7 | Target Canton Ford Rd
+47330 Michigan Ave, Canton, MI 48188 | 42.308941, -83.513763 | 6 | Target Canton Michigan Ave
+45001 Ford Rd, Canton, MI 48187 | 42.324673, -83.481385 | 9 | Meijer Canton
+1500 E Medical Center Dr, Ann Arbor, MI 48109 | 42.281610, -83.731206 | 8 | University Hospital
+1201 S Main St, Ann Arbor, MI 48104 | 42.265868, -83.748704 | 5 | Michigan Stadium
+20900 Oakwood Blvd, Dearborn, MI 48124 | 42.302874, -83.235308 | 11 | The Henry Ford
+8450 W 10 Mile Rd, Royal Oak, MI 48067 | 42.475672, -83.239219 | 10 | Detroit Zoo
+27500 Novi Rd, Novi, MI 48377 | 42.491216, -83.468383 | 9 | Twelve Oaks Mall
+44175 W Twelve Mile Rd, Novi, MI 48377 | 42.496209, -83.480174 | 8 | Twelve Mile Crossing
+46100 Grand River Ave, Novi, MI 48374 | 42.495655, -83.508478 | 7 | Suburban Collection Showplace
+100 Briarwood Cir, Ann Arbor, MI 48108 | 42.241150, -83.745677 | 6 | Briarwood Mall
+500 S State St, Ann Arbor, MI 48109 | 42.274994, -83.738220 | 6 | UM Central Campus
+3100 Washtenaw Ave, Ann Arbor, MI 48104 | 42.257185, -83.698363 | 5 | Whole Foods Ann Arbor
+400 Renaissance Center, Detroit, MI 48243 | 42.329357, -83.039640 | 12 | GM Renaissance Center
+1 Washington Blvd, Detroit, MI 48226 | 42.325614, -83.051192 | 10 | Huntington Place
+11050 Rogell Dr, Detroit, MI 48242 | 42.212431, -83.353389 | 15 | DTW Airport

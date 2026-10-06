@@ -1,0 +1,17 @@
+# Case 3 - Piedmont-Greenville-Greer-Spartanburg, SC: depot + 15 customers (address | lat, lng | demand | name)
+7755 Augusta Rd, Piedmont, SC 29673 | 34.710778, -82.387556 |  | Isuzu Piedmont Production Site
+8024 Augusta Rd, Piedmont, SC 29673 | 34.695846, -82.399102 | 5 | Food Lion Piedmont
+11410 Anderson Rd, Greenville, SC 29611 | 34.789873, -82.481362 | 6 | Walmart Supercenter Greenville Anderson Rd
+1115 Wren School Rd, Piedmont, SC 29673 | 34.726168, -82.546941 | 5 | Prisma Health Heritage Pediatrics and Internal Medicine - Wren
+701 Grove Rd, Greenville, SC 29605 | 34.839951, -82.420275 | 8 | Prisma Health Greenville Memorial Hospital
+700 Haywood Rd, Greenville, SC 29607 | 34.849019, -82.334093 | 6 | Haywood Mall
+650 N Academy St, Greenville, SC 29601 | 34.852606, -82.391530 | 5 | Bon Secours Wellness Arena
+100 Tower Dr, Unit 2, Greenville, SC 29607 | 34.847932, -82.349998 | 4 | Greenville Downtown Airport
+1 Parkway S, Greenville, SC 29615 | 34.860921, -82.258138 | 6 | Michelin North America Headquarters
+5 Research Dr, Greenville, SC 29607 | 34.814288, -82.326987 | 6 | Clemson University International Center for Automotive Research (CU-ICAR)
+126 Club Loop, Greenville, SC 29605 | 34.763220, -82.376050 | 7 | Donaldson Field - Vantage Aviation
+2000 GSP Dr, Greer, SC 29651 | 34.895671, -82.218859 | 9 | Greenville-Spartanburg International Airport
+1400 Highway 101 S, Greer, SC 29651 | 34.893060, -82.178890 | 8 | BMW Group Plant Spartanburg
+100 International Commerce Blvd, Greer, SC 29651 | 34.931600, -82.215300 | 7 | Inland Port Greer
+830 S Buncombe Rd, Greer, SC 29650 | 34.920159, -82.244364 | 6 | Prisma Health Greer Memorial Hospital
+101 E Wood St, Spartanburg, SC 29303 | 34.967890, -81.939710 | 7 | Spartanburg Medical Center

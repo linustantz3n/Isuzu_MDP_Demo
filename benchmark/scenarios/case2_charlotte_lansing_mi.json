@@ -1,0 +1,236 @@
+{
+  "id": "case2_charlotte_lansing_mi",
+  "name": "Case 2 \u2013 Charlotte-Lansing, MI",
+  "description": "Isuzu Charlotte depot + 4 local Charlotte customers and 3 Lansing customers (local vs. regional vehicle allocation)",
+  "created_at": "2026-10-06T15:30:17+00:00",
+  "source_file": "benchmark/stops/charlotte_lansing_mi.txt",
+  "locations": [
+    {
+      "address": "1055 Mikesell St, Charlotte, MI 48813",
+      "formatted_address": "1055 Mikesell St, Charlotte, MI 48813",
+      "lat": 42.552477,
+      "lng": -84.850417,
+      "name": "Isuzu Charlotte Depot"
+    },
+    {
+      "address": "1167 E Clinton Trail, Charlotte, MI 48813",
+      "formatted_address": "1167 E Clinton Trail, Charlotte, MI 48813",
+      "lat": 42.555382,
+      "lng": -84.81404,
+      "demand": 10,
+      "name": "Meijer Charlotte"
+    },
+    {
+      "address": "1680 Packard Hwy, Charlotte, MI 48813",
+      "formatted_address": "1680 Packard Hwy, Charlotte, MI 48813",
+      "lat": 42.580273,
+      "lng": -84.804114,
+      "demand": 12,
+      "name": "Walmart Supercenter Charlotte"
+    },
+    {
+      "address": "1650 Packard Hwy, Charlotte, MI 48813",
+      "formatted_address": "1650 Packard Hwy, Charlotte, MI 48813",
+      "lat": 42.579421,
+      "lng": -84.805998,
+      "demand": 6,
+      "name": "Tractor Supply Charlotte"
+    },
+    {
+      "address": "530 W Beech St, Charlotte, MI 48813",
+      "formatted_address": "530 W Beech St, Charlotte, MI 48813",
+      "lat": 42.5791,
+      "lng": -84.843,
+      "demand": 8,
+      "name": "Eaton County Health and Rehabilitation Services"
+    },
+    {
+      "address": "5330 W Saginaw Hwy, Lansing, MI 48917",
+      "formatted_address": "5330 W Saginaw Hwy, Lansing, MI 48917",
+      "lat": 42.743181,
+      "lng": -84.627746,
+      "demand": 14,
+      "name": "Lansing Mall"
+    },
+    {
+      "address": "100 N Capitol Ave, Lansing, MI 48933",
+      "formatted_address": "100 N Capitol Ave, Lansing, MI 48933",
+      "lat": 42.73361,
+      "lng": -84.55556,
+      "demand": 9,
+      "name": "Michigan State Capitol"
+    },
+    {
+      "address": "4100 Capital City Blvd, Lansing, MI 48906",
+      "formatted_address": "4100 Capital City Blvd, Lansing, MI 48906",
+      "lat": 42.775028,
+      "lng": -84.589139,
+      "demand": 15,
+      "name": "Capital Region International Airport"
+    }
+  ],
+  "distance_m": [
+    [
+      0,
+      3569,
+      7068,
+      7056,
+      3363,
+      33642,
+      37517,
+      42919
+    ],
+    [
+      3426,
+      0,
+      4922,
+      4910,
+      5519,
+      31496,
+      35371,
+      40772
+    ],
+    [
+      6939,
+      5915,
+      0,
+      208,
+      3707,
+      29935,
+      33810,
+      39211
+    ],
+    [
+      7013,
+      5989,
+      215,
+      0,
+      3781,
+      30009,
+      33884,
+      39285
+    ],
+    [
+      3368,
+      5662,
+      3709,
+      3697,
+      0,
+      32270,
+      36145,
+      41546
+    ],
+    [
+      33390,
+      32366,
+      30502,
+      30489,
+      30614,
+      0,
+      7107,
+      7972
+    ],
+    [
+      37584,
+      36560,
+      34696,
+      34683,
+      34808,
+      7249,
+      0,
+      6800
+    ],
+    [
+      42896,
+      41872,
+      40008,
+      39995,
+      40120,
+      8108,
+      7052,
+      0
+    ]
+  ],
+  "time_s": [
+    [
+      0,
+      335,
+      494,
+      531,
+      313,
+      1492,
+      1546,
+      1753
+    ],
+    [
+      353,
+      0,
+      374,
+      411,
+      525,
+      1372,
+      1426,
+      1633
+    ],
+    [
+      567,
+      489,
+      0,
+      75,
+      360,
+      1384,
+      1438,
+      1645
+    ],
+    [
+      578,
+      501,
+      74,
+      0,
+      372,
+      1395,
+      1449,
+      1656
+    ],
+    [
+      306,
+      505,
+      299,
+      336,
+      0,
+      1427,
+      1481,
+      1688
+    ],
+    [
+      1485,
+      1407,
+      1359,
+      1395,
+      1496,
+      0,
+      721,
+      719
+    ],
+    [
+      1506,
+      1428,
+      1380,
+      1416,
+      1517,
+      755,
+      0,
+      648
+    ],
+    [
+      1804,
+      1726,
+      1678,
+      1715,
+      1815,
+      750,
+      681,
+      0
+    ]
+  ]
+}
