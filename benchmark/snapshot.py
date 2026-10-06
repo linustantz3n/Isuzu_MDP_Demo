@@ -9,7 +9,9 @@ Usage (from the repo root, with GOOGLE_MAPS_API_KEY in .env):
     python -m benchmark.snapshot route-optimizer-frontend/public/demo_stops.txt \
         demo_anaheim "Anaheim demo" --description "Depot + 5 SoCal stops"
 
-The first line of the stops file is the depot.
+The first line of the stops file is the depot. A line may optionally carry
+known coordinates (skips geocoding), a demand and a display name, separated by "|":
+    14900 Beck Rd, Plymouth, MI 48170 | 42.370474, -83.488067 | 8 | USA Hockey Arena
 """
 
 import argparse
@@ -40,17 +42,28 @@ def main():
     from route_optimizer_backend import geocode_address, get_distance_matrix
 
     with open(args.stops_file) as f:
-        addresses = [line.strip() for line in f if line.strip()]
-    if len(addresses) < 2:
+        lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    if len(lines) < 2:
         parser.error("need a depot and at least one stop")
 
-    print(f"Geocoding {len(addresses)} addresses...")
+    print(f"Resolving {len(lines)} locations...")
     locations = []
-    for addr in addresses:
-        g = geocode_address(addr)
-        locations.append({"address": addr, "formatted_address": g["formatted_address"],
-                          "lat": g["lat"], "lng": g["lng"]})
-        print(f"  {addr} -> {g['lat']:.5f}, {g['lng']:.5f}")
+    for line in lines:
+        parts = [p.strip() for p in line.split("|")]
+        addr = parts[0]
+        if len(parts) > 1 and parts[1]:
+            lat, lng = (float(x) for x in parts[1].split(","))
+            loc = {"address": addr, "formatted_address": addr, "lat": lat, "lng": lng}
+        else:
+            g = geocode_address(addr)
+            loc = {"address": addr, "formatted_address": g["formatted_address"],
+                   "lat": g["lat"], "lng": g["lng"]}
+        if len(parts) > 2 and parts[2]:
+            loc["demand"] = int(parts[2])
+        if len(parts) > 3 and parts[3]:
+            loc["name"] = parts[3]
+        locations.append(loc)
+        print(f"  {addr} -> {loc['lat']:.5f}, {loc['lng']:.5f}")
 
     print("Fetching distance/time matrices...")
     matrices = get_distance_matrix(locations)

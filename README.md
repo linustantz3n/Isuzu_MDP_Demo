@@ -258,6 +258,38 @@ When comparing your advanced routing against this baseline:
 
 ---
 
+## Algorithm Benchmark
+
+The **Benchmark** tab (and `benchmark/` package) answers "how much better is OR-Tools than naive routing, and on which dimensions?" It runs every registered algorithm on the same saved scenario for each fleet size K = 1..N and scores them identically from the scenario's distance/time matrices.
+
+| Algorithm | K | Notes |
+|---|---|---|
+| Nearest Neighbor, 2-opt, Held-Karp (optimal) | 1 | Single-truck TSP; Held-Karp is the exact reference |
+| Round-robin + NN / 2-opt | ≥2 | Naive dispatcher: deal stops out in list order |
+| K-means + 2-opt | ≥2 | Capacity-balanced clusters on lat/lng |
+| Sweep + 2-opt | any | Gillett-Miller radial sectors around the depot |
+| Clarke-Wright Savings | any | Classic savings merge; flagged infeasible if it needs > K trucks |
+| OR-Tools (construction only) | any | PATH_CHEAPEST_ARC, no local search |
+| OR-Tools (production) | any | PATH_CHEAPEST_ARC + Guided Local Search |
+
+Every truck is capped at `ceil(stops / K)` stops for every algorithm, matching OR-Tools. Metrics: total distance, total drive time, makespan, trucks used, solve time, and gaps vs the best result, vs production OR-Tools, and (K=1) vs the Held-Karp optimum.
+
+```bash
+# Scenarios are snapshotted once (Google API calls), then reused offline
+python -m benchmark.snapshot route-optimizer-frontend/public/demo_stops.txt demo_anaheim "Anaheim demo"
+
+# Headless run / CSV export
+python -m benchmark.cli --list
+python -m benchmark.cli demo_anaheim --max-vehicles 3 --csv results.csv
+
+# Tests
+pytest tests/
+```
+
+To benchmark a new algorithm (e.g. a BEV-aware router), write `solve(problem) -> list of [0, ..., 0] routes` and register it in `benchmark/algorithms.py` (`ALGORITHMS`).
+
+---
+
 ## Files
 
 ```

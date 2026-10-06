@@ -25,6 +25,7 @@ def list_scenarios() -> list:
                 "description": s.get("description", ""),
                 "num_stops": len(s["locations"]) - 1,
                 "depot": s["locations"][0]["address"],
+                "total_demand": sum(loc.get("demand", 0) for loc in s["locations"]) or None,
             })
     return out
 

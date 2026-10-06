@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart3, Loader2, AlertCircle, Play, TrendingDown, ArrowUpDown, CheckCircle, XCircle } from 'lucide-react';
 import BenchmarkCharts, { algoColor } from './BenchmarkCharts';
+import BenchmarkRoutes from './BenchmarkRoutes';
 import { API_BASE } from './api';
 
 const FAMILY_LABELS = {
@@ -130,6 +131,9 @@ export default function BenchmarkPanel() {
               <p className="text-xs text-slate-500 mt-2 leading-relaxed">
                 {scenario.description}<br />
                 <span className="text-slate-600">Depot: {scenario.depot}</span>
+                {scenario.total_demand != null && (
+                  <><br /><span className="text-slate-600">Total demand: {scenario.total_demand} units</span></>
+                )}
               </p>
             )}
           </section>
@@ -148,8 +152,12 @@ export default function BenchmarkPanel() {
               onChange={e => setMaxVehicles(Number(e.target.value))}
               className="w-full accent-[#C8002F]"
             />
+            <div className="flex justify-between text-[11px] text-slate-600">
+              <span>1</span>
+              <span>{Math.max(1, kLimit)}</span>
+            </div>
             <p className="text-xs text-slate-600 mt-1">
-              Every truck is capped at ⌈stops / K⌉ stops, the same limit OR-Tools enforces.
+              Up to one truck per stop. Every truck is capped at ⌈stops / K⌉ stops, the same limit OR-Tools enforces.
             </p>
           </section>
 
@@ -278,7 +286,7 @@ export default function BenchmarkPanel() {
             </div>
 
             {/* K selector */}
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs text-slate-500 mr-1">Fleet size</span>
               {Array.from({ length: result.max_vehicles }, (_, i) => i + 1).map(k => (
                 <button
@@ -361,6 +369,8 @@ export default function BenchmarkPanel() {
             </div>
 
             <BenchmarkCharts result={result} selectedK={selectedK} />
+
+            <BenchmarkRoutes rows={tableRows} locations={result.scenario.locations} selectedK={selectedK} />
           </div>
         )}
       </main>
