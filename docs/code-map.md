@@ -83,23 +83,24 @@ One file, in sections, top to bottom:
 | [`AXES`](../route_optimizer_backend.py#L1220), [`CAPABILITIES`](../route_optimizer_backend.py#L1259) | The fields the assistant may change, their limits, and what it can do |
 | [`check_value`](../route_optimizer_backend.py#L1371), [`make_change`](../route_optimizer_backend.py#L1418), [`describe_change`](../route_optimizer_backend.py#L1314) | Range checks and labels, shared by every path |
 | [`outcome_apply`](../route_optimizer_backend.py#L1445), [`outcome_ask`](../route_optimizer_backend.py#L1477), [`outcome_out_of_scope`](../route_optimizer_backend.py#L1487), [`outcome_recommend`](../route_optimizer_backend.py#L1511) | Build the reply for each intent |
-| [`LEXICON`](../route_optimizer_backend.py#L1596), [`lexicon_fast_path`](../route_optimizer_backend.py#L1697) | Stage 1: regex fast path, no model call |
-| [`mentions_saved_driver`](../route_optimizer_backend.py#L1682) | Sends a message that names a saved driver to the model |
-| [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L1773), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L1834), [`call_extraction`](../route_optimizer_backend.py#L1906) | Stage 2: GPT-4o-mini with a strict JSON schema |
-| [`validate_change`](../route_optimizer_backend.py#L1940), [`validate_extraction`](../route_optimizer_backend.py#L2022), [`route_outcome`](../route_optimizer_backend.py#L2120) | Stage 3: deterministic validation and routing |
-| [`ai_chat`](../route_optimizer_backend.py#L2160) | `POST /api/chat` |
+| [`LEXICON`](../route_optimizer_backend.py#L1596), [`lexicon_fast_path`](../route_optimizer_backend.py#L1719) | Stage 1: regex fast path, no model call |
+| [`mentions_saved_driver`](../route_optimizer_backend.py#L1705) | Sends a message that names a saved driver to the model |
+| [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L1863), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L1871), [`call_extraction`](../route_optimizer_backend.py#L1946) | Stage 2: GPT-4o-mini with a strict JSON schema |
+| [`validate_change`](../route_optimizer_backend.py#L1985), [`validate_extraction`](../route_optimizer_backend.py#L2075), [`route_outcome`](../route_optimizer_backend.py#L2191) | Stage 3: deterministic validation and routing |
+| [`run_steps`](../route_optimizer_backend.py#L2280), [`advance_form_state`](../route_optimizer_backend.py#L2238) | Run a multi-step message in order and merge the replies |
+| [`ai_chat`](../route_optimizer_backend.py#L2324) | `POST /api/chat` |
 
 ### Driver memory
 | Name | Does |
 |---|---|
-| [`MEMORY_PATH`](../route_optimizer_backend.py#L2205), [`load_memory`](../route_optimizer_backend.py#L2220), [`save_memory`](../route_optimizer_backend.py#L2233) | The `fleet_memory.json` store |
-| [`validate_profile`](../route_optimizer_backend.py#L2272) | Evidence and range gate for a driver profile |
-| [`do_remember`](../route_optimizer_backend.py#L2335), [`do_recall`](../route_optimizer_backend.py#L2363), [`do_forget`](../route_optimizer_backend.py#L2397) | The memory operations |
-| [`profile_to_vehicle`](../route_optimizer_backend.py#L2245) | Recalled driver → a vehicle entry for the form |
-| [`get_memory`](../route_optimizer_backend.py#L2412), [`clear_memory`](../route_optimizer_backend.py#L2419) | `GET` / `DELETE /api/memory` |
+| [`MEMORY_PATH`](../route_optimizer_backend.py#L2368), [`load_memory`](../route_optimizer_backend.py#L2383), [`save_memory`](../route_optimizer_backend.py#L2396) | The `fleet_memory.json` store |
+| [`validate_profile`](../route_optimizer_backend.py#L2435) | Evidence and range gate for a driver profile |
+| [`do_remember`](../route_optimizer_backend.py#L2512), [`do_recall`](../route_optimizer_backend.py#L2544), [`do_forget`](../route_optimizer_backend.py#L2577) | The memory operations |
+| [`profile_to_vehicle`](../route_optimizer_backend.py#L2408) | Recalled driver → a vehicle entry for the form |
+| [`get_memory`](../route_optimizer_backend.py#L2593), [`clear_memory`](../route_optimizer_backend.py#L2600) | `GET` / `DELETE /api/memory` |
 
 ### Benchmark endpoints
-[`benchmark_scenarios`](../route_optimizer_backend.py#L2436), [`benchmark_algorithms`](../route_optimizer_backend.py#L2442), [`benchmark_run`](../route_optimizer_backend.py#L2448): thin wrappers around `benchmark.run_benchmark`.
+[`benchmark_scenarios`](../route_optimizer_backend.py#L2617), [`benchmark_algorithms`](../route_optimizer_backend.py#L2623), [`benchmark_run`](../route_optimizer_backend.py#L2629): thin wrappers around `benchmark.run_benchmark`.
 
 The server starts at the bottom of the file: `app.run(port=5001)`.
 

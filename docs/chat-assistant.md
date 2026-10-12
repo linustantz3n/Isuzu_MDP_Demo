@@ -1,7 +1,7 @@
 # Chat assistant
 
 **Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L1188)
-(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L2160)), and the UI in
+(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L2324)), and the UI in
 [`AIChatbot.jsx`](../route-optimizer-frontend/src/AIChatbot.jsx).
 
 The assistant fills in the form. It turns an operator's sentence into **one validated change at
@@ -12,10 +12,11 @@ runs the optimizer and never reads results.
 operator utterance
   ├─ 1. lexicon fast path      known phrasings ("temperature 30 C", "6 packs", "开空调") → no model call
   │      miss ↓
-  ├─ 2. constrained extraction  GPT-4o-mini, strict JSON schema, closed set of intents
-  └─ 3. deterministic validation
+  ├─ 2. constrained extraction  GPT-4o-mini, strict JSON schema: an ordered list of steps (usually one)
+  └─ 3. deterministic validation, step by step in order
          • schema + null coupling   exactly one typed value slot, matching the axis; ranges enforced
          • evidence span            the quoted `evidence` must literally appear in the utterance (anti-hallucination)
+         • padding dropped          value-less changes, and fields restated as they already are, are discarded
          • ambiguity flag / term    model flag OR bare place name with no state/ZIP → forces a question
               ├─ apply change       one step, one axis; extra changes are queued and released per "yes"
               ├─ ask a question     `pending` is echoed back by the client, so the session remembers it
@@ -28,9 +29,10 @@ operator utterance
 |---|---|
 | Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L1220) |
 | What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L1259) |
-| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L1596), [`lexicon_fast_path()`](../route_optimizer_backend.py#L1697) |
-| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L1773), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L1834), [`call_extraction()`](../route_optimizer_backend.py#L1906) |
-| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L1940), [`validate_extraction()`](../route_optimizer_backend.py#L2022), [`route_outcome()`](../route_optimizer_backend.py#L2120) |
+| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L1596), [`lexicon_fast_path()`](../route_optimizer_backend.py#L1719) |
+| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L1863), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L1871), [`call_extraction()`](../route_optimizer_backend.py#L1946) |
+| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L1985), [`validate_extraction()`](../route_optimizer_backend.py#L2075), [`route_outcome()`](../route_optimizer_backend.py#L2191) |
+| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L2280) |
 | Building the reply | `outcome_apply / outcome_ask / outcome_recommend / outcome_memory / outcome_out_of_scope` |
 | Applying a change in the UI | [`applyChatChange`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L272) in `RouteOptimizer.jsx` |
 
@@ -43,6 +45,32 @@ To apply every validated change in a single turn instead of one at a time, set
 
 Without `OPENAI_API_KEY` in `.env`, the lexicon fast path still works. Everything else returns
 *out of scope* with the capability list.
+
+## Several requests in one message
+
+One message can ask for several actions in sequence. The model returns them as an ordered list
+of steps, and the server runs them in that order:
+
+```
+"delete driver Han and Linus, then list all drivers"
+   -> Drivers Han, Linus deleted
+      2 drivers saved:
+      [Donghua] [Li]        one card per driver, with packs and weight when saved
+```
+
+- **A later step sees what an earlier one did.** The list runs after the deletion. "Use 3
+  trucks, then tell me which solver to use" gets advice for 3 trucks
+  ([`advance_form_state()`](../route_optimizer_backend.py#L2238) carries the form forward between steps).
+- **Most messages are still one step.** Several values in one sentence ("2 trucks with 6 packs")
+  form one step with several changes, and deleting several drivers is one step.
+- **One form change per message still holds.** If a second step would change the form again, it
+  is held behind a "yes / no" question, just as the second change of a single step is.
+- **A question stops the sequence.** If a step needs an answer (an ambiguous address, a queued
+  change, a solver-switch offer), the steps after it are not run, and the reply says so:
+  "The rest of your request is on hold until you answer — say it again afterwards."
+- **At most 5 steps** per message (`MAX_STEPS`).
+- Each step's reply goes on its own line, and every change from every step is applied to the
+  form in order.
 
 ## Solver recommendation
 
@@ -96,17 +124,25 @@ saved. If the model recognises a save request but returns no name, the reply ask
   vehicle slot already had. The driver's name then shows on the vehicle card and on that
   vehicle's route in the results (`routes[].driver`).
 - **The same gates that protect form changes protect profiles.** Packs and weight go through the
-  form's range checks (3–9 packs, 10,000–19,500 lbs). The model must quote the words it read the
-  profile from, and the driver's name must appear in the message, so it cannot invent a driver.
+  form's range checks (3–9 packs, 10,000–19,500 lbs). The driver's name must appear in the message
+  as a whole word, so the model cannot invent a driver. When packs or weight are given, the model
+  must also quote one exact, unbroken phrase from the message for that driver, so it cannot move
+  one driver's numbers onto another. A name on its own needs no quote, so "add driver Linus and
+  Han" saves both.
+- **A driver is only deleted or loaded if you wrote their name.** "delete everything" or
+  "remove all drivers" deletes nobody; the assistant asks "Which driver should I delete?". Any
+  name the model adds that is not in the message is refused and listed as "not found in your
+  message". To wipe the whole memory, use `DELETE /api/memory`.
 - **An update merges** with what is stored, so "Wang runs 8 packs now" keeps the stored weight.
   Up to 40 drivers can be stored.
-- **A saved driver's name disables the lexicon fast path** for that message. "Wang runs 8 packs
-  now" must update the *profile*, while "set battery packs to 8" changes the *form*, and only the
-  model can tell them apart. Names are matched as whole words, so a driver called "Li" does not
-  capture "climate".
+- **A saved driver's name, or words like "driver", "save" or "remember", disable the lexicon fast
+  path** for that message. "Wang runs 8 packs now" must update the *profile*, while "set battery
+  packs to 8" changes the *form*, and only the model can tell them apart. Without this, "add driver
+  Linus with 6 packs" would set the form's packs to 6. Names are matched as whole words, so a
+  driver called "Li" does not capture "climate".
 
-Code: [`do_remember()`](../route_optimizer_backend.py#L2335), [`do_recall()`](../route_optimizer_backend.py#L2363),
-[`do_forget()`](../route_optimizer_backend.py#L2397), [`validate_profile()`](../route_optimizer_backend.py#L2272).
+Code: [`do_remember()`](../route_optimizer_backend.py#L2512), [`do_recall()`](../route_optimizer_backend.py#L2544),
+[`do_forget()`](../route_optimizer_backend.py#L2577), [`validate_profile()`](../route_optimizer_backend.py#L2435).
 
 The memory is stored in one JSON file, `fleet_memory.json`, next to the server. It is gitignored
 because it is runtime state. Its shape is
@@ -138,7 +174,11 @@ the earlier vehicle-and-plate version (keyed `"vehicles"`) is not carried over.
 ```
 
 `intent` is one of `apply`, `ask`, `recommend`, `memory` or `out_of_scope`. `source` is `lexicon`,
-`model` or `session`. `advice` is filled for `recommend`, and `profiles` for `memory`.
+`model` or `session`. `advice` is filled for `recommend`, and `profiles` for `memory`. For a
+multi-step message, `intent` is that of the last step run, `message` has one line per step, and
+`changes` holds every step's changes in order. The client applies everything in `changes`
+whatever the `intent`. That includes the `fleet` change a driver load produces, which before
+this fix was shown as "Loaded" but never applied.
 
 ## Regression scripts
 
