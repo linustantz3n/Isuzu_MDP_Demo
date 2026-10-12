@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, User } from 'lucide-react';
 import RouteMap from './RouteMap';
 import FleetCharts from './FleetCharts';
+import AIChatbot from './AIChatbot';
 
 const API_BASE = 'http://localhost:5001/api';
 
@@ -32,6 +33,9 @@ function RouteOptimizer() {
     { id: 1, name: 'Vehicle 1', weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 }
   ]);
   const [lastLocations, setLastLocations] = useState([]);
+  // 'auto' lets the backend price Held-Karp before running it; the chatbot can
+  // pin a specific solver via the `solver` axis.
+  const [solver, setSolver] = useState('auto');
   const [energyParams, setEnergyParams] = useState({
     temperature_c: 20,
     total_weight_lbs: 19500,
@@ -216,7 +220,8 @@ function RouteOptimizer() {
           return_to_start: useDepot,
           num_vehicles: vehicles.length,
           vehicles: vehicles,
-          energy_params: energyParams
+          energy_params: energyParams,
+          solver: solver
         })
       });
 
@@ -226,7 +231,8 @@ function RouteOptimizer() {
         throw new Error(data.message);
       }
 
-      setResults(data.results);
+      // `solver` rides along on results so the panel and the data stay in sync.
+      setResults({ ...data.results, solver: data.solver });
       setLastLocations(locationsToOptimize);
     } catch (err) {
       setError(err.message || 'Failed to optimize route');
@@ -258,6 +264,97 @@ function RouteOptimizer() {
 
   const isDepotValidated = () => {
     return useDepot && depot.trim() && validatedDepot !== null;
+  };
+
+  // Chatbot "apply change" outcome: one call touches exactly one axis and only
+  // invalidates what that axis affects (mirrors the manual handlers above).
+  const applyChatChange = ({ axis, op, value }) => {
+    switch (axis) {
+      case 'depot':
+        updateDepot(value);
+        break;
+      case 'addresses':
+        setAddresses(prev => {
+          const current = prev.filter(a => a.trim());
+          let next;
+          if (op === 'add') next = [...current, ...value];
+          else if (op === 'remove') next = current.filter(a => !value.some(v => a.toLowerCase().includes(v.toLowerCase())));
+          else next = [...value];
+          while (next.length < 2) next.push('');
+          return next;
+        });
+        setValidatedLocations([]);
+        setResults(null);
+        break;
+      case 'vehicle_count':
+        setVehicles(prev => {
+          if (value <= prev.length) return prev.slice(0, value);
+          const out = [...prev];
+          while (out.length < value) {
+            const id = out.length ? Math.max(...out.map(v => v.id)) + 1 : 1;
+            out.push({ id, name: `Vehicle ${id}`, weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 });
+          }
+          return out;
+        });
+        setResults(null);
+        break;
+      case 'battery_packs':
+        setVehicles(prev => prev.map(v => ({
+          ...v,
+          battery_packs: value,
+          battery_kwh: value * 20,
+          weight_lbs: Math.round(BASE_WEIGHT_NO_BATTERY + value * PACK_WEIGHT_LBS),
+        })));
+        setResults(null);
+        break;
+      case 'vehicle_weight_lbs':
+        setVehicles(prev => prev.map(v => ({ ...v, weight_lbs: value })));
+        setResults(null);
+        break;
+      case 'temperature_c':
+      case 'unload_time_min':
+      case 'has_climate_control':
+        setEnergyParams(prev => ({ ...prev, [axis]: value }));
+        break;
+      case 'solver':
+        setSolver(value);
+        setResults(null);
+        break;
+      case 'fleet':
+        // A memory recall: each vehicle carries its own packs and weight,
+        // unlike the uniform battery_packs / vehicle_weight_lbs axes.
+        setVehicles(value.map((v, i) => ({
+          id: i + 1,
+          name: v.name || `Vehicle ${i + 1}`,
+          battery_packs: v.battery_packs,
+          battery_kwh: v.battery_kwh ?? v.battery_packs * 20,
+          weight_lbs: v.weight_lbs,
+          driver: v.driver || '',
+          plate: v.plate || '',
+        })));
+        setResults(null);
+        break;
+      default:
+        break;
+    }
+  };
+
+  // Snapshot the chatbot sends with every message so relative requests
+  // ("one more truck") resolve against what is actually on screen.
+  const chatFormState = {
+    depot,
+    addresses: addresses.filter(a => a.trim()),
+    vehicle_count: vehicles.length,
+    battery_packs: vehicles[0]?.battery_packs ?? 4,
+    vehicle_weight_lbs: vehicles[0]?.weight_lbs ?? 13000,
+    fleet: vehicles.map(v => ({
+      name: v.name, battery_packs: v.battery_packs,
+      weight_lbs: v.weight_lbs, driver: v.driver || '', plate: v.plate || '',
+    })),
+    temperature_c: energyParams.temperature_c,
+    unload_time_min: energyParams.unload_time_min,
+    has_climate_control: energyParams.has_climate_control,
+    solver,
   };
 
   const hk = results?.optimal;
@@ -423,6 +520,20 @@ function RouteOptimizer() {
                         </button>
                       )}
                     </div>
+                    {(v.driver || v.plate) && (
+                      <div className="flex items-center gap-2 mb-2 -mt-1">
+                        {v.driver && (
+                          <span className="text-[10px] text-slate-500 flex items-center gap-1">
+                            <User className="w-2.5 h-2.5" />{v.driver}
+                          </span>
+                        )}
+                        {v.plate && (
+                          <span className="text-[9px] font-mono text-slate-400 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5">
+                            {v.plate}
+                          </span>
+                        )}
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="text-[10px] text-slate-500 block mb-1">Battery Packs</label>
@@ -584,7 +695,14 @@ function RouteOptimizer() {
                     {lastLocations.length} stops
                     {fleet && ` · ${fleet.num_vehicles_used} vehicle${fleet.num_vehicles_used !== 1 ? 's' : ''} dispatched`}
                     {fleet && fleet.num_vehicles_requested !== fleet.num_vehicles_used && ` (${fleet.num_vehicles_requested} requested)`}
+                    {results.solver && ` · solver: ${results.solver.requested === 'auto' ? 'auto' : results.solver.baseline_label}`}
                   </p>
+                  {results.solver?.note && (
+                    <p className="text-[11px] text-amber-400/80 mt-1 flex items-center gap-1.5">
+                      <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                      {results.solver.note}
+                    </p>
+                  )}
                 </div>
                 {fleet && (
                   <div className="text-right">
@@ -601,8 +719,12 @@ function RouteOptimizer() {
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
                   <div className="flex items-center gap-2 mb-3">
                     <Route className="w-4 h-4 text-yellow-400" />
-                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Held-Karp</span>
-                    <span className="ml-auto text-[10px] text-slate-600">exact · 1 vehicle</span>
+                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+                      {results.solver?.baseline_label || 'Held-Karp'}
+                    </span>
+                    <span className="ml-auto text-[10px] text-slate-600">
+                      {results.solver?.baseline_exact === false ? 'approx' : 'exact'} · 1 vehicle
+                    </span>
                   </div>
                   <div className="space-y-2">
                     <div className="flex justify-between items-center">
@@ -945,6 +1067,7 @@ function RouteOptimizer() {
           )}
         </main>
       </div>
+      <AIChatbot formState={chatFormState} onApplyChange={applyChatChange} />
     </div>
   );
 }

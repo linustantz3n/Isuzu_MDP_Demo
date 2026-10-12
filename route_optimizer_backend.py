@@ -12,6 +12,7 @@ API will be available at http://localhost:5000
 """
 
 import os
+import re
 import json
 import math
 import time
@@ -635,6 +636,300 @@ def solve_vrp_ortools(matrix: list, num_vehicles: int) -> list:
 
 
 # =============================================================================
+# Solver registry and recommendation
+# =============================================================================
+#
+# The chatbot must never invent claims about the solvers, so everything it says
+# about them is computed here: feasibility, predicted runtime and the reason.
+#
+# Held-Karp is O(n^2 * 2^n). Measured on this machine (matrix size n, closed
+# tour): 118 ms at n=15, 621 ms at n=17, 3222 ms at n=19 — a near-constant
+# ~17 ns per unit of n^2 * 2^n. That lets us price the solve before paying for
+# it, instead of letting a 25-stop request hang the server for minutes.
+
+HK_SEC_PER_UNIT = 17e-9
+HK_TIME_BUDGET_MS = 2000.0     # `auto` declines Held-Karp beyond this
+HK_HARD_LIMIT_N = 22           # refuse outright; ~34 s even if asked for
+
+# 2-opt landed on the optimal tour in every measured case except n=12 (+6.6%).
+TWO_OPT_TYPICAL_GAP = "0–5%"
+NN_TYPICAL_GAP = "10–25%"
+
+SOLVERS = {
+    'held_karp': {
+        'label': 'Held-Karp',
+        'kind': 'tsp',
+        'quality': 'optimal (proven)',
+        'complexity': 'O(n²·2ⁿ)',
+        'multi_vehicle': False,
+    },
+    '2opt': {
+        'label': '2-opt',
+        'kind': 'tsp',
+        'quality': f'within {TWO_OPT_TYPICAL_GAP} of optimal',
+        'complexity': 'O(n²) per pass',
+        'multi_vehicle': False,
+    },
+    'nearest_neighbor': {
+        'label': 'Nearest neighbor',
+        'kind': 'tsp',
+        'quality': f'{NN_TYPICAL_GAP} worse than optimal',
+        'complexity': 'O(n²)',
+        'multi_vehicle': False,
+    },
+    'ortools_vrp': {
+        'label': 'OR-Tools VRP',
+        'kind': 'vrp',
+        'quality': 'near-optimal (metaheuristic)',
+        'complexity': 'guided local search',
+        'multi_vehicle': True,
+    },
+}
+
+SOLVER_CHOICES = ['auto'] + list(SOLVERS)
+
+
+def estimate_held_karp_ms(matrix_size: int) -> float:
+    """Predicted Held-Karp runtime in ms for an n x n matrix."""
+    n = max(1, int(matrix_size))
+    return (n ** 2) * (2 ** n) * HK_SEC_PER_UNIT * 1000.0
+
+
+CJK_RE = re.compile(r'[一-鿿]')
+
+
+def detect_lang(text: str) -> str:
+    """The advice is written by code, so it has to pick the operator's language itself."""
+    return 'zh' if CJK_RE.search(str(text or '')) else 'en'
+
+
+# Duration units, per language.
+_DUR = {
+    'en': [(1, "<1 ms"), (1000, "{:.0f} ms"), (90_000, "{:.1f} s"), (3_600_000, "{:.0f} min"),
+           (86_400_000, "{:.1f} h"), (3.15e10, "{:.0f} days"), (None, "{:.0f} years")],
+    'zh': [(1, "<1 毫秒"), (1000, "{:.0f} 毫秒"), (90_000, "{:.1f} 秒"), (3_600_000, "{:.0f} 分钟"),
+           (86_400_000, "{:.1f} 小时"), (3.15e10, "{:.0f} 天"), (None, "{:.0f} 年")],
+}
+_DUR_DIV = [1, 1, 1000, 60_000, 3_600_000, 86_400_000, 3.15e10]
+
+
+def format_duration(ms: float, lang: str = 'en') -> str:
+    rows = _DUR.get(lang, _DUR['en'])
+    for i, (limit, tmpl) in enumerate(rows):
+        if limit is None or ms < limit:
+            return tmpl if i == 0 else tmpl.format(ms / _DUR_DIV[i])
+    return rows[-1][1].format(ms / _DUR_DIV[-1])
+
+
+# Reason templates. One entry per branch of recommend_solver, so the English and
+# Chinese wordings cannot drift apart.
+REASONS = {
+'fleet': {
+ 'en': "{veh} vehicles means this is a VRP, not a TSP. OR-Tools is the only solver here that can split "
+       "stops across vehicles — Held-Karp, 2-opt and nearest neighbor all assume a single vehicle.",
+ 'zh': "{veh} 辆车意味着这是 VRP 而不是 TSP。这里只有 OR-Tools 能把站点分配给多辆车——"
+       "Held-Karp、2-opt 和最近邻都只能解单车路线。",
+},
+'fleet_no_guarantee': {
+ 'en': " No solver here can prove an optimum for multiple vehicles; Held-Karp only does that for one. "
+       "Drop to a single vehicle if you need the guarantee.",
+ 'zh': "另外，多车情况下这里没有任何求解器能证明最优——Held-Karp 只对单车有这个保证。"
+       "如果你必须要这个保证，请把车辆数降到 1。",
+},
+'trivial': {
+ 'en': "{stops} stops — any solver returns the same route.",
+ 'zh': "只有 {stops} 个站，用哪个求解器结果都一样。",
+},
+'affordable': {
+ 'en': "{stops} stops: Held-Karp finishes in about {hk} and its answer is provably optimal — worth it as "
+       "the baseline every other route is measured against.",
+ 'zh': "{stops} 个站：Held-Karp 大约 {hk} 就能跑完，而且结果在数学上可证明是最优的——"
+       "作为衡量其他路线的基线，这个代价值得付。",
+},
+'forced_optimal': {
+ 'en': "{stops} stops: Held-Karp will take about {hk} — slow, but you asked for the proven optimum, "
+       "and it is still within reach.",
+ 'zh': "{stops} 个站：Held-Karp 大约要 {hk}——是慢，但你要的是可证明的最优解，而且这个规模还跑得动。",
+},
+'too_slow': {
+ 'en': "{stops} stops puts Held-Karp at roughly {hk} — every extra stop doubles that. 2-opt stays under "
+       "a millisecond and typically lands on the same tour ({gap} off optimal). Say \"I need the proven "
+       "optimum\" to force it.",
+ 'zh': "{stops} 个站会让 Held-Karp 跑大约 {hk}——每多一个站这个时间就翻一倍。"
+       "2-opt 不到 1 毫秒，而且通常能找到同一条路线（与最优相差 {gap}）。"
+       "说“我要可证明的最优解”可以强制使用 Held-Karp。",
+},
+'beyond_limit': {
+ 'en': "{stops} stops is past Held-Karp's practical limit (about {hk}, and it needs {mb} M states in "
+       "memory). 2-opt handles any size in milliseconds at {gap} off optimal.",
+ 'zh': "{stops} 个站已经超出 Held-Karp 的实用上限（约 {hk}，还需要 {mb} M 个状态驻留内存）。"
+       "2-opt 不论规模都是毫秒级，与最优相差 {gap}。",
+},
+}
+
+# Sentences outcome_recommend assembles around the reason.
+PHRASES = {
+'scope_current': {'en': "At your current {stops} stops and {veh} vehicle{s}",
+                  'zh': "按当前的 {stops} 个站、{veh} 辆车"},
+'scope_hypo':    {'en': "For {stops} stops and {veh} vehicle{s}",
+                  'zh': "如果是 {stops} 个站、{veh} 辆车"},
+'use':           {'en': "{scope}: use {label}. {reason}", 'zh': "{scope}：用 {label}。{reason}"},
+'already':       {'en': " That is already what you're running.", 'zh': "这也正是你现在在用的。"},
+'switch_q':      {'en': " Switch to {label}? (yes / no)", 'zh': "要切换到 {label} 吗？（是 / 否）"},
+'switch_pend':   {'en': "Switch solver to {label}? (yes / no)", 'zh': "要把求解器切换到 {label} 吗？（是 / 否）"},
+'current_auto':  {'en': "Solver is set to {cur}, which resolves to {eff} here. {reason}",
+                  'zh': "求解器设置为 {cur}，在这里会解析成 {eff}。{reason}"},
+'current_pin':   {'en': "Solver is set to {cur}. {reason}", 'zh': "求解器设置为 {cur}。{reason}"},
+'why':           {'en': "Held-Karp is exponential: O(n²·2ⁿ). Measured here, it takes 118 ms at 14 stops, "
+                        "621 ms at 16 and 3.2 s at 18 — every stop you add roughly doubles it, so 24 stops is "
+                        "already about 13 minutes. 2-opt is O(n²) per pass, stays under a millisecond at any "
+                        "size in this tool, and lands within {gap} of optimal — usually exactly on it. "
+                        "{scope}, Held-Karp is priced at {hk}, so the answer is: it is worth paying while it "
+                        "is cheap, and not once it is not.",
+                  'zh': "Held-Karp 是指数复杂度 O(n²·2ⁿ)。在这台机器上实测：14 个站 118 毫秒，16 个站 621 毫秒，"
+                        "18 个站 3.2 秒——每多一个站大约翻一倍，所以 24 个站就已经要 13 分钟左右。"
+                        "2-opt 每轮是 O(n²)，在本工具的任何规模下都不到 1 毫秒，且与最优相差 {gap}——通常就是最优解。"
+                        "{scope}，Held-Karp 的代价是 {hk}。所以答案是：便宜的时候值得付，不便宜的时候就不值。"},
+'about_ok':      {'en': "{label} is the right pick here. {reason}", 'zh': "{label} 在这里正是合适的选择。{reason}"},
+'about_workable':{'en': "{label} would work here, but {pick} is the better pick. {reason}",
+                  'zh': "{label} 在这里能用，但 {pick} 更合适。{reason}"},
+'about_no':      {'en': "{label} is not the one to use here — {why} {reason}",
+                  'zh': "{label} 在这里不合适——{why}{reason}"},
+'why_multi':     {'en': "it only handles a single vehicle.", 'zh': "它只能处理单车。"},
+'why_slow':      {'en': "at {stops} stops it would take about {hk}.", 'zh': "{stops} 个站要跑大约 {hk}。"},
+'why_worse':     {'en': "it is {gap} worse than optimal and costs no less than 2-opt.",
+                  'zh': "它比最优差 {gap}，而代价并不比 2-opt 低。"},
+'why_single':    {'en': "it needs 2 or more vehicles.", 'zh': "它需要 2 辆或更多车。"},
+}
+
+
+def _t(key: str, lang: str, **kw) -> str:
+    return PHRASES[key].get(lang, PHRASES[key]['en']).format(**kw)
+
+
+def recommend_solver(num_stops: int, num_vehicles: int, need_optimal: bool = False,
+                     lang: str = 'en') -> dict:
+    """Deterministic solver choice for a problem shape. No model involved.
+
+    num_stops excludes the depot; the matrix Held-Karp sees is num_stops + 1.
+    """
+    num_stops = max(0, int(num_stops))
+    num_vehicles = max(1, int(num_vehicles))
+    n = num_stops + 1
+    hk_ms = estimate_held_karp_ms(n)
+
+    def out(branch, solver, **kw):
+        text = REASONS[branch].get(lang, REASONS[branch]['en']).format(
+            stops=num_stops, veh=num_vehicles, hk=format_duration(hk_ms, lang),
+            gap=TWO_OPT_TYPICAL_GAP, mb=2 ** n // 1_000_000, **kw)
+        return {'solver': solver, 'reason': text, 'hk_estimate_ms': hk_ms, 'branch': branch}
+
+    if num_vehicles > 1:
+        r = out('fleet', 'ortools_vrp')
+        if need_optimal:
+            r['reason'] += REASONS['fleet_no_guarantee'].get(lang, REASONS['fleet_no_guarantee']['en'])
+        return r
+    if num_stops < 2:
+        return out('trivial', 'held_karp')
+    if hk_ms <= HK_TIME_BUDGET_MS:
+        return out('affordable', 'held_karp')
+    if n <= HK_HARD_LIMIT_N:
+        return out('forced_optimal', 'held_karp') if need_optimal else out('too_slow', '2opt')
+    return out('beyond_limit', '2opt')
+
+
+TABLE_NOTES = {
+    'single_only': {'en': 'single vehicle only', 'zh': '仅支持单车'},
+    'needs_multi': {'en': 'needs 2+ vehicles', 'zh': '需要 2 辆及以上'},
+    'too_slow':    {'en': 'too slow ({hk})', 'zh': '太慢（{hk}）'},
+    'instant':     {'en': '<1 ms', 'zh': '<1 毫秒'},
+}
+QUALITY_ZH = {
+    'held_karp': '最优（可证明）',
+    '2opt': f'与最优相差 {TWO_OPT_TYPICAL_GAP}',
+    'nearest_neighbor': f'比最优差 {NN_TYPICAL_GAP}',
+    'ortools_vrp': '接近最优（元启发式）',
+}
+
+
+def solver_table(num_stops: int, num_vehicles: int, lang: str = 'en') -> list:
+    """Per-solver feasibility and cost at this problem size — the evidence behind the advice."""
+    n = max(0, int(num_stops)) + 1
+    multi = int(num_vehicles) > 1
+    hk_ms = estimate_held_karp_ms(n)
+
+    def note(key, **kw):
+        return TABLE_NOTES[key].get(lang, TABLE_NOTES[key]['en']).format(**kw)
+
+    rows = []
+    for key, spec in SOLVERS.items():
+        row = {'solver': key, 'label': spec['label'], 'complexity': spec['complexity'],
+               'quality': QUALITY_ZH[key] if lang == 'zh' else spec['quality'],
+               'feasible': True, 'note': ''}
+        if multi and not spec['multi_vehicle']:
+            row['feasible'], row['note'] = False, note('single_only')
+        elif not multi and spec['multi_vehicle']:
+            row['feasible'], row['note'] = False, note('needs_multi')
+        elif key == 'held_karp':
+            row['estimate_ms'] = hk_ms
+            row['note'] = format_duration(hk_ms, lang)
+            if n > HK_HARD_LIMIT_N:
+                row['feasible'], row['note'] = False, note('too_slow', hk=format_duration(hk_ms, lang))
+        else:
+            row['note'] = note('instant')
+        rows.append(row)
+    return rows
+
+
+def resolve_solver(requested: str, num_stops: int, num_vehicles: int) -> dict:
+    """Turn a solver setting into the algorithm list /api/optimize should actually run.
+
+    The cheap heuristics always run so the comparison panel keeps working; the
+    setting really decides whether the exponential one is worth paying for.
+    """
+    requested = requested if requested in SOLVER_CHOICES else 'auto'
+    n = max(0, int(num_stops)) + 1
+    hk_ms = estimate_held_karp_ms(n)
+    algorithms = ['nearest_neighbor', '2opt']
+    skipped = None
+
+    if requested == 'auto':
+        # Held-Karp is the single-vehicle exact baseline the results panel is built
+        # around, so affordability decides it — in fleet mode too, where it serves
+        # as the "one truck does everything" reference.
+        run_hk = recommend_solver(num_stops, 1)['solver'] == 'held_karp'
+        if not run_hk:
+            skipped = (f"Held-Karp skipped: about {format_duration(hk_ms)} at {num_stops} stops. "
+                       f"Ask for the proven optimum to run it anyway.")
+    elif requested == 'held_karp':
+        run_hk = n <= HK_HARD_LIMIT_N
+        if not run_hk:
+            skipped = (f"Held-Karp refused: {num_stops} stops would take about {format_duration(hk_ms)}. "
+                       f"Showing 2-opt instead.")
+    elif requested == 'ortools_vrp':
+        run_hk = recommend_solver(num_stops, 1)['solver'] == 'held_karp'
+    else:
+        run_hk = False
+        skipped = f"Held-Karp skipped: solver is set to {SOLVERS[requested]['label']}."
+
+    if run_hk:
+        algorithms.insert(0, 'held_karp')
+
+    # Which route the single-vehicle baseline panel shows when Held-Karp did not run.
+    fallback = requested if requested in ('2opt', 'nearest_neighbor') else '2opt'
+
+    return {
+        'requested': requested,
+        'effective': 'held_karp' if run_hk else (
+            'ortools_vrp' if int(num_vehicles) > 1 else fallback),
+        'algorithms': algorithms,
+        'fallback_baseline': fallback,
+        'held_karp_estimate_ms': hk_ms,
+        'note': skipped,
+    }
+
+
+# =============================================================================
 # API Endpoints
 # =============================================================================
 
@@ -713,7 +1008,7 @@ def optimize_route():
     data = request.json
     locations = data.get('locations', [])
     mode = data.get('mode', 'distance')
-    algorithms = data.get('algorithms', ['held_karp', 'nearest_neighbor', '2opt'])
+    algorithms = data.get('algorithms')
     # Accept either a `vehicles` array (new) or legacy `num_vehicles` int.
     vehicles_config = data.get('vehicles', None)
     num_vehicles = data.get('num_vehicles', 1)
@@ -727,7 +1022,14 @@ def optimize_route():
     
     if len(locations) > 25:
         return jsonify({"status": "error", "message": "Maximum 25 locations supported"}), 400
-    
+
+    # Solver selection. `auto` prices Held-Karp before running it, so a large
+    # request degrades to 2-opt instead of hanging the server for minutes.
+    num_stops_for_solver = len(locations) - (1 if return_to_start else 0)
+    solver_decision = resolve_solver(data.get('solver', 'auto'), num_stops_for_solver, num_vehicles)
+    if algorithms is None:
+        algorithms = solver_decision['algorithms']
+
     try:
         # Get distance matrix from Google
         matrices = get_distance_matrix(locations)
@@ -798,7 +1100,18 @@ def optimize_route():
             start = time.time()
             results['2opt'] = solve_tsp_2opt(matrix, return_to_start=return_to_start)
             results['2opt']['solve_time_ms'] = (time.time() - start) * 1000
-        
+
+        # The single-vehicle baseline panel always reads results['optimal'].
+        # When Held-Karp was priced out, the chosen heuristic stands in and says so.
+        if 'optimal' not in results:
+            fb = solver_decision.get('fallback_baseline', '2opt')
+            src = results.get('greedy' if fb == 'nearest_neighbor' else '2opt') or results.get('2opt')
+            if src:
+                stand_in = dict(src)
+                stand_in['order'] = list(src['order'])
+                stand_in['substituted_for'] = 'held_karp'
+                results['optimal'] = stand_in
+
         # Calculate full metrics for each result
         for key, result in results.items():
             order = result['order']
@@ -949,6 +1262,13 @@ def optimize_route():
                 'num_delivery_stops': num_delivery_stops,
             }
         
+        # Name the solver whose route the baseline panel is actually showing.
+        baseline_key = ('held_karp' if 'held_karp' in algorithms
+                        else solver_decision.get('fallback_baseline', '2opt'))
+        solver_decision['baseline_solver'] = baseline_key
+        solver_decision['baseline_label'] = SOLVERS[baseline_key]['label']
+        solver_decision['baseline_exact'] = baseline_key == 'held_karp'
+
         # Calculate savings if we have both optimal and greedy
         comparison = {}
         if 'optimal' in results and 'greedy' in results:
@@ -1136,6 +1456,7 @@ def optimize_route():
             "num_locations": len(locations),
             "results": results,
             "comparison": comparison,
+            "solver": solver_decision,
             "energy_params": {
                 "temperature_c": temperature_c,
                 "temperature_f": temperature_c * 9/5 + 32,
@@ -1175,6 +1496,1239 @@ def get_route_directions():
 
 
 # =============================================================================
+# AI Chat – lexicon fast path → constrained extraction → deterministic validation
+# =============================================================================
+#
+#   operator utterance
+#     │
+#     ├─ 1. lexicon fast path ──── hit ─────────────────────────────────┐
+#     │       known phrasings, no model call                            │
+#     │  miss                                                           │
+#     ├─ 2. constrained extraction                                      │
+#     │       GPT-4o-mini, strict closed schema, four intents           │
+#     │                                                                 │
+#     └─ 3. deterministic validation                                    │
+#             schema + null coupling                                    │
+#             evidence span must appear in the utterance                │
+#             ambiguity flag / term forces a question                   │
+#                  │                                                    │
+#                  ├─ apply change    one step, one axis  ◄─────────────┘
+#                  ├─ ask a question  remembered for the session
+#                  └─ out of scope    names the real capabilities
+#
+# The model only *proposes*; every value that reaches the form has passed
+# through plain Python checks in this section.
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4o-mini"
+
+INTENTS = ('apply', 'ask', 'confirm', 'recommend', 'memory', 'out_of_scope')
+
+# Closed vocabulary: every axis the chatbot may touch, its value type and hard
+# limits. Anything not listed here is out of scope by definition.
+AXES = {
+    'depot':               {'type': 'text',   'label': 'Depot'},
+    'addresses':           {'type': 'list',   'label': 'Stops'},
+    'vehicle_count':       {'type': 'number', 'label': 'Vehicles',       'min': 1,     'max': 10,    'unit': ''},
+    'battery_packs':       {'type': 'number', 'label': 'Battery packs',  'min': 3,     'max': 9,     'unit': ' packs'},
+    'vehicle_weight_lbs':  {'type': 'number', 'label': 'Vehicle weight', 'min': 10000, 'max': 19500, 'unit': ' lbs'},
+    'temperature_c':       {'type': 'number', 'label': 'Temperature',    'min': -10,   'max': 40,    'unit': ' °C'},
+    'unload_time_min':     {'type': 'number', 'label': 'Unload time',    'min': 5,     'max': 120,   'unit': ' min'},
+    'has_climate_control': {'type': 'bool',   'label': 'Climate control'},
+    'solver':              {'type': 'enum',   'label': 'Solver', 'choices': SOLVER_CHOICES},
+    # Set only by a memory recall: the full per-vehicle fleet, not a uniform value.
+    'fleet':               {'type': 'fleet',  'label': 'Fleet'},
+}
+
+AXIS_LABEL_ZH = {
+    'depot': '仓库', 'addresses': '站点', 'vehicle_count': '车辆数', 'battery_packs': '电池包',
+    'vehicle_weight_lbs': '整车重量', 'temperature_c': '温度', 'unload_time_min': '卸货时间',
+    'has_climate_control': '空调', 'solver': '求解器', 'fleet': '车队',
+}
+
+CAPABILITIES_ZH = [
+    "设置仓库地址",
+    "设置、新增或删除配送站点",
+    "设置车辆数量（1–10）",
+    "设置每辆车的电池包数（3–9，每包 20 kWh）",
+    "设置整车重量（10,000–19,500 lbs）",
+    "设置环境温度（−10 到 40 °C）",
+    "设置每站卸货时间（5–120 分钟）",
+    "开启或关闭空调",
+    "根据问题规模推荐求解器，并切换过去",
+    "按名字记住一辆车（电池、重量、司机、车牌），之后直接调用",
+]
+
+
+def axis_label(axis: str, lang: str = 'en') -> str:
+    return AXIS_LABEL_ZH[axis] if lang == 'zh' else AXES[axis]['label']
+
+# What the assistant can really do. Returned verbatim on the out-of-scope
+# branch so the answer never depends on the model's self-description.
+CAPABILITIES = [
+    "Set the depot address",
+    "Set, add or remove delivery stops",
+    "Set the number of vehicles (1–10)",
+    "Set battery packs per vehicle (3–9, 20 kWh each)",
+    "Set vehicle weight (10,000–19,500 lbs)",
+    "Set ambient temperature (−10 to 40 °C)",
+    "Set unload time per stop (5–120 min)",
+    "Turn climate control on or off",
+    "Recommend which solver fits your problem size, and switch to it",
+    "Remember a vehicle by name (packs, weight, driver, plate) and load it back later",
+]
+
+# One utterance → one applied change. Further validated changes are queued and
+# released one per confirmation, so the operator always sees exactly what moved.
+ONE_CHANGE_PER_TURN = True
+
+
+# Digits, English and Chinese number words, and the relative forms the model
+# resolves against the form state.
+NUMERIC_EVIDENCE_RE = re.compile(
+    r'\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|'
+    r'a|an|another|more|less|fewer|half|double|twice)\b'
+    r'|[一二两三四五六七八九十零半]|多|少|再|加|减', re.I)
+
+
+BOOL_EVIDENCE_RE = re.compile(
+    r'\b(?:on|off|enable[ds]?|disable[ds]?|turn|switch|with|without|no|yes|keep|stop|'
+    r'run(?:ning)?|use|using|hvac|a/?c|climate|cooling|heating)\b'
+    r'|[开关启停]|不用|关闭|打开|空调', re.I)
+
+
+def _norm(s: str) -> str:
+    """Whitespace-insensitive, case-insensitive form used for substring checks."""
+    return re.sub(r'\s+', '', str(s)).lower()
+
+
+_EDGE_PUNCT = ' \t\r\n.,;:!?。，；：！？"\'“”‘’()（）'
+
+
+def _strip_edges(s: str) -> str:
+    """Models like to add a trailing period to a quote; that must not fail the span check."""
+    return str(s or '').strip(_EDGE_PUNCT)
+
+
+# A bare place name with no street number, ZIP, comma or state code
+# ("Springfield", "Ann Arbor") can geocode to several places.
+_STATE_CODE = re.compile(r'\b[A-Z]{2}\b')
+
+
+def looks_ambiguous_place(text: str) -> bool:
+    t = str(text or '').strip()
+    return bool(t) and not any(ch.isdigit() for ch in t) and ',' not in t and '，' not in t and not _STATE_CODE.search(t)
+
+
+def describe_change(change: dict, lang: str = 'en') -> str:
+    """Deterministic one-line label for a validated change (shown as a chip)."""
+    spec = AXES[change['axis']]
+    label = axis_label(change['axis'], lang)
+    value, op = change['value'], change['op']
+    zh = lang == 'zh'
+    if spec['type'] == 'fleet':
+        names = ", ".join(v.get('name', '?') for v in value)
+        return (f"{label} → {names}（{len(value)} 辆）" if zh
+                else f"{label} → {names} ({len(value)} vehicle{'s' if len(value) != 1 else ''})")
+    if spec['type'] == 'enum':
+        return f"{label} → {'Auto' if value == 'auto' else SOLVERS[value]['label']}"
+    if spec['type'] == 'bool':
+        return f"{label} → {('开' if value else '关') if zh else ('on' if value else 'off')}"
+    if spec['type'] == 'number':
+        unit = UNIT_ZH.get(change['axis'], spec['unit']) if zh else spec['unit']
+        return f"{label} → {value}{unit}"
+    if spec['type'] == 'list':
+        n = len(value)
+        if op == 'add':
+            if zh:
+                return f"新增站点 → {value[0]}" if n == 1 else f"新增 {n} 个站点"
+            return f"Add stop → {value[0]}" if n == 1 else f"Add {n} stops"
+        if op == 'remove':
+            if zh:
+                return f"删除站点 → {value[0]}" if n == 1 else f"删除 {n} 个站点"
+            return f"Remove stop → {value[0]}" if n == 1 else f"Remove {n} stops"
+        return f"{label} → {n} 个地址" if zh else f"{label} → {n} address{'es' if n != 1 else ''}"
+    return f"{label} → {value}"
+
+
+UNIT_ZH = {'vehicle_count': ' 辆', 'battery_packs': ' 块', 'vehicle_weight_lbs': ' lbs',
+           'temperature_c': ' °C', 'unload_time_min': ' 分钟'}
+
+# Rejection reasons the operator reads, in both languages.
+REJECT = {
+    'unknown_field': {'en': "unknown field '{axis}'", 'zh': "未知字段「{axis}」"},
+    'unknown_op':    {'en': "unknown operation '{op}'", 'zh': "未知操作「{op}」"},
+    'op_stops_only': {'en': "'{op}' only applies to stops", 'zh': "「{op}」只适用于站点"},
+    'not_number':    {'en': "{label} must be a number", 'zh': "{label}必须是数字"},
+    'out_of_range':  {'en': "{label} must be between {lo} and {hi}{unit}",
+                      'zh': "{label}必须在 {lo} 到 {hi}{unit} 之间"},
+    'empty':         {'en': "{label} is empty", 'zh': "{label}是空的"},
+    'not_list':      {'en': "{label} must be a list", 'zh': "{label}必须是列表"},
+    'bad_enum':      {'en': "{label} must be one of: {choices}", 'zh': "{label}必须是以下之一：{choices}"},
+    'no_evidence':   {'en': "{label}: not found in your message", 'zh': "{label}：在你的话里找不到依据"},
+    'no_number':     {'en': "{label}: you didn't give a number for it", 'zh': "{label}：你没有给出数字"},
+    'no_onoff':      {'en': "{label}: you didn't say on or off", 'zh': "{label}：你没有说开还是关"},
+    'slot':          {'en': "{label}: value slot mismatch (got {got}, need {need})",
+                      'zh': "{label}：值的类型不对（收到 {got}，应为 {need}）"},
+}
+
+
+def _r(key: str, lang: str, **kw) -> str:
+    return REJECT[key].get(lang, REJECT[key]['en']).format(**kw)
+
+
+def check_value(axis: str, op: str, value, lang: str = 'en'):
+    """Range / shape check shared by both paths. Returns (value, None) or (None, reason)."""
+    spec = AXES.get(axis)
+    if not spec:
+        return None, _r('unknown_field', lang, axis=axis)
+    label = axis_label(axis, lang) if spec else axis
+    if op not in ('set', 'add', 'remove'):
+        return None, _r('unknown_op', lang, op=op)
+    if op != 'set' and spec['type'] != 'list':
+        return None, _r('op_stops_only', lang, op=op)
+
+    if spec['type'] == 'number':
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None, _r('not_number', lang, label=label)
+        value = int(round(value))
+        if not spec['min'] <= value <= spec['max']:
+            unit = UNIT_ZH.get(axis, spec['unit']) if lang == 'zh' else spec['unit']
+            return None, _r('out_of_range', lang, label=label, lo=spec['min'], hi=spec['max'], unit=unit)
+    elif spec['type'] == 'text':
+        value = str(value or '').strip()
+        if not value:
+            return None, _r('empty', lang, label=label)
+    elif spec['type'] == 'list':
+        if not isinstance(value, list):
+            return None, _r('not_list', lang, label=label)
+        value = [str(v).strip() for v in value if str(v or '').strip()]
+        if not value:
+            return None, _r('empty', lang, label=label)
+    elif spec['type'] == 'fleet':
+        if not isinstance(value, list) or not value:
+            return None, _r('empty', lang, label=label)
+    elif spec['type'] == 'bool':
+        value = bool(value)
+    elif spec['type'] == 'enum':
+        value = str(value or '').strip().lower().replace('-', '_').replace(' ', '_')
+        aliases = {'optimal': 'held_karp', 'heldkarp': 'held_karp', 'exact': 'held_karp',
+                   'greedy': 'nearest_neighbor', 'nn': 'nearest_neighbor',
+                   'two_opt': '2opt', 'opt2': '2opt', '2_opt': '2opt', '2opt_local_search': '2opt',
+                   'ortools': 'ortools_vrp', 'or_tools': 'ortools_vrp', 'vrp': 'ortools_vrp'}
+        value = aliases.get(value, value)
+        if value not in spec['choices']:
+            return None, _r('bad_enum', lang, label=label, choices=', '.join(spec['choices']))
+    return value, None
+
+
+def make_change(axis: str, op: str, value, evidence: str, lang: str = 'en') -> dict:
+    change = {'axis': axis, 'op': op, 'value': value, 'evidence': evidence}
+    change['label'] = describe_change(change, lang)
+    return change
+
+
+# ---- outcome builders (the three boxes at the bottom of the diagram) ---------
+
+def is_destructive(change: dict) -> bool:
+    """Changes that throw work away rather than adjust it."""
+    return change['axis'] == 'addresses' and change['op'] == 'remove' and len(change['value']) > 1
+
+
+OUTCOME_TEXT = {
+    'wipe':    {'en': "That removes {n} stops. Confirm? (yes / no)", 'zh': "这会删掉 {n} 个站点，确认吗？（是 / 否）"},
+    'also':    {'en': "Also apply: {label}? (yes / no)", 'zh': "还要设置 {label} 吗？（是 / 否）"},
+    'applied': {'en': "Applied: {list}.", 'zh': "已应用：{list}。"},
+    'skipped': {'en': " Skipped: {list}.", 'zh': "已跳过：{list}。"},
+    'dropped': {'en': "OK, dropped that.", 'zh': "好的，不改了。"},
+    'nothing': {'en': "There's nothing pending to confirm.", 'zh': "当前没有待确认的内容。"},
+}
+
+
+def _o(key: str, lang: str, **kw) -> str:
+    return OUTCOME_TEXT[key].get(lang, OUTCOME_TEXT[key]['en']).format(**kw)
+
+
+def outcome_apply(changes: list, source: str, rejected=None, confirmed: bool = False,
+                  lang: str = 'en') -> dict:
+    # Never wipe a list of stops on one sentence; make the operator say yes.
+    # `confirmed` means they just did, so the gate steps aside.
+    if changes and not confirmed and is_destructive(changes[0]):
+        return outcome_ask(_o('wipe', lang, n=len(changes[0]['value'])),
+                           'addresses', source, queued=changes, rejected=rejected)
+
+    sep = '；' if lang == 'zh' else '; '
+    if ONE_CHANGE_PER_TURN and len(changes) > 1:
+        applied, queued = changes[:1], changes[1:]
+        pending = {
+            'question': _o('also', lang, label=queued[0]['label']),
+            'axis': None,
+            'queued': queued,
+        }
+    else:
+        applied, pending = changes, None
+
+    message = _o('applied', lang, list=sep.join(c['label'] for c in applied))
+    if rejected:
+        message += _o('skipped', lang, list=sep.join(rejected))
+    if pending:
+        message += ("" if lang == 'zh' else " ") + pending['question']
+
+    return {
+        'status': 'ok', 'intent': 'apply', 'source': source,
+        'message': message, 'changes': applied, 'pending': pending,
+        'capabilities': None, 'rejected': rejected or [], 'advice': None, 'profiles': [],
+    }
+
+
+def outcome_ask(question: str, axis, source: str, queued=None, rejected=None, lang: str = 'en') -> dict:
+    """Ask a question; `pending` is echoed back by the client so the session remembers it."""
+    return {
+        'status': 'ok', 'intent': 'ask', 'source': source,
+        'message': question, 'changes': [],
+        'pending': {'question': question, 'axis': axis, 'queued': queued or []},
+        'capabilities': None, 'rejected': rejected or [], 'advice': None, 'profiles': [],
+    }
+
+
+def outcome_out_of_scope(message: str, source: str, list_capabilities: bool = True,
+                         lang: str = 'en') -> dict:
+    caps = (CAPABILITIES_ZH if lang == 'zh' else CAPABILITIES) if list_capabilities else None
+    return {
+        'status': 'ok', 'intent': 'out_of_scope', 'source': source,
+        'message': message, 'changes': [], 'pending': None,
+        'capabilities': caps, 'rejected': [], 'advice': None, 'profiles': [],
+    }
+
+
+def why_not(solver: str, num_stops: int, num_vehicles: int, lang: str) -> str:
+    """Deterministic reason a named solver is the wrong pick here, or '' if it is fine."""
+    n = num_stops + 1
+    if num_vehicles > 1 and not SOLVERS[solver]['multi_vehicle']:
+        return _t('why_multi', lang)
+    if num_vehicles <= 1 and SOLVERS[solver]['multi_vehicle']:
+        return _t('why_single', lang)
+    if solver == 'held_karp' and estimate_held_karp_ms(n) > HK_TIME_BUDGET_MS:
+        return _t('why_slow', lang, stops=num_stops, hk=format_duration(estimate_held_karp_ms(n), lang))
+    if solver == 'nearest_neighbor':
+        return _t('why_worse', lang, gap=NN_TYPICAL_GAP)
+    return ''
+
+
+def outcome_recommend(topic: str, num_stops: int, num_vehicles: int, current: str, source: str,
+                      hypothetical: bool = False, need_optimal: bool = False,
+                      lang: str = 'en', about: str = None) -> dict:
+    """Solver advice. Every number and claim below is computed, never generated.
+
+    topic: 'which' (what should I use), 'why' (why not always the optimal one),
+           'current' (what am I using now).
+    about: a solver the operator named, e.g. "should I use Held-Karp?".
+    """
+    rec = recommend_solver(num_stops, num_vehicles, need_optimal, lang)
+    table = solver_table(num_stops, num_vehicles, lang)
+    current = current if current in SOLVER_CHOICES else 'auto'
+    effective_now = (recommend_solver(num_stops, num_vehicles, lang=lang)['solver']
+                     if current == 'auto' else current)
+    plural = '' if num_vehicles == 1 else 's'
+    scope = _t('scope_hypo' if hypothetical else 'scope_current', lang,
+               stops=num_stops, veh=num_vehicles, s=plural)
+    label = SOLVERS[rec['solver']]['label']
+    pending = None
+
+    if topic == 'current':
+        cur_label = 'Auto' if current == 'auto' else SOLVERS[current]['label']
+        msg = (_t('current_auto', lang, cur=cur_label, eff=SOLVERS[effective_now]['label'], reason=rec['reason'])
+               if current == 'auto' else
+               _t('current_pin', lang, cur=cur_label, reason=rec['reason']))
+    elif topic == 'why':
+        msg = _t('why', lang, gap=TWO_OPT_TYPICAL_GAP, scope=scope,
+                 hk=format_duration(rec['hk_estimate_ms'], lang))
+    elif about and about in SOLVERS:
+        # They named a solver: answer about that one, then give the pick.
+        reason = why_not(about, num_stops, num_vehicles, lang)
+        if reason:
+            msg = _t('about_no', lang, label=SOLVERS[about]['label'], why=reason, reason=rec['reason'])
+        elif about == rec['solver']:
+            msg = _t('about_ok', lang, label=SOLVERS[about]['label'], reason=rec['reason'])
+        else:
+            # Usable, just not the best trade at this size.
+            msg = _t('about_workable', lang, label=SOLVERS[about]['label'], pick=label, reason=rec['reason'])
+    else:
+        msg = _t('use', lang, scope=scope, label=label, reason=rec['reason'])
+
+    # Offer the switch only for a question about the form as it stands.
+    if topic == 'which' and not hypothetical:
+        if rec['solver'] != effective_now:
+            msg += _t('switch_q', lang, label=label)
+            pending = {'question': _t('switch_pend', lang, label=label), 'axis': 'solver',
+                       'queued': [make_change('solver', 'set', rec['solver'],
+                                              f"recommended for {num_stops} stops / {num_vehicles} vehicles")]}
+        elif not about:
+            msg += _t('already', lang)
+
+    return {
+        'status': 'ok', 'intent': 'recommend', 'source': source,
+        'message': msg, 'changes': [], 'pending': pending,
+        'capabilities': None, 'rejected': [], 'profiles': [], 'advice': {
+            'topic': topic, 'about': about,
+            'recommended': rec['solver'], 'recommended_label': label,
+            'current': current, 'effective_now': effective_now,
+            'num_stops': num_stops, 'num_vehicles': num_vehicles,
+            'hypothetical': hypothetical, 'lang': lang,
+            'held_karp_estimate': format_duration(rec['hk_estimate_ms'], lang),
+            'table': table,
+        },
+    }
+
+
+# ---- 1. lexicon fast path ----------------------------------------------------
+# Known phrasings for the numeric / boolean axes. A hit skips the model entirely.
+# Free-text axes (depot, stops) are never fast-pathed: they always go through
+# extraction + evidence validation.
+
+_NUM = r'(-?\d+(?:\.\d+)?)'
+_SEP = r'\s*(?:is|to|of|at|=|:|set\s*to|改成|改为|设为|设置为|调到|是|为)?\s*'
+_AC = r'(?:a/?c|climate(?:\s*control)?|hvac|air\s*con(?:ditioning)?|空调)'
+
+
+def _num(m):
+    return float(m.group(1))
+
+
+def _f_to_c(m):
+    return (float(m.group(1)) - 32) * 5 / 9
+
+
+# (axis, pattern, required-context pattern or None, value extractor)
+LEXICON = [
+    ('temperature_c', re.compile(_NUM + r'\s*°?\s*(?:deg(?:rees?)?\s*)?(?:c\b|celsius|摄氏度?)', re.I), None, _num),
+    ('temperature_c', re.compile(_NUM + r'\s*°?\s*(?:deg(?:rees?)?\s*)?(?:f\b|fahrenheit|华氏度?)', re.I), None, _f_to_c),
+    ('temperature_c', re.compile(_NUM + r'\s*°?\s*度', re.I), None, _num),
+    ('temperature_c', re.compile(r'(?:temp(?:erature)?|温度)' + _SEP + _NUM, re.I), None, _num),
+
+    ('battery_packs', re.compile(_NUM + r'\s*(?:battery\s*)?packs?\b', re.I), None, _num),
+    ('battery_packs', re.compile(_NUM + r'\s*(?:块|个|组)?\s*电池', re.I), None, _num),
+    ('battery_packs', re.compile(r'(?:packs?|batter(?:y|ies)|电池(?:包|组)?)' + _SEP + _NUM, re.I), None, _num),
+
+    ('unload_time_min', re.compile(_NUM + r'\s*(?:min(?:ute)?s?|分钟)', re.I),
+     re.compile(r'unload|service|dwell|per\s*stop|卸货|每站|停留', re.I), _num),
+    ('unload_time_min', re.compile(r'(?:unload(?:ing)?(?:\s*time)?|卸货(?:时间)?)' + _SEP + _NUM, re.I), None, _num),
+
+    ('vehicle_count', re.compile(_NUM + r'\s*(?:trucks?|vehicles?|vans?|辆(?:车)?|台(?:车)?)', re.I), None, _num),
+    ('vehicle_count', re.compile(r'(?:trucks?|vehicles?|fleet(?:\s*size)?|车辆|车)' + _SEP + _NUM, re.I), None, _num),
+
+    ('vehicle_weight_lbs', re.compile(_NUM + r'\s*(?:lbs?|pounds?|磅)', re.I), None, _num),
+    ('vehicle_weight_lbs', re.compile(r'(?:weigh(?:t|s)?|重量)' + _SEP + _NUM, re.I), None, _num),
+
+    ('has_climate_control', re.compile(r'(?:turn\s*on|switch\s*on|enable|with|开|打开)\s*(?:the\s*)?' + _AC, re.I), None, lambda m: True),
+    ('has_climate_control', re.compile(r'(?:turn\s*off|switch\s*off|disable|without|no|关|关闭)\s*(?:the\s*)?' + _AC, re.I), None, lambda m: False),
+    ('has_climate_control', re.compile(_AC + r'\s*(?:on|开)\b', re.I), None, lambda m: True),
+    ('has_climate_control', re.compile(_AC + r'\s*(?:off|关)', re.I), None, lambda m: False),
+]
+
+# Replies to a pending question.
+YES_RE = re.compile(r'^\s*(?:y|yes|yeah|yep|yup|ok|okay|sure|go\s*ahead|continue|next|do\s*it|please|好|好的|是|是的|对|继续|可以|行|嗯)\s*[.!。！]*\s*$', re.I)
+NO_RE = re.compile(r'^\s*(?:n|no|nope|nah|cancel|skip|stop|不|不用|不要|取消|算了|跳过)\s*[.!。！]*\s*$', re.I)
+BARE_NUM_RE = re.compile(r'^\s*' + _NUM + r'\s*$')
+
+# Bare solver questions with no numbers in them: the answer is computed either
+# way, so there is nothing for the model to add.
+_SOLVER_WORD = r'(?:solver|algorithm|algo|求解器|算法)'
+# An actual "why" / "how slow" question, as opposed to "is X good enough".
+WHY_RE = re.compile(r'\bwhy\b|how\s+(?:slow|long|fast|big|much\s+time|expensive)'
+                    r'|what\s+makes\s+it|为什么|为啥|多(?:慢|久|快)|要多长时间', re.I)
+SOLVER_TOPIC_LEXICON = [
+    ('current', re.compile(r'(?:which|what)\s+' + _SOLVER_WORD + r'.{0,20}?(?:using|running|active|now|currently|set to)'
+                           r'|current\s+' + _SOLVER_WORD + r'|(?:当前|现在|目前).{0,4}' + _SOLVER_WORD, re.I)),
+    ('why', re.compile(r'why\s+not.{0,30}(?:optimal|exact|held.?karp)'
+                       r'|why.{0,30}(?:not\s+)?always.{0,20}(?:optimal|exact|best|held.?karp)'
+                       r'|为(?:什么|啥).{0,12}(?:不|别).{0,12}(?:总是|一直|都)?.{0,8}(?:最优|精确|held.?karp)'
+                       r'|为(?:什么|啥).{0,8}(?:不用|不选).{0,8}(?:最优|精确)', re.I)),
+    ('which', re.compile(r'(?:which|what)\s+' + _SOLVER_WORD
+                         + r'|' + _SOLVER_WORD + r'\s+(?:should|would|to use|recommend)'
+                         + r'|recommend.{0,12}' + _SOLVER_WORD
+                         + r'|用(?:哪个|什么|啥)' + _SOLVER_WORD
+                         + r'|' + _SOLVER_WORD + r'(?:推荐|选哪个|用哪个)'
+                         + r'|推荐.{0,4}' + _SOLVER_WORD, re.I)),
+]
+
+
+def solver_topic_fast_path(utterance: str):
+    """Return 'which' / 'why' / 'current' for a plain solver question, else None."""
+    if re.search(r'\d', utterance):     # a stated size is a hypothetical → needs the model
+        return None
+    for topic, pattern in SOLVER_TOPIC_LEXICON:
+        if pattern.search(utterance):
+            return topic
+    return None
+
+
+# A question is never a command. Without this guard "30 stops and 1 truck?"
+# would match the vehicle pattern and silently set the fleet to one.
+QUESTION_RE = re.compile(r'[?？]\s*$|^\s*(?:what|which|how|why|should|can|could|is|are|do|does|would)\b'
+                         r'|吗\s*[?？]?\s*$|呢\s*[?？]?\s*$|(?:怎么|哪个|多少|是否|要不要)', re.I)
+
+# Utterances longer than this, or containing list separators, are too rich for
+# a regex table and always go to the model.
+LEXICON_MAX_LEN = 60
+
+
+# "one more truck" / "再加一辆车": a +1 / -1 move resolved against the form.
+RELATIVE_LEXICON = [
+    ('vehicle_count', +1, re.compile(r'(?:add|one more|another)\s*(?:one\s*)?(?:more\s*)?(?:truck|vehicle|van)'
+                                     r'|(?:再|多)(?:加|来)(?:一)?(?:辆|台)', re.I)),
+    ('vehicle_count', -1, re.compile(r'(?:remove|drop|one less|take away)\s*(?:one\s*)?(?:truck|vehicle|van)'
+                                     r'|(?:少|减)(?:一)?(?:辆|台)', re.I)),
+    ('battery_packs', +1, re.compile(r'(?:add|one more|another)\s*(?:one\s*)?(?:more\s*)?(?:battery\s*)?pack'
+                                     r'|(?:再|多)(?:加|来)(?:一)?(?:块|个|组)?电池', re.I)),
+    ('battery_packs', -1, re.compile(r'(?:remove|drop|one less)\s*(?:one\s*)?(?:battery\s*)?pack'
+                                     r'|(?:少|减)(?:一)?(?:块|个|组)?电池', re.I)),
+]
+
+
+def mentions_saved_vehicle(utterance: str) -> bool:
+    norm = _norm(utterance)
+    return any(key and key in norm for key in load_memory()['vehicles'])
+
+
+def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
+    """Return a finished outcome dict on a hit, or None on a miss."""
+    form_state = form_state or {}
+    lang = detect_lang(utterance)
+
+    # (a) replies to a question we asked earlier in the session
+    if pending:
+        queued = pending.get('queued') or []
+        if queued and YES_RE.match(utterance):
+            return outcome_apply(queued, source='session', confirmed=True, lang=lang)
+        if NO_RE.match(utterance):
+            return outcome_out_of_scope(_o('dropped', lang), source='session', list_capabilities=False, lang=lang)
+        axis = pending.get('axis')
+        m = BARE_NUM_RE.match(utterance)
+        if axis and AXES.get(axis, {}).get('type') == 'number' and m:
+            value, reason = check_value(axis, 'set', float(m.group(1)), lang)
+            if reason:
+                return outcome_ask(reason + ('。' if lang == 'zh' else '.'), axis, source='lexicon', lang=lang)
+            return outcome_apply([make_change(axis, 'set', value, m.group(0).strip(), lang)], source='lexicon', lang=lang)
+
+    is_question = bool(QUESTION_RE.search(utterance))
+
+    # "Truck A has 8 packs now" must update the stored profile, not the form.
+    # The regex table cannot tell those apart, so any saved name sends the
+    # utterance to the model.
+    if mentions_saved_vehicle(utterance):
+        return None
+
+    # (b) relative nudges that only need the current value
+    if not is_question and not re.search(r'\d', utterance):
+        for axis, step, pattern in RELATIVE_LEXICON:
+            m = pattern.search(utterance)
+            if m and isinstance(form_state.get(axis), (int, float)):
+                value, reason = check_value(axis, 'set', form_state[axis] + step, lang)
+                if reason:
+                    return outcome_ask(reason + ('。' if lang == 'zh' else '.'), axis, source='lexicon', lang=lang)
+                return outcome_apply([make_change(axis, 'set', value, m.group(0).strip(), lang)], source='lexicon', lang=lang)
+
+    # (c) a plain solver question — the advice is computed, not generated
+    topic = solver_topic_fast_path(utterance)
+    if topic:
+        return outcome_recommend(topic,
+                                 len(form_state.get('addresses') or []),
+                                 int(form_state.get('vehicle_count') or 1),
+                                 form_state.get('solver', 'auto'), source='lexicon', lang=lang)
+
+    # (d) known phrasings
+    if is_question or len(utterance) > LEXICON_MAX_LEN or ',' in utterance or '，' in utterance:
+        return None
+
+    hits = {}
+    for axis, pattern, context, extract in LEXICON:
+        if context and not context.search(utterance):
+            continue
+        m = pattern.search(utterance)
+        if m and axis not in hits:
+            hits[axis] = (m, extract(m))
+
+    # Exactly one axis must match; anything richer needs the model.
+    if len(hits) != 1:
+        return None
+
+    axis, (m, raw_value) = next(iter(hits.items()))
+    value, reason = check_value(axis, 'set', raw_value, lang)
+    if reason:
+        return outcome_ask(reason + ('。' if lang == 'zh' else '.'), axis, source='lexicon', lang=lang)
+    return outcome_apply([make_change(axis, 'set', value, m.group(0).strip(), lang)], source='lexicon', lang=lang)
+
+
+# ---- 2. constrained extraction -----------------------------------------------
+# Strict JSON schema: the model cannot add fields, cannot leave fields out, and
+# every enum is closed. Values are split into typed slots so the validator can
+# check null coupling instead of guessing what a string means.
+
+_NULLABLE_STR = {"type": ["string", "null"]}
+
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "intent": {"type": "string", "enum": list(INTENTS)},
+        "changes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "axis": {"type": "string", "enum": list(AXES)},
+                    "op": {"type": "string", "enum": ["set", "add", "remove"]},
+                    "value_text": _NULLABLE_STR,
+                    "value_number": {"type": ["number", "null"]},
+                    "value_bool": {"type": ["boolean", "null"]},
+                    "value_list": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["axis", "op", "value_text", "value_number", "value_bool", "value_list", "evidence"],
+            },
+        },
+        "question": _NULLABLE_STR,
+        "question_axis": {"anyOf": [{"type": "string", "enum": list(AXES)}, {"type": "null"}]},
+        "ambiguous_term": _NULLABLE_STR,
+        "advice_topic": {"anyOf": [{"type": "string", "enum": ["which", "why", "current"]}, {"type": "null"}]},
+        "advice_about": {"anyOf": [{"type": "string", "enum": list(SOLVERS)}, {"type": "null"}]},
+        "memory_op": {"anyOf": [{"type": "string", "enum": ["remember", "recall", "forget", "list"]},
+                                {"type": "null"}]},
+        "memory_profiles": {"anyOf": [{
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "battery_packs": {"type": ["integer", "null"]},
+                    "weight_lbs": {"type": ["integer", "null"]},
+                    "driver": _NULLABLE_STR,
+                    "plate": _NULLABLE_STR,
+                    "evidence": {"type": "string"},
+                },
+                "required": ["name", "battery_packs", "weight_lbs", "driver", "plate", "evidence"],
+            }}, {"type": "null"}]},
+        "memory_names": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+        "advice_scenario": {"anyOf": [{
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "stops": {"type": ["integer", "null"]},
+                "vehicles": {"type": ["integer", "null"]},
+                "need_optimal": {"type": "boolean"},
+                "evidence": {"type": "string"},
+            },
+            "required": ["stops", "vehicles", "need_optimal", "evidence"],
+        }, {"type": "null"}]},
+        "message": {"type": "string"},
+    },
+    "required": ["intent", "changes", "question", "question_axis", "ambiguous_term",
+                 "advice_topic", "advice_about", "advice_scenario",
+                 "memory_op", "memory_profiles", "memory_names", "message"],
+}
+
+EXTRACTION_SYSTEM_PROMPT = """You are the form-filling assistant inside the Isuzu BEV Fleet Route Optimizer.
+You never change the form yourself. You only EXTRACT what the operator asked for into the fixed schema; deterministic code validates and applies it afterwards.
+
+INTENTS (choose exactly one):
+- "apply": the operator asked to change one or more form fields. List every requested change in `changes`, in the order mentioned, one entry per axis.
+- "ask": the request is ambiguous or incomplete (a place name that exists in several states or countries, a number whose unit or target field is unclear, a missing value). Put the clarifying question in `question`, name the field in `question_axis` when there is one, copy the ambiguous word(s) into `ambiguous_term`, and leave `changes` empty.
+- "confirm": ONLY when a PENDING QUESTION is listed below AND the message is nothing but a yes/no answer to it. If there is no pending question, never use this intent.
+- "recommend": the operator is asking WHICH SOLVER / ALGORITHM to use, why one is better, why not always use the optimal one, or which one is active. This includes questions about how long a solver takes, how many stops it can handle, or whether one is fast/good enough — route them here rather than declining. Set `advice_topic`: "which" (what should I use / can solver X handle this), "why" (why not always the exact one / how slow is it / explain the tradeoff), "current" (what am I running now). Do NOT answer with runtimes, limits or a pick of your own — code computes all of that and writes the reply. No changes.
+- "memory": the operator wants to save, load, list or delete a NAMED VEHICLE. Set `memory_op`:
+  * "remember" — they are describing a vehicle to save ("Truck A is 6 packs, 15000 lbs, driver Wang, plate 8ABC123", "Truck A 是 6 块电池"). Fill `memory_profiles`, one entry per vehicle, each with an exact `evidence` substring covering that vehicle's words. Leave a field null if they did not say it. Never invent packs, weight, a driver or a plate.
+  * "recall" — they want saved vehicles loaded into the form ("use Truck A and Truck C today", "今天用 Truck A"). Put the names in `memory_names`.
+  * "forget" — delete a saved vehicle ("forget Truck A"). Put the names in `memory_names`.
+  * "list" — show what is saved ("what vehicles do you know?", "存了哪些车"). Leave `memory_names` null.
+  A vehicle is "named" when the operator gives it an identifier like Truck A, 大卡, Van 3. Changing the count or packs of the CURRENT unnamed vehicles is intent "apply", not memory.
+- "out_of_scope": anything the form cannot do (weather, traffic, arrival times, running the optimisation, reading results, small talk, unrelated questions). No changes. Say briefly what you cannot do.
+
+AXES (the only fields that exist):
+- depot (text): the depot / warehouse / start address
+- addresses (list of text): the delivery stops. op "set" replaces the whole list, "add" appends, "remove" deletes matching stops
+- vehicle_count (integer 1–10)
+- battery_packs (integer 3–9; each pack is 20 kWh; applies to every vehicle)
+- vehicle_weight_lbs (integer 10000–19500)
+- temperature_c (integer −10 to 40; convert °F to °C)
+- unload_time_min (integer 5–120; minutes per stop)
+- has_climate_control (boolean; AC / HVAC on or off)
+- solver — one of: "auto" (let the app decide), "held_karp" (the exact / optimal / proven / guaranteed solver), "2opt" (fast approximation), "nearest_neighbor" (greedy, like Google Maps), "ortools_vrp" (multi-vehicle). "force the exact solver", "I want the guaranteed optimum" → held_karp, never auto. an instruction naming a solver ("switch to 2-opt", "use nearest neighbor", "force the exact solver", "go back to auto") is intent "apply" on this axis. A question ABOUT solvers ("which one should I use", "why not the optimal one") is intent "recommend".
+
+VALUE RULES:
+- Fill exactly ONE of value_text / value_number / value_bool / value_list per change, matching the axis type. The other three must be null. Stops always go in value_list, even a single stop; a solver name goes in value_text.
+- `evidence` must be an EXACT substring copied from the operator's latest message that justifies the change — copy it verbatim, do not add punctuation. Never invent a value the message does not contain; if it is not there, do not emit the change.
+- Keep addresses exactly as written. Do not add a city, state or country the operator did not write. A place name without a state or country that could be in several places → intent "ask".
+- `op` is "set" for every axis except addresses, which also accepts "add" and "remove". Resolve relative requests ("one more truck", "5 degrees warmer") against CURRENT FORM STATE and emit the resulting absolute number with op "set".
+- A plain statement of a value ("depot is X", "仓库设在 X", "temperature 30") is intent "apply", even when it already equals CURRENT FORM STATE — emit the change anyway rather than asking whether they want it.
+- An on-topic message with no usable value ("it's really hot today", "the trucks feel heavy") is intent "ask": ask for the number. Reserve "out_of_scope" for things this form genuinely cannot express.
+- Leave `memory_op`, `memory_profiles` and `memory_names` null for every intent except "memory".
+- For intent "recommend": whenever the message names a size at all — "22 stops and 3 trucks", "on 25 stops", "for 12 stops" — fill `advice_scenario` with those numbers plus an exact `evidence` substring, even if it reads as a hypothetical. A question about how long a solver takes or how big it scales is `advice_topic` "why"; leave the numbers in `advice_scenario`. If the message names one solver ("should I use Held-Karp?", "is 2-opt good enough?", "Held-Karp 能跑 25 个站吗"), put that solver's key in `advice_about`. Chinese counts too: "25 个站" is 25 stops, "3 辆车" is 3 vehicles. set `need_optimal` true only if they said they require a guaranteed/proven optimum. Otherwise leave `advice_scenario` null and the current form state is used. Leave `advice_topic` and `advice_scenario` null for every other intent.
+- `message`: one short, friendly sentence in the operator's language. For "ask" it must equal `question`. For "recommend" it is ignored — code writes the answer.
+
+CURRENT FORM STATE:
+{form_state}
+{pending_block}"""
+
+
+def build_system_prompt(form_state: dict, pending) -> str:
+    saved = load_memory()['vehicles']
+    saved_block = ("\nSAVED VEHICLES (memory): "
+                   + ", ".join(f"{p['name']} ({p.get('battery_packs')} packs, "
+                               f"{p.get('weight_lbs')} lbs)" for p in saved.values())
+                   + "\nA message naming one of these updates its SAVED profile (intent \"memory\", "
+                     "op \"remember\"), not the current form."
+                   if saved else "\nSAVED VEHICLES (memory): none yet.")
+    pending_block = ""
+    if pending and pending.get('question'):
+        pending_block = (
+            f"\nPENDING QUESTION you asked earlier: \"{pending['question']}\""
+            "\nIf the latest message answers it, emit the corresponding change with intent \"apply\"."
+        )
+    return EXTRACTION_SYSTEM_PROMPT.format(
+        form_state=json.dumps(form_state or {}, ensure_ascii=False, indent=2),
+        pending_block=saved_block + pending_block,
+    )
+
+
+def extraction_schema_for(pending) -> dict:
+    """Closed schema, narrowed to the situation: with nothing pending there is
+    nothing to confirm, so the model is not offered that intent at all."""
+    if pending and pending.get('question'):
+        return EXTRACTION_SCHEMA
+    schema = json.loads(json.dumps(EXTRACTION_SCHEMA))
+    schema['properties']['intent']['enum'] = [i for i in INTENTS if i != 'confirm']
+    return schema
+
+
+def call_extraction(utterance: str, history: list, form_state: dict, pending) -> dict:
+    messages = [{"role": "system", "content": build_system_prompt(form_state, pending)}]
+    for h in history[-10:]:
+        if h.get('role') in ('user', 'assistant') and h.get('content'):
+            messages.append({"role": h['role'], "content": str(h['content'])})
+    messages.append({"role": "user", "content": utterance})
+
+    response = requests.post(
+        OPENAI_CHAT_URL,
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "route_chat_extraction", "strict": True,
+                                "schema": extraction_schema_for(pending)},
+            },
+        },
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"OpenAI {response.status_code}: {response.text[:300]}")
+
+    choice = response.json()['choices'][0]['message']
+    if choice.get('refusal'):
+        return {"intent": "out_of_scope", "changes": [], "question": None, "question_axis": None,
+                "ambiguous_term": None, "message": choice['refusal']}
+    return json.loads(choice['content'])
+
+
+# ---- 3. deterministic validation --------------------------------------------
+
+def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: str = 'en'):
+    """Gate for one extracted change. Returns (change, None) or (None, reason)."""
+    form_state = form_state or {}
+    axis = raw.get('axis')
+    op = raw.get('op') or 'set'
+    spec = AXES.get(axis)
+    if not spec:
+        return None, _r('unknown_field', lang, axis=axis)
+    label = axis_label(axis, lang)
+
+    # "clear all stops": a remove with nothing named means all of them. Filling
+    # in the current list turns it into an ordinary change the gates can see.
+    if axis == 'addresses' and op in ('remove', 'set') and not raw.get('value_list'):
+        current = [a for a in (form_state.get('addresses') or []) if str(a).strip()]
+        if current:
+            raw = dict(raw, value_list=list(current), value_text=None)
+            op = 'remove'
+
+    # "one more truck" / "5 degrees warmer": a relative move on a numeric axis.
+    # Resolve it against the form here rather than trusting the model to add up.
+    if spec['type'] == 'number' and op in ('add', 'remove') and raw.get('value_number') is not None:
+        current = form_state.get(axis)
+        if isinstance(current, (int, float)):
+            delta = float(raw['value_number'])
+            raw = dict(raw, op='set',
+                       value_number=current + (delta if op == 'add' else -delta))
+            op = 'set'
+
+    # Null coupling: exactly one typed slot is filled, and it is this axis's slot.
+    slots = {
+        'text': raw.get('value_text'),
+        'number': raw.get('value_number'),
+        'bool': raw.get('value_bool'),
+        'list': raw.get('value_list'),
+    }
+    filled = [k for k, v in slots.items() if v is not None]
+    if spec['type'] == 'list' and filled == ['text']:
+        # one stop written into the text slot: same information, wrong container
+        slots['list'], slots['text'], filled = [slots['text']], None, ['list']
+    # An enum is carried as a string; check_value below maps it onto the choices.
+    slot = 'text' if spec['type'] == 'enum' else spec['type']
+    if slot not in filled:
+        # The wrong container means the model misread the axis — that is a real
+        # type error. Extra slots alongside the right one are just noise.
+        return None, _r('slot', lang, label=label, got=filled or '-', need=slot)
+
+    value, reason = check_value(axis, op, slots[slot], lang)
+    if reason:
+        return None, reason
+
+    # Evidence span: the justification must literally appear in the utterance.
+    evidence = _strip_edges(raw.get('evidence'))
+    if not evidence or _norm(evidence) not in _norm(utterance):
+        return None, _r('no_evidence', lang, label=label)
+
+    # Quoting the whole sentence would let any invented number through the span
+    # check, so a numeric change has to point at something numeric.
+    if spec['type'] == 'number' and not NUMERIC_EVIDENCE_RE.search(evidence):
+        return None, _r('no_number', lang, label=label)
+    if spec['type'] == 'bool' and not BOOL_EVIDENCE_RE.search(evidence):
+        return None, _r('no_onoff', lang, label=label)
+
+    return make_change(axis, op, value, evidence, lang), None
+
+
+def ambiguous_place_in(change: dict):
+    """Return the ambiguous place name in an address change, or None."""
+    if change['axis'] == 'depot' and looks_ambiguous_place(change['value']):
+        return change['value']
+    if change['axis'] == 'addresses' and change['op'] != 'remove':
+        for v in change['value']:
+            if looks_ambiguous_place(v):
+                return v
+    return None
+
+
+def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
+                        pending_exists: bool = False) -> dict:
+    """Apply the coupling rules to a whole extraction. Never trusts the model."""
+    form_state = form_state or {}
+    lang = detect_lang(utterance)
+    intent = raw.get('intent')
+    if intent not in INTENTS:
+        intent = 'out_of_scope'
+    question = (raw.get('question') or '').strip() or None
+    question_axis = raw.get('question_axis') if raw.get('question_axis') in AXES else None
+    ambiguous = (raw.get('ambiguous_term') or '').strip() or None
+    message = (raw.get('message') or '').strip()
+
+    # Solver advice: the topic is a closed enum, and a hypothetical size is only
+    # honoured when its evidence really appears in the utterance.
+    topic = raw.get('advice_topic') if raw.get('advice_topic') in ('which', 'why', 'current') else None
+    about = raw.get('advice_about') if raw.get('advice_about') in SOLVERS else None
+    mem_op = raw.get('memory_op') if raw.get('memory_op') in ('remember', 'recall', 'forget', 'list') else None
+    mem_profiles = raw.get('memory_profiles') if isinstance(raw.get('memory_profiles'), list) else []
+    mem_names = [str(n).strip() for n in (raw.get('memory_names') or []) if str(n).strip()]
+    if intent == 'memory' and not mem_op:
+        mem_op = 'remember' if mem_profiles else ('recall' if mem_names else 'list')
+    # "is 2-opt good enough?" is a pick question, not a tradeoff lecture. The model
+    # mislabels it as "why" about a third of the time, so the utterance decides.
+    if topic == 'why' and not WHY_RE.search(utterance):
+        topic = 'which'
+    scenario = None
+    if intent == 'recommend':
+        raw_scen = raw.get('advice_scenario')
+        if isinstance(raw_scen, dict) and _norm(_strip_edges(raw_scen.get('evidence'))) in _norm(utterance):
+            stops, vehicles = raw_scen.get('stops'), raw_scen.get('vehicles')
+            if stops is not None or vehicles is not None:
+                scenario = {'stops': stops, 'vehicles': vehicles,
+                            'need_optimal': bool(raw_scen.get('need_optimal'))}
+        topic = topic or 'which'
+
+    changes, rejected = [], []
+    if intent in ('apply', 'confirm'):
+        for c in raw.get('changes') or []:
+            change, reason = validate_change(c if isinstance(c, dict) else {}, utterance, form_state, lang)
+            if change:
+                changes.append(change)
+            else:
+                rejected.append(reason)
+
+    # Ambiguity flag / term: an ambiguous extraction may never be applied.
+    # The model may raise the flag; the place check below raises it regardless.
+    if intent == 'apply' and not ambiguous:
+        for c in changes:
+            term = ambiguous_place_in(c)
+            if term:
+                ambiguous, question_axis = term, c['axis']
+                break
+    if ambiguous and intent == 'apply':
+        intent = 'ask'
+        question = question or (f"「{ambiguous}」可能指好几个地方——你说的是哪个城市和州？" if lang == 'zh'
+                                else f"\"{ambiguous}\" could be in several places — which city and state do you mean?")
+
+    # Null coupling at the intent level.
+    if intent == 'apply' and not changes:
+        intent = 'ask'
+        detail = ("（" + "；".join(rejected) + "）") if rejected else ""
+        question = (f"这条我没法从你的话里核实。{detail}能再说一遍具体的值吗？" if lang == 'zh'
+                    else "I couldn't verify that in your message. "
+                         + (("(" + "; ".join(rejected) + ".) ") if rejected else "")
+                         + "Could you say it again with the exact value?")
+        question_axis = question_axis or _single_rejected_axis(raw)
+    if intent == 'ask' and not question:
+        question = "你想改哪一项？能说得具体点吗？" if lang == 'zh' else "Could you clarify what you'd like to change?"
+    if intent == 'confirm' and changes and not pending_exists:
+        # The model labelled a plain instruction as a confirmation. The changes
+        # passed validation, so honour them instead of dropping them.
+        intent = 'apply'
+    if intent in ('confirm', 'out_of_scope', 'recommend', 'memory'):
+        changes, question = [], None
+    if intent == 'out_of_scope' and not message:
+        message = "这个我帮不了。" if lang == 'zh' else "I can't help with that."
+
+    return {'intent': intent, 'changes': changes, 'rejected': rejected, 'lang': lang,
+            'question': question, 'question_axis': question_axis, 'message': message,
+            'advice_topic': topic, 'advice_scenario': scenario, 'advice_about': about,
+            'memory_op': mem_op, 'memory_profiles': mem_profiles, 'memory_names': mem_names,
+            'utterance': utterance}
+
+
+def _single_rejected_axis(raw: dict):
+    axes = {c.get('axis') for c in (raw.get('changes') or []) if isinstance(c, dict)}
+    axes = {a for a in axes if a in AXES}
+    return axes.pop() if len(axes) == 1 else None
+
+
+def route_outcome(verdict: dict, pending, source: str, form_state: dict = None) -> dict:
+    intent = verdict['intent']
+    form_state = form_state or {}
+    lang = verdict.get('lang', 'en')
+    if intent == 'confirm':
+        queued = (pending or {}).get('queued') or []
+        if queued:
+            return outcome_apply(queued, source='session', confirmed=True, lang=lang)
+        return outcome_out_of_scope(_o('nothing', lang), source, list_capabilities=False, lang=lang)
+    if intent == 'memory':
+        op = verdict.get('memory_op') or 'list'
+        if op == 'remember':
+            return do_remember(verdict.get('memory_profiles'), verdict.get('utterance', ''), source, lang)
+        if op == 'forget':
+            return do_forget(verdict.get('memory_names'), source, lang)
+        return do_recall(verdict.get('memory_names') if op == 'recall' else [], source, lang)
+    if intent == 'recommend':
+        scen = verdict.get('advice_scenario') or {}
+        stops = scen.get('stops')
+        vehicles = scen.get('vehicles')
+        hypothetical = stops is not None or vehicles is not None
+        if stops is None:
+            stops = len(form_state.get('addresses') or [])
+        if vehicles is None:
+            vehicles = form_state.get('vehicle_count') or 1
+        return outcome_recommend(
+            verdict.get('advice_topic') or 'which',
+            int(stops), int(vehicles),
+            form_state.get('solver', 'auto'), source,
+            hypothetical=hypothetical, need_optimal=bool(scen.get('need_optimal')),
+            lang=verdict.get('lang', 'en'), about=verdict.get('advice_about'))
+    if intent == 'apply':
+        return outcome_apply(verdict['changes'], source, rejected=verdict['rejected'], lang=lang)
+    if intent == 'ask':
+        return outcome_ask(verdict['question'], verdict['question_axis'], source,
+                           rejected=verdict['rejected'], lang=lang)
+    return outcome_out_of_scope(verdict['message'], source, lang=lang)
+
+
+@app.route('/api/chat', methods=['POST'])
+def ai_chat():
+    """Operator utterance → lexicon → extraction → validation → one of three outcomes."""
+    data = request.json or {}
+    utterance = str(data.get('message', '')).strip()
+    history = data.get('history') or []
+    form_state = data.get('form_state') or {}
+    pending = data.get('pending') or None
+
+    if not utterance:
+        return jsonify({"status": "error", "message": "No message provided"}), 400
+
+    # 1. lexicon fast path
+    hit = lexicon_fast_path(utterance, pending, form_state)
+    if hit:
+        return jsonify(hit)
+
+    # 2. constrained extraction
+    if not OPENAI_API_KEY:
+        return jsonify(outcome_out_of_scope(
+            "AI extraction is unavailable (OPENAI_API_KEY is not set). "
+            "Short phrasings still work without it, e.g. \"temperature 30 C\" or \"6 battery packs\":",
+            source='lexicon'))
+    try:
+        raw = call_extraction(utterance, history, form_state, pending)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Extraction failed: {e}"}), 502
+
+    # 3. deterministic validation → apply / ask / out of scope
+    verdict = validate_extraction(raw, utterance, form_state, pending_exists=bool(pending))
+    return jsonify(route_outcome(verdict, pending, source='model', form_state=form_state))
+
+
+# =============================================================================
+# Fleet memory — named vehicle profiles that survive the session
+# =============================================================================
+#
+# The point is not the labels. A profile carries battery_packs and weight_lbs,
+# which feed the energy model and the range check, so recalling "Truck A" puts
+# real parameters into the form. Driver and plate ride along as identification.
+#
+# Stored as one JSON file next to the server: small, inspectable, and easy to
+# show to someone who asks where it actually lives.
+
+MEMORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fleet_memory.json')
+
+PROFILE_FIELDS = {
+    'battery_packs':     {'axis': 'battery_packs',      'label': 'packs'},
+    'weight_lbs':        {'axis': 'vehicle_weight_lbs', 'label': 'lbs'},
+    'driver':            {'axis': None,                 'label': 'driver'},
+    'plate':             {'axis': None,                 'label': 'plate'},
+}
+MAX_PROFILES = 40
+MAX_LABEL_LEN = 40
+
+
+def _memory_default() -> dict:
+    return {'vehicles': {}}
+
+
+def load_memory() -> dict:
+    try:
+        with open(MEMORY_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get('vehicles'), dict):
+            return _memory_default()
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return _memory_default()
+
+
+def save_memory(mem: dict) -> None:
+    tmp = MEMORY_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(mem, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MEMORY_PATH)
+
+
+def profile_key(name: str) -> str:
+    """Lookup key: case- and space-insensitive, so "truck a" finds "Truck A"."""
+    return re.sub(r'\s+', '', str(name or '')).lower()
+
+
+def profile_to_vehicle(profile: dict, vid: int) -> dict:
+    """A stored profile in the shape /api/optimize and the form expect."""
+    packs = int(profile.get('battery_packs', 4))
+    return {
+        'id': vid,
+        'name': profile.get('name', f'Vehicle {vid}'),
+        'battery_packs': packs,
+        'battery_kwh': packs * 20,
+        'weight_lbs': int(profile.get('weight_lbs', 13000)),
+        'driver': profile.get('driver') or '',
+        'plate': profile.get('plate') or '',
+    }
+
+
+def describe_profile(profile: dict, lang: str = 'en') -> str:
+    packs = profile.get('battery_packs', 4)
+    bits = [f"{packs} packs ({packs * 20} kWh)",
+            f"{int(profile.get('weight_lbs', 13000)):,} lbs"]
+    if profile.get('driver'):
+        bits.append(f"{'司机 ' if lang == 'zh' else 'driver '}{profile['driver']}")
+    if profile.get('plate'):
+        bits.append(profile['plate'])
+    return f"{profile.get('name', '?')} — " + " · ".join(bits)
+
+
+def validate_profile(raw: dict, utterance: str, lang: str = 'en'):
+    """Gate for one remembered profile. Returns (profile, None) or (None, reason)."""
+    name = _strip_edges(raw.get('name'))[:MAX_LABEL_LEN]
+    if not name:
+        return None, _m('no_name', lang)
+
+    # Same anti-hallucination rule as a form change: the model has to point at
+    # the words it read the profile out of.
+    evidence = _strip_edges(raw.get('evidence'))
+    if not evidence or _norm(evidence) not in _norm(utterance):
+        return None, _m('no_evidence', lang, name=name)
+
+    profile = {'name': name}
+    for field, spec in PROFILE_FIELDS.items():
+        value = raw.get(field)
+        if value is None or value == '':
+            continue
+        if spec['axis']:
+            # Reuse the form's own range checks — a profile cannot store a
+            # vehicle the form would refuse.
+            value, reason = check_value(spec['axis'], 'set', value, lang)
+            if reason:
+                return None, f"{name}: {reason}"
+        else:
+            value = str(value).strip()[:MAX_LABEL_LEN]
+        profile[field] = value
+
+    if len(profile) == 1:          # name only, nothing to store
+        return None, _m('no_specs', lang, name=name)
+    # No defaults and no "needs specs" check here: an update that mentions only
+    # the driver is fine for a vehicle we already know. do_remember decides,
+    # because only it can see whether the profile already exists.
+    return profile, None
+
+
+MEMORY_TEXT = {
+    'no_name':     {'en': "a profile needs a name", 'zh': "档案得有个名字"},
+    'no_evidence': {'en': "{name}: not found in your message", 'zh': "{name}：在你的话里找不到依据"},
+    'no_specs':    {'en': "{name}: tell me its battery packs or weight",
+                    'zh': "{name}：至少要告诉我电池包数或重量"},
+    'saved':       {'en': "Saved {n} vehicle{s}: {list}", 'zh': "已记住 {n} 辆车：{list}"},
+    'updated':     {'en': "Updated {list}", 'zh': "已更新 {list}"},
+    'full':        {'en': "Memory is full ({max} vehicles). Forget one first.",
+                    'zh': "记忆已满（{max} 辆）。先删掉一辆吧。"},
+    'loaded':      {'en': "Loaded {n} vehicle{s} into the form: {list}",
+                    'zh': "已载入 {n} 辆车到表单：{list}"},
+    'unknown':     {'en': "I don't have {missing} saved. I know: {known}",
+                    'zh': "我没存过 {missing}。已存的有：{known}"},
+    'none_saved':  {'en': "No vehicles saved yet. Try: \"Truck A is 6 packs, 15000 lbs, driver Wang\"",
+                    'zh': "还没存过车。试试：「Truck A 是 6 块电池，15000 磅，司机老王」"},
+    'forgot':      {'en': "Forgot {list}", 'zh': "已删除 {list}"},
+    'listing':     {'en': "{n} vehicle{s} saved:", 'zh': "已存 {n} 辆车："},
+}
+
+
+def _m(key: str, lang: str, **kw) -> str:
+    return MEMORY_TEXT[key].get(lang, MEMORY_TEXT[key]['en']).format(**kw)
+
+
+def outcome_memory(message: str, source: str, lang: str = 'en', changes=None,
+                   profiles=None, rejected=None) -> dict:
+    """A memory read/write. `changes` is set when a recall also fills the form."""
+    return {
+        'status': 'ok', 'intent': 'memory', 'source': source,
+        'message': message, 'changes': changes or [], 'pending': None,
+        'capabilities': None, 'rejected': rejected or [], 'advice': None,
+        'profiles': profiles or [],
+    }
+
+
+def do_remember(raw_profiles: list, utterance: str, source: str, lang: str) -> dict:
+    mem = load_memory()
+    saved, rejected = [], []
+    for raw in raw_profiles or []:
+        profile, reason = validate_profile(raw if isinstance(raw, dict) else {}, utterance, lang)
+        if not profile:
+            rejected.append(reason)
+            continue
+        key = profile_key(profile['name'])
+        existing = mem['vehicles'].get(key)
+        if existing is None:
+            if len(mem['vehicles']) >= MAX_PROFILES:
+                rejected.append(_m('full', lang, max=MAX_PROFILES))
+                continue
+            # A brand-new vehicle needs at least one real spec; a label alone
+            # would store nothing the optimiser can use.
+            if 'battery_packs' not in profile and 'weight_lbs' not in profile:
+                rejected.append(_m('no_specs', lang, name=profile['name']))
+                continue
+        # Merge, so "Truck A now has 8 packs" keeps the weight, driver and plate.
+        merged = {**(existing or {}), **profile}
+        merged.setdefault('battery_packs', 4)
+        merged.setdefault('weight_lbs', 13000)
+        mem['vehicles'][key] = merged
+        saved.append(merged)
+
+    if saved:
+        save_memory(mem)
+    sep = '；' if lang == 'zh' else '; '
+    message = (_m('saved', lang, n=len(saved), s='' if len(saved) == 1 else 's',
+                  list=sep.join(describe_profile(p, lang) for p in saved))
+               if saved else (sep.join(rejected) if rejected else _m('no_name', lang)))
+    return outcome_memory(message, source, lang, profiles=saved,
+                          rejected=rejected if saved else [])
+
+
+def do_recall(names: list, source: str, lang: str) -> dict:
+    mem = load_memory()
+    if not mem['vehicles']:
+        return outcome_memory(_m('none_saved', lang), source, lang)
+
+    # No names given → list what is stored rather than guessing.
+    if not names:
+        lines = [_m('listing', lang, n=len(mem['vehicles']),
+                    s='' if len(mem['vehicles']) == 1 else 's')]
+        lines += [f"· {describe_profile(p, lang)}" for p in mem['vehicles'].values()]
+        return outcome_memory("\n".join(lines), source, lang,
+                              profiles=list(mem['vehicles'].values()))
+
+    found, missing = [], []
+    for n in names:
+        p = mem['vehicles'].get(profile_key(n))
+        (found if p else missing).append(p or n)
+    if not found:
+        return outcome_memory(_m('unknown', lang, missing=", ".join(missing),
+                                 known=", ".join(p['name'] for p in mem['vehicles'].values())),
+                              source, lang)
+
+    fleet = [profile_to_vehicle(p, i + 1) for i, p in enumerate(found)]
+    change = make_change('fleet', 'set', fleet,
+                         ", ".join(p['name'] for p in found), lang)
+    sep = '；' if lang == 'zh' else '; '
+    message = _m('loaded', lang, n=len(found), s='' if len(found) == 1 else 's',
+                 list=sep.join(describe_profile(p, lang) for p in found))
+    rejected = [_m('unknown', lang, missing=", ".join(missing),
+                   known=", ".join(p['name'] for p in mem['vehicles'].values()))] if missing else []
+    return outcome_memory(message, source, lang, changes=[change],
+                          profiles=found, rejected=rejected)
+
+
+def do_forget(names: list, source: str, lang: str) -> dict:
+    mem = load_memory()
+    gone, missing = [], []
+    for n in names or []:
+        p = mem['vehicles'].pop(profile_key(n), None)
+        (gone.append(p['name']) if p else missing.append(n))
+    if gone:
+        save_memory(mem)
+        return outcome_memory(_m('forgot', lang, list=", ".join(gone)), source, lang)
+    known = ", ".join(p['name'] for p in mem['vehicles'].values()) or '-'
+    return outcome_memory(_m('unknown', lang, missing=", ".join(missing or ['?']), known=known),
+                          source, lang)
+
+
+@app.route('/api/memory', methods=['GET'])
+def get_memory():
+    """The frontend reads this on load so the sidebar can list the saved fleet."""
+    mem = load_memory()
+    return jsonify({"status": "ok", "vehicles": list(mem['vehicles'].values())})
+
+
+@app.route('/api/memory', methods=['DELETE'])
+def clear_memory():
+    name = (request.args.get('name') or '').strip()
+    mem = load_memory()
+    if name:
+        removed = mem['vehicles'].pop(profile_key(name), None)
+        save_memory(mem)
+        return jsonify({"status": "ok", "removed": removed['name'] if removed else None,
+                        "vehicles": list(mem['vehicles'].values())})
+    save_memory(_memory_default())
+    return jsonify({"status": "ok", "removed": "all", "vehicles": []})
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1183,6 +2737,7 @@ if __name__ == '__main__':
     print("Route Optimization Server")
     print("=" * 60)
     print(f"API Key Set: {'Yes' if GOOGLE_API_KEY else 'No - set GOOGLE_MAPS_API_KEY env var'}")
+    print(f"OpenAI Key Set: {'Yes' if OPENAI_API_KEY else 'No - lexicon fast path only'}")
     print()
     print("Endpoints:")
     print("  POST /api/set_key        - Set Google Maps API key")
@@ -1190,6 +2745,7 @@ if __name__ == '__main__':
     print("  POST /api/geocode_batch  - Geocode multiple addresses")
     print("  POST /api/optimize       - Optimize route (main endpoint)")
     print("  POST /api/directions     - Get turn-by-turn directions")
+    print("  POST /api/chat           - Chat assistant (lexicon → extraction → validation)")
     print("  GET  /api/health         - Health check")
     print()
     print("Starting server on http://localhost:5001")

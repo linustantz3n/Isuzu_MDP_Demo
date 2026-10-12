@@ -144,7 +144,7 @@ export default function RouteMap({ results, locations }) {
       // Delay fit until after DirectionsRenderers have mounted (avoids race with suppressFitBounds)
       setTimeout(() => fitToRoutes(allVisible, valid), 100);
     });
-  }, [isLoaded, results, locations]);
+  }, [isLoaded, results, locations]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loadError) return (
     <div className="bg-slate-800 rounded-xl p-6 border border-red-500/30 text-red-400 text-sm">

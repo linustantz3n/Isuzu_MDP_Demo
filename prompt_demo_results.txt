@@ -1,0 +1,36 @@
+Isuzu BEV Route Optimizer - chatbot Q&A
+form: 14 stops, 1 vehicle, 4 battery packs, 20 C, 30 min unload, climate control on, solver auto
+
+Q1. I have 22 stops and 3 trucks, which algorithm?
+A.  For 22 stops and 3 vehicles: use OR-Tools VRP. 3 vehicles means this is a VRP, not a TSP.
+    OR-Tools is the only solver here that can split stops across vehicles — Held-Karp, 2-opt and
+    nearest neighbor all assume a single vehicle.
+
+Q2. is 2-opt good enough for my route?
+A.  2-opt would work here, but Held-Karp is the better pick. 14 stops: Held-Karp finishes in
+    about 125 ms and its answer is provably optimal — worth it as the baseline every other route
+    is measured against.
+
+Q3. it's 86 degrees fahrenheit today
+A.  Applied: Temperature → 30 °C.
+
+Q4. add one more truck
+A.  Applied: Vehicles → 2.
+
+Q5. switch to 2-opt
+A.  Applied: Solver → 2-opt.
+
+Q6. give me 12 battery packs
+A.  Battery packs must be between 3 and 9 packs.
+
+Q7. set the depot to Springfield
+A.  Which Springfield are you referring to?
+
+Q8. what's the traffic on the 405?
+A.  I'm unable to provide traffic information.
+
+Q9. depot in Anaheim CA, 2 trucks, 6 packs, 35 degrees, unload 20 min
+A.  Applied: Depot → Anaheim CA. Also apply: Vehicles → 2? (yes / no)
+
+Q9b. yes
+A.  Applied: Vehicles → 2. Also apply: Battery packs → 6 packs? (yes / no)

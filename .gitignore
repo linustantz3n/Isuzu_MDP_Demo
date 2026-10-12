@@ -21,3 +21,7 @@ __pycache__/
 # Frontend build (deploy separately)
 route-optimizer-frontend/build/
 route-optimizer-frontend/node_modules/
+
+# Fleet memory (runtime state, not source)
+fleet_memory.json
+fleet_memory.json.tmp
