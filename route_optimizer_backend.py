@@ -1679,19 +1679,41 @@ RELATIVE_LEXICON = [
 ]
 
 
+def _name_pattern(name: str) -> str:
+    """Whole-word, case- and spacing-insensitive pattern for a Latin-script name,
+    so a driver called "Li" does not match inside "climate"."""
+    # Optional whitespace between every character: "WangWei" matches "Wang Wei".
+    return r'(?<!\w)' + r'\s*'.join(map(re.escape, re.sub(r'\s+', '', name))) + r'(?!\w)'
+
+
+def name_in(name: str, text: str) -> bool:
+    """Is this driver name written in the text? Chinese has no word boundaries,
+    so a CJK name is a plain substring check."""
+    name = str(name or '').strip()
+    if not name:
+        return False
+    if CJK_RE.search(name):
+        return _norm(name) in _norm(text)
+    return bool(re.search(_name_pattern(name), text, re.I))
+
+
+# Words that mark a message as being about driver memory. "add" is left out:
+# "add one more truck" is a form change the lexicon should keep handling.
+MEMORY_WORD_RE = re.compile(r'\b(?:drivers?|remember|save|store|register)\b|司机|记住|保存', re.I)
+
+
 def mentions_saved_driver(utterance: str) -> bool:
-    # Whole-word match: a driver called "Li" must not capture "climate".
-    # Chinese has no word boundaries, so a CJK name is a plain substring check.
-    for p in load_memory()['drivers'].values():
-        name = str(p.get('name') or '').strip()
-        if not name:
-            continue
-        if CJK_RE.search(name):
-            if _norm(name) in _norm(utterance):
-                return True
-        elif re.search(r'(?<!\w)' + r'\s*'.join(map(re.escape, name.split())) + r'(?!\w)', utterance, re.I):
-            return True
-    return False
+    return any(name_in(p.get('name'), utterance) for p in load_memory()['drivers'].values())
+
+
+def typed_spelling(name: str, utterance: str) -> str:
+    """The name exactly as the operator wrote it. The evidence checks ignore
+    case, so without this the model's casing ("donghua" for "Donghua") is what
+    gets stored."""
+    if CJK_RE.search(name):
+        return name          # no letter case to recover
+    m = re.search(_name_pattern(name), utterance, re.I)
+    return m.group(0) if m else name
 
 
 def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
@@ -1718,8 +1740,9 @@ def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
 
     # "Wang runs 8 packs now" must update the stored profile, not the form.
     # The regex table cannot tell those apart, so any saved driver's name sends
-    # the utterance to the model.
-    if mentions_saved_driver(utterance):
+    # the utterance to the model — and so does talk of drivers or saving, or
+    # "add driver Linus with 6 packs" would set the form's packs to 6.
+    if mentions_saved_driver(utterance) or MEMORY_WORD_RE.search(utterance):
         return None
 
     # (b) relative nudges that only need the current value
@@ -1770,7 +1793,13 @@ def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
 
 _NULLABLE_STR = {"type": ["string", "null"]}
 
-EXTRACTION_SCHEMA = {
+# The axes the model may name. 'fleet' is left out: only a driver recall sets
+# it, and offering it lets the model emit a fleet change that is then rejected.
+MODEL_AXES = [a for a in AXES if a != 'fleet']
+
+# One step = one action. A message usually has one; "delete Han, then list all
+# drivers" has two, and run_steps executes them in order.
+STEP_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -1781,7 +1810,7 @@ EXTRACTION_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "axis": {"type": "string", "enum": list(AXES)},
+                    "axis": {"type": "string", "enum": MODEL_AXES},
                     "op": {"type": "string", "enum": ["set", "add", "remove"]},
                     "value_text": _NULLABLE_STR,
                     "value_number": {"type": ["number", "null"]},
@@ -1793,7 +1822,7 @@ EXTRACTION_SCHEMA = {
             },
         },
         "question": _NULLABLE_STR,
-        "question_axis": {"anyOf": [{"type": "string", "enum": list(AXES)}, {"type": "null"}]},
+        "question_axis": {"anyOf": [{"type": "string", "enum": MODEL_AXES}, {"type": "null"}]},
         "ambiguous_term": _NULLABLE_STR,
         "advice_topic": {"anyOf": [{"type": "string", "enum": ["which", "why", "current"]}, {"type": "null"}]},
         "advice_about": {"anyOf": [{"type": "string", "enum": list(SOLVERS)}, {"type": "null"}]},
@@ -1831,21 +1860,31 @@ EXTRACTION_SCHEMA = {
                  "memory_op", "memory_profiles", "memory_names", "message"],
 }
 
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"steps": {"type": "array", "items": STEP_SCHEMA}},
+    "required": ["steps"],
+}
+MAX_STEPS = 5
+
 EXTRACTION_SYSTEM_PROMPT = """You are the form-filling assistant inside the Isuzu BEV Fleet Route Optimizer.
 You never change the form yourself. You only EXTRACT what the operator asked for into the fixed schema; deterministic code validates and applies it afterwards.
 
-INTENTS (choose exactly one):
+STEPS: return `steps`, normally exactly ONE. Use several steps only when the operator asks for separate actions in sequence ("delete Han and Linus, then list all drivers", "save driver Wang and load him for today", "use 3 trucks, then tell me which solver to use"). One step per action, in the order asked; code runs them in that order, so a later step sees the result of an earlier one. Never split a single action: several form values in one sentence ("2 trucks with 6 packs", "set temperature to 28 and use 3 trucks") are ONE "apply" step with several `changes`, and saving or deleting several drivers is ONE "memory" step listing all of them. Each step fills every field below on its own, with its own `evidence` and `message`. Resolve pronouns to names ("load him" → the name).
+
+INTENTS (each step has exactly one):
 - "apply": the operator asked to change one or more form fields. List every requested change in `changes`, in the order mentioned, one entry per axis.
 - "ask": the request is ambiguous or incomplete (a place name that exists in several states or countries, a number whose unit or target field is unclear, a missing value). Put the clarifying question in `question`, name the field in `question_axis` when there is one, copy the ambiguous word(s) into `ambiguous_term`, and leave `changes` empty.
 - "confirm": ONLY when a PENDING QUESTION is listed below AND the message is nothing but a yes/no answer to it. If there is no pending question, never use this intent.
 - "recommend": the operator is asking WHICH SOLVER / ALGORITHM to use, why one is better, why not always use the optimal one, or which one is active. This includes questions about how long a solver takes, how many stops it can handle, or whether one is fast/good enough — route them here rather than declining. Set `advice_topic`: "which" (what should I use / can solver X handle this), "why" (why not always the exact one / how slow is it / explain the tradeoff), "current" (what am I running now). Do NOT answer with runtimes, limits or a pick of your own — code computes all of that and writes the reply. No changes.
 - "memory": the operator wants to save, load, list or delete a DRIVER PROFILE. The memory tracks drivers, not vehicles: a profile is a driver's name, optionally with the battery packs and weight of the truck that driver runs. Phrasing does not matter: a command, a statement and a polite question ("can you…", "could you…", "is it possible to…", "please…", "能帮我…吗") are the same request — carry it out, do not ask for confirmation. Always set `memory_op`:
-  * "remember" — save a new driver or update a saved one: save, add, store, register, create, remember, 记住, 保存, 添加, or a description of the driver's truck. Examples: "remember driver Wang", "save driver Donghua to the system", "can you save driver Donghua?", "could you add a new driver called Li", "could you save driver Li with 8 packs?", "Wang runs 6 packs at 15000 lbs", "记住司机老王，6 块电池", "能帮我记住司机东华吗". Fill `memory_profiles` with one entry per driver — never leave it empty for "remember". `name` is the driver's name in exactly the characters the operator typed: "donghua" stays "donghua" and "东华" stays "东华". Never convert between pinyin and Chinese characters, translate or re-spell a name. `evidence` is an exact substring covering that driver's words. Leave packs or weight null if they did not say it — a name alone is a valid profile. Never invent a name, packs or weight.
+  * "remember" — save a new driver or update a saved one: save, add, store, register, create, remember, 记住, 保存, 添加, or a description of the driver's truck. Examples: "remember driver Wang", "save driver Donghua to the system", "can you save driver Donghua?", "could you add a new driver called Li", "could you save driver Li with 8 packs?", "Wang runs 6 packs at 15000 lbs", "记住司机老王，6 块电池", "能帮我记住司机东华吗". Fill `memory_profiles` with one entry per driver — never leave it empty for "remember". `name` is the driver's name in exactly the characters the operator typed: "donghua" stays "donghua" and "东华" stays "东华". Never convert between pinyin and Chinese characters, translate or re-spell a name. `evidence` is ONE contiguous, exact substring of the message covering that driver's words — never join words from different places: in "add driver Linus and Han with 6 packs", Han's evidence is "Han with 6 packs", not "add driver Han". Leave packs or weight null if they did not say it — a name alone is a valid profile. Never invent a name, packs or weight.
   * "recall" — load drivers that are ALREADY SAVED into the form for a run ("Wang and Li are driving today", "use Wang today", "load driver Li", "今天老王出车"). Put the names in `memory_names`. Adding or saving a driver is "remember", not "recall".
-  * "forget" — delete a saved driver ("forget Wang"). Put the names in `memory_names`.
+  * "forget" — delete saved drivers the operator NAMES ("forget Wang", "delete driver Li"). Put the names in `memory_names` exactly as written. "delete everything", "clear all" or "remove all" with no driver named are about the STOPS (axis addresses), never memory.
   * "list" — show who is saved ("which drivers do you know?", "存了哪些司机"). Leave `memory_names` null.
   A message that names a driver ("driver Wang", "司机老王", or a name listed under SAVED DRIVERS) is memory. Changing the count, packs or weight of the CURRENT vehicles without naming a driver is intent "apply", not memory. Licence plates and vehicle names are not tracked: leave them out.
-- "out_of_scope": anything the form cannot do (weather, traffic, arrival times, running the optimisation, reading results, small talk, unrelated questions). No changes. Say briefly what you cannot do.
+- "out_of_scope": anything the form cannot do (weather, traffic, arrival times, running the optimisation, reading results, resetting the whole form, small talk, unrelated questions). No changes. Say briefly what you cannot do.
 
 AXES (the only fields that exist):
 - depot (text): the depot / warehouse / start address
@@ -1899,7 +1938,8 @@ def extraction_schema_for(pending) -> dict:
     if pending and pending.get('question'):
         return EXTRACTION_SCHEMA
     schema = json.loads(json.dumps(EXTRACTION_SCHEMA))
-    schema['properties']['intent']['enum'] = [i for i in INTENTS if i != 'confirm']
+    step = schema['properties']['steps']['items']
+    step['properties']['intent']['enum'] = [i for i in INTENTS if i != 'confirm']
     return schema
 
 
@@ -1930,15 +1970,21 @@ def call_extraction(utterance: str, history: list, form_state: dict, pending) ->
 
     choice = response.json()['choices'][0]['message']
     if choice.get('refusal'):
-        return {"intent": "out_of_scope", "changes": [], "question": None, "question_axis": None,
-                "ambiguous_term": None, "message": choice['refusal']}
+        return {"steps": [{"intent": "out_of_scope", "changes": [], "question": None, "question_axis": None,
+                           "ambiguous_term": None, "message": choice['refusal']}]}
     return json.loads(choice['content'])
 
 
 # ---- 3. deterministic validation --------------------------------------------
 
+# Words that make an empty stops change mean "remove all of them".
+CLEAR_ALL_RE = re.compile(r'\b(?:all|every(?:thing|one)?|clear|wipe|empty|remove|delete)\b'
+                          r'|全部|所有|清空|清除|删除|删掉', re.I)
+
+
 def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: str = 'en'):
-    """Gate for one extracted change. Returns (change, None) or (None, reason)."""
+    """Gate for one extracted change. Returns (change, None), (None, reason), or
+    (None, None) for padding that is dropped silently."""
     form_state = form_state or {}
     axis = raw.get('axis')
     op = raw.get('op') or 'set'
@@ -1947,13 +1993,20 @@ def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: st
         return None, _r('unknown_field', lang, axis=axis)
     label = axis_label(axis, lang)
 
-    # "clear all stops": a remove with nothing named means all of them. Filling
-    # in the current list turns it into an ordinary change the gates can see.
-    if axis == 'addresses' and op in ('remove', 'set') and not raw.get('value_list'):
+    if all(raw.get(k) in (None, '', []) for k in ('value_text', 'value_number', 'value_bool', 'value_list')):
+        # "clear all stops": a remove with nothing named means all of them —
+        # but only when the operator's words say so. Filling in the current
+        # list turns it into an ordinary change the gates can see.
         current = [a for a in (form_state.get('addresses') or []) if str(a).strip()]
-        if current:
-            raw = dict(raw, value_list=list(current), value_text=None)
+        if (axis == 'addresses' and op in ('remove', 'set') and current
+                and CLEAR_ALL_RE.search(_strip_edges(raw.get('evidence')))):
+            raw = dict(raw, value_list=list(current))
             op = 'remove'
+        else:
+            # Any other change with no value is the model padding the array
+            # (one entry per field, quoting the same words). There is nothing
+            # to apply, so drop it without a "skipped" note.
+            return None, None
 
     # "one more truck" / "5 degrees warmer": a relative move on a numeric axis.
     # Resolve it against the form here rather than trusting the model to add up.
@@ -2048,6 +2101,13 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
     # information, wrong container. validate_profile still checks the name.
     if intent == 'memory' and mem_op == 'remember' and not mem_profiles and mem_names:
         mem_profiles = [{'name': n, 'evidence': n} for n in mem_names]
+    # Same anti-hallucination rule as saving: a driver is only deleted or loaded
+    # if the operator wrote that name. Without it "delete everything" came back
+    # as forget [Wang, Li, Han, Linus], names lifted from the prompt's examples.
+    names_refused = []
+    if intent == 'memory' and mem_op in ('forget', 'recall'):
+        names_refused = [n for n in mem_names if not name_in(n, utterance)]
+        mem_names = [n for n in mem_names if name_in(n, utterance)]
     # "is 2-opt good enough?" is a pick question, not a tradeoff lecture. The model
     # mislabels it as "why" about a third of the time, so the utterance decides.
     if topic == 'why' and not WHY_RE.search(utterance):
@@ -2068,8 +2128,19 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
             change, reason = validate_change(c if isinstance(c, dict) else {}, utterance, form_state, lang)
             if change:
                 changes.append(change)
-            else:
+            elif reason:
                 rejected.append(reason)
+        # Padding with a value: a field restated as it already is, quoting the
+        # words of an earlier change ("use 3 trucks" → also "battery packs 4").
+        # It would change nothing, so drop it rather than ask about it.
+        kept, seen_evidence = [], set()
+        for c in changes:
+            ev = _norm(c['evidence'])
+            if ev in seen_evidence and form_state.get(c['axis']) == c['value']:
+                continue
+            seen_evidence.add(ev)
+            kept.append(c)
+        changes = kept
 
     # Ambiguity flag / term: an ambiguous extraction may never be applied.
     # The model may raise the flag; the place check below raises it regardless.
@@ -2108,7 +2179,7 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
             'question': question, 'question_axis': question_axis, 'message': message,
             'advice_topic': topic, 'advice_scenario': scenario, 'advice_about': about,
             'memory_op': mem_op, 'memory_profiles': mem_profiles, 'memory_names': mem_names,
-            'utterance': utterance}
+            'memory_names_refused': names_refused, 'utterance': utterance}
 
 
 def _single_rejected_axis(raw: dict):
@@ -2128,11 +2199,19 @@ def route_outcome(verdict: dict, pending, source: str, form_state: dict = None) 
         return outcome_out_of_scope(_o('nothing', lang), source, list_capabilities=False, lang=lang)
     if intent == 'memory':
         op = verdict.get('memory_op') or 'list'
+        names = verdict.get('memory_names') or []
+        refused = [_m('no_evidence', lang, name=n) for n in verdict.get('memory_names_refused') or []]
         if op == 'remember':
             return do_remember(verdict.get('memory_profiles'), verdict.get('utterance', ''), source, lang)
-        if op == 'forget':
-            return do_forget(verdict.get('memory_names'), source, lang)
-        return do_recall(verdict.get('memory_names') if op == 'recall' else [], source, lang)
+        # No usable name: ask which driver rather than delete or load a guess.
+        if op == 'forget' and not names:
+            return outcome_memory(_m('which_forget', lang), source, lang, rejected=refused)
+        if op == 'recall' and not names and refused:
+            return outcome_memory(_m('which_recall', lang), source, lang, rejected=refused)
+        out = (do_forget(names, source, lang) if op == 'forget'
+               else do_recall(names if op == 'recall' else [], source, lang))
+        out['rejected'] = refused + out['rejected']
+        return out
     if intent == 'recommend':
         scen = verdict.get('advice_scenario') or {}
         stops = scen.get('stops')
@@ -2154,6 +2233,91 @@ def route_outcome(verdict: dict, pending, source: str, form_state: dict = None) 
         return outcome_ask(verdict['question'], verdict['question_axis'], source,
                            rejected=verdict['rejected'], lang=lang)
     return outcome_out_of_scope(verdict['message'], source, lang=lang)
+
+
+def advance_form_state(state: dict, changes: list) -> dict:
+    """The form as it will look once the client applies `changes`, so a later
+    step in the same message ("…then which solver?") sees the new values.
+    Mirrors applyChatChange in RouteOptimizer.jsx."""
+    state = dict(state or {})
+    for c in changes:
+        axis, op, value = c['axis'], c['op'], c['value']
+        if axis == 'addresses':
+            current = list(state.get('addresses') or [])
+            if op == 'add':
+                current += value
+            elif op == 'remove':
+                current = [a for a in current if not any(v.lower() in a.lower() for v in value)]
+            else:
+                current = list(value)
+            state['addresses'] = current
+        elif axis == 'fleet':
+            state['fleet'] = value
+            state['vehicle_count'] = len(value)
+        else:
+            state[axis] = value
+    return state
+
+
+def outcome_hold(changes: list, source: str, lang: str = 'en') -> dict:
+    """A form change in a message that already moved one: queued for a yes,
+    exactly as outcome_apply queues the second change of a single step."""
+    question = _o('also', lang, label=changes[0]['label'])
+    return {
+        'status': 'ok', 'intent': 'apply', 'source': source,
+        'message': question, 'changes': [],
+        'pending': {'question': question, 'axis': None, 'queued': changes},
+        'capabilities': None, 'rejected': [], 'advice': None, 'profiles': [],
+    }
+
+
+STEP_TEXT = {
+    'on_hold': {'en': "The rest of your request is on hold until you answer — say it again afterwards.",
+                'zh': "剩下的请求先暂停，回答之后请再说一遍。"},
+}
+
+
+def run_steps(raw_steps: list, utterance: str, pending, source: str, form_state: dict = None) -> dict:
+    """Validate and run each extracted step in order, then merge the replies.
+
+    A later step is validated against the form as the earlier steps left it.
+    The first step that needs an answer (a question, a queued change, a
+    switch offer) ends the turn: only one question can be pending, and the
+    steps after it may depend on the answer.
+    """
+    steps = [s for s in raw_steps if isinstance(s, dict)][:MAX_STEPS] or [{}]
+    state = dict(form_state or {})
+    outcomes, moved_form = [], False
+    for raw in steps:
+        verdict = validate_extraction(raw, utterance, state, pending_exists=bool(pending))
+        if verdict['intent'] == 'apply' and moved_form and ONE_CHANGE_PER_TURN:
+            out = outcome_hold(verdict['changes'], source, verdict.get('lang', 'en'))
+        else:
+            out = route_outcome(verdict, pending, source, state)
+        moved_form |= out['intent'] == 'apply' and bool(out['changes'])
+        state = advance_form_state(state, out['changes'])
+        outcomes.append(out)
+        if out['pending']:
+            break
+
+    if len(outcomes) == 1 and len(steps) == 1:
+        return outcomes[0]
+
+    lang = detect_lang(utterance)
+    messages = [o['message'] for o in outcomes if o['message']]
+    if len(outcomes) < len(steps):
+        messages.append(STEP_TEXT['on_hold'].get(lang, STEP_TEXT['on_hold']['en']))
+    last = outcomes[-1]
+    return {
+        'status': 'ok', 'intent': last['intent'], 'source': source,
+        'message': "\n".join(messages),
+        'changes': [c for o in outcomes for c in o['changes']],
+        'pending': last['pending'],
+        'capabilities': next((o['capabilities'] for o in outcomes if o['capabilities']), None),
+        'rejected': [r for o in outcomes for r in o['rejected']],
+        'advice': next((o['advice'] for o in reversed(outcomes) if o['advice']), None),
+        'profiles': [p for o in outcomes for p in o['profiles']],
+    }
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -2184,9 +2348,8 @@ def ai_chat():
     except Exception as e:
         return jsonify({"status": "error", "message": f"Extraction failed: {e}"}), 502
 
-    # 3. deterministic validation → apply / ask / out of scope
-    verdict = validate_extraction(raw, utterance, form_state, pending_exists=bool(pending))
-    return jsonify(route_outcome(verdict, pending, source='model', form_state=form_state))
+    # 3. deterministic validation of each step, run in order
+    return jsonify(run_steps(raw.get('steps') or [], utterance, pending, 'model', form_state))
 
 
 # =============================================================================
@@ -2275,15 +2438,12 @@ def validate_profile(raw: dict, utterance: str, lang: str = 'en'):
     if not name:
         return None, _m('no_name', lang)
 
-    # Same anti-hallucination rule as a form change: the model has to point at
-    # the words it read the profile out of. A name-only profile has nothing
-    # else to check, so the name itself must be in the message too.
-    evidence = _strip_edges(raw.get('evidence'))
-    if (not evidence or _norm(evidence) not in _norm(utterance)
-            or _norm(name) not in _norm(utterance)):
+    # The driver's name must be written in the message, so the model cannot
+    # invent a driver.
+    if not name_in(name, utterance):
         return None, _m('no_evidence', lang, name=name)
 
-    profile = {'name': name}
+    profile = {'name': typed_spelling(name, utterance)}
     for field, axis in PROFILE_FIELDS.items():
         value = raw.get(field)
         if value is None or value == '':
@@ -2294,6 +2454,16 @@ def validate_profile(raw: dict, utterance: str, lang: str = 'en'):
         if reason:
             return None, f"{name}: {reason}"
         profile[field] = value
+
+    # Packs and weight need the evidence span: the model must quote the
+    # operator's own words for this driver, so it cannot invent the numbers or
+    # move one driver's onto another. A name-only profile has nothing more to
+    # guard. Checking the span there anyway rejected "add driver Linus and Han",
+    # because the model quoted "add driver Han", which is not in the message.
+    if len(profile) > 1:
+        evidence = _strip_edges(raw.get('evidence'))
+        if not evidence or _norm(evidence) not in _norm(utterance):
+            return None, _m('no_spec_evidence', lang, name=name)
     return profile, None
 
 
@@ -2302,6 +2472,9 @@ MEMORY_TEXT = {
     'no_driver':   {'en': "I couldn't find a driver's name to save. Try: \"save driver Donghua\"",
                     'zh': "没找到要保存的司机名字。试试：「记住司机东华」"},
     'no_evidence': {'en': "{name}: not found in your message", 'zh': "{name}：在你的话里找不到依据"},
+    'no_spec_evidence': {'en': "{name}: couldn't tell which packs or weight are {name}'s. "
+                               "Try: \"{name} runs 6 packs\"",
+                         'zh': "{name}：分不清哪些电池包数或重量属于 {name}。试试：「{name} 6 块电池」"},
     'saved':       {'en': "Saved {n} driver{s}: {list}", 'zh': "已记住 {n} 位司机：{list}"},
     'updated':     {'en': "Updated {list}", 'zh': "已更新 {list}"},
     'full':        {'en': "Memory is full ({max} drivers). Forget one first.",
@@ -2312,7 +2485,11 @@ MEMORY_TEXT = {
                     'zh': "我没存过 {missing}。已存的有：{known}"},
     'none_saved':  {'en': "No drivers saved yet. Try: \"remember driver Wang, 6 packs, 15000 lbs\"",
                     'zh': "还没存过司机。试试：「记住司机老王，6 块电池，15000 磅」"},
-    'forgot':      {'en': "Forgot {list}", 'zh': "已删除 {list}"},
+    'forgot':      {'en': "Driver{s} {list} deleted", 'zh': "已删除司机 {list}"},
+    'which_forget': {'en': "Which driver should I delete? Name them, e.g. \"delete driver Li\"",
+                     'zh': "要删除哪位司机？请说出名字，例如「删除司机老王」"},
+    'which_recall': {'en': "Which drivers are driving? Name them, e.g. \"Li and Wang are driving today\"",
+                     'zh': "哪几位司机出车？请说出名字，例如「今天老王和小李出车」"},
     'listing':     {'en': "{n} driver{s} saved:", 'zh': "已存 {n} 位司机："},
 }
 
@@ -2345,6 +2522,10 @@ def do_remember(raw_profiles: list, utterance: str, source: str, lang: str) -> d
         if existing is None and len(mem['drivers']) >= MAX_PROFILES:
             rejected.append(_m('full', lang, max=MAX_PROFILES))
             continue
+        # The same driver typed in different case: "Donghua" corrects a stored
+        # "donghua", but a casual all-lowercase update keeps the stored capitals.
+        if existing and profile['name'] == profile['name'].lower():
+            profile['name'] = existing['name']
         # Merge, so "Wang runs 8 packs now" keeps the stored weight.
         merged = {**(existing or {}), **profile}
         mem['drivers'][key] = merged
@@ -2365,13 +2546,12 @@ def do_recall(names: list, source: str, lang: str) -> dict:
     if not mem['drivers']:
         return outcome_memory(_m('none_saved', lang), source, lang)
 
-    # No names given → list who is stored rather than guessing.
+    # No names given → list who is stored rather than guessing. The chat shows
+    # each profile as a card, so the text is just the count.
     if not names:
-        lines = [_m('listing', lang, n=len(mem['drivers']),
-                    s='' if len(mem['drivers']) == 1 else 's')]
-        lines += [f"· {describe_profile(p, lang)}" for p in mem['drivers'].values()]
-        return outcome_memory("\n".join(lines), source, lang,
-                              profiles=list(mem['drivers'].values()))
+        return outcome_memory(_m('listing', lang, n=len(mem['drivers']),
+                                 s='' if len(mem['drivers']) == 1 else 's'),
+                              source, lang, profiles=list(mem['drivers'].values()))
 
     found, missing = [], []
     for n in names:
@@ -2402,7 +2582,8 @@ def do_forget(names: list, source: str, lang: str) -> dict:
         (gone.append(p['name']) if p else missing.append(n))
     if gone:
         save_memory(mem)
-        return outcome_memory(_m('forgot', lang, list=", ".join(gone)), source, lang)
+        return outcome_memory(_m('forgot', lang, s='' if len(gone) == 1 else 's',
+                                 list=", ".join(gone)), source, lang)
     known = ", ".join(p['name'] for p in mem['drivers'].values()) or '-'
     return outcome_memory(_m('unknown', lang, missing=", ".join(missing or ['?']), known=known),
                           source, lang)

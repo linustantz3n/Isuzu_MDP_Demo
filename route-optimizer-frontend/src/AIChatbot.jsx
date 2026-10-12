@@ -152,8 +152,10 @@ export default function AIChatbot({ formState, onApplyChange }) {
             profiles: data.profiles,
           },
         }]);
-        // Apply change: each entry touches exactly one axis.
-        if (data.intent === 'apply' && data.changes.length) {
+        // Apply every change the reply carries, in order; each touches exactly
+        // one axis. Not only intent 'apply': a driver recall ('memory') sets the
+        // fleet, and a multi-step reply can mix both.
+        if (data.changes?.length) {
           data.changes.forEach(onApplyChange);
           setFilled(true);
           setTimeout(() => setFilled(false), 3000);
@@ -285,7 +287,7 @@ export default function AIChatbot({ formState, onApplyChange }) {
                       ? 'bg-[#C8002F] text-white rounded-br-sm border-transparent'
                       : `${INTENT_STYLE[m.meta?.intent] || INTENT_STYLE.apply} rounded-bl-sm`
                   }`}>
-                    {m.content}
+                    <div className="whitespace-pre-line">{m.content}</div>
                     {m.role === 'assistant' && renderMeta(m.meta)}
                   </div>
                 </div>
