@@ -1097,6 +1097,7 @@ def optimize_route():
                 fleet_routes.append({
                     "vehicle_id": vcfg.get('id', v_idx + 1),
                     "vehicle_name": vcfg.get('name', f'Vehicle {v_idx + 1}'),
+                    "driver": vcfg.get('driver') or '',
                     "vehicle_config": {
                         "total_weight_lbs": v_total_weight_lbs,
                         "cargo_weight_lbs": v_cargo_weight_lbs,
@@ -1226,7 +1227,7 @@ AXES = {
     'unload_time_min':     {'type': 'number', 'label': 'Unload time',    'min': 5,     'max': 120,   'unit': ' min'},
     'has_climate_control': {'type': 'bool',   'label': 'Climate control'},
     'solver':              {'type': 'enum',   'label': 'Solver', 'choices': SOLVER_CHOICES},
-    # Set only by a memory recall: the full per-vehicle fleet, not a uniform value.
+    # Set only by a memory recall: one vehicle per recalled driver, not a uniform value.
     'fleet':               {'type': 'fleet',  'label': 'Fleet'},
 }
 
@@ -1246,7 +1247,7 @@ CAPABILITIES_ZH = [
     "设置每站卸货时间（5–120 分钟）",
     "开启或关闭空调",
     "根据问题规模推荐求解器，并切换过去",
-    "按名字记住一辆车（电池、重量、司机、车牌），之后直接调用",
+    "按名字记住司机（可附带所开卡车的电池包数和重量），之后直接调用",
 ]
 
 
@@ -1265,7 +1266,7 @@ CAPABILITIES = [
     "Set unload time per stop (5–120 min)",
     "Turn climate control on or off",
     "Recommend which solver fits your problem size, and switch to it",
-    "Remember a vehicle by name (packs, weight, driver, plate) and load it back later",
+    "Remember a driver by name (optionally with their truck's packs and weight) and load them back later",
 ]
 
 # One utterance → one applied change. Further validated changes are queued and
@@ -1317,7 +1318,7 @@ def describe_change(change: dict, lang: str = 'en') -> str:
     value, op = change['value'], change['op']
     zh = lang == 'zh'
     if spec['type'] == 'fleet':
-        names = ", ".join(v.get('name', '?') for v in value)
+        names = ", ".join(v.get('driver') or v.get('name', '?') for v in value)
         return (f"{label} → {names}（{len(value)} 辆）" if zh
                 else f"{label} → {names} ({len(value)} vehicle{'s' if len(value) != 1 else ''})")
     if spec['type'] == 'enum':
@@ -1678,9 +1679,19 @@ RELATIVE_LEXICON = [
 ]
 
 
-def mentions_saved_vehicle(utterance: str) -> bool:
-    norm = _norm(utterance)
-    return any(key and key in norm for key in load_memory()['vehicles'])
+def mentions_saved_driver(utterance: str) -> bool:
+    # Whole-word match: a driver called "Li" must not capture "climate".
+    # Chinese has no word boundaries, so a CJK name is a plain substring check.
+    for p in load_memory()['drivers'].values():
+        name = str(p.get('name') or '').strip()
+        if not name:
+            continue
+        if CJK_RE.search(name):
+            if _norm(name) in _norm(utterance):
+                return True
+        elif re.search(r'(?<!\w)' + r'\s*'.join(map(re.escape, name.split())) + r'(?!\w)', utterance, re.I):
+            return True
+    return False
 
 
 def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
@@ -1705,10 +1716,10 @@ def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
 
     is_question = bool(QUESTION_RE.search(utterance))
 
-    # "Truck A has 8 packs now" must update the stored profile, not the form.
-    # The regex table cannot tell those apart, so any saved name sends the
-    # utterance to the model.
-    if mentions_saved_vehicle(utterance):
+    # "Wang runs 8 packs now" must update the stored profile, not the form.
+    # The regex table cannot tell those apart, so any saved driver's name sends
+    # the utterance to the model.
+    if mentions_saved_driver(utterance):
         return None
 
     # (b) relative nudges that only need the current value
@@ -1797,11 +1808,9 @@ EXTRACTION_SCHEMA = {
                     "name": {"type": "string"},
                     "battery_packs": {"type": ["integer", "null"]},
                     "weight_lbs": {"type": ["integer", "null"]},
-                    "driver": _NULLABLE_STR,
-                    "plate": _NULLABLE_STR,
                     "evidence": {"type": "string"},
                 },
-                "required": ["name", "battery_packs", "weight_lbs", "driver", "plate", "evidence"],
+                "required": ["name", "battery_packs", "weight_lbs", "evidence"],
             }}, {"type": "null"}]},
         "memory_names": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
         "advice_scenario": {"anyOf": [{
@@ -1830,12 +1839,12 @@ INTENTS (choose exactly one):
 - "ask": the request is ambiguous or incomplete (a place name that exists in several states or countries, a number whose unit or target field is unclear, a missing value). Put the clarifying question in `question`, name the field in `question_axis` when there is one, copy the ambiguous word(s) into `ambiguous_term`, and leave `changes` empty.
 - "confirm": ONLY when a PENDING QUESTION is listed below AND the message is nothing but a yes/no answer to it. If there is no pending question, never use this intent.
 - "recommend": the operator is asking WHICH SOLVER / ALGORITHM to use, why one is better, why not always use the optimal one, or which one is active. This includes questions about how long a solver takes, how many stops it can handle, or whether one is fast/good enough — route them here rather than declining. Set `advice_topic`: "which" (what should I use / can solver X handle this), "why" (why not always the exact one / how slow is it / explain the tradeoff), "current" (what am I running now). Do NOT answer with runtimes, limits or a pick of your own — code computes all of that and writes the reply. No changes.
-- "memory": the operator wants to save, load, list or delete a NAMED VEHICLE. Set `memory_op`:
-  * "remember" — they are describing a vehicle to save ("Truck A is 6 packs, 15000 lbs, driver Wang, plate 8ABC123", "Truck A 是 6 块电池"). Fill `memory_profiles`, one entry per vehicle, each with an exact `evidence` substring covering that vehicle's words. Leave a field null if they did not say it. Never invent packs, weight, a driver or a plate.
-  * "recall" — they want saved vehicles loaded into the form ("use Truck A and Truck C today", "今天用 Truck A"). Put the names in `memory_names`.
-  * "forget" — delete a saved vehicle ("forget Truck A"). Put the names in `memory_names`.
-  * "list" — show what is saved ("what vehicles do you know?", "存了哪些车"). Leave `memory_names` null.
-  A vehicle is "named" when the operator gives it an identifier like Truck A, 大卡, Van 3. Changing the count or packs of the CURRENT unnamed vehicles is intent "apply", not memory.
+- "memory": the operator wants to save, load, list or delete a DRIVER PROFILE. The memory tracks drivers, not vehicles: a profile is a driver's name, optionally with the battery packs and weight of the truck that driver runs. Phrasing does not matter: a command, a statement and a polite question ("can you…", "could you…", "is it possible to…", "please…", "能帮我…吗") are the same request — carry it out, do not ask for confirmation. Always set `memory_op`:
+  * "remember" — save a new driver or update a saved one: save, add, store, register, create, remember, 记住, 保存, 添加, or a description of the driver's truck. Examples: "remember driver Wang", "save driver Donghua to the system", "can you save driver Donghua?", "could you add a new driver called Li", "could you save driver Li with 8 packs?", "Wang runs 6 packs at 15000 lbs", "记住司机老王，6 块电池", "能帮我记住司机东华吗". Fill `memory_profiles` with one entry per driver — never leave it empty for "remember". `name` is the driver's name in exactly the characters the operator typed: "donghua" stays "donghua" and "东华" stays "东华". Never convert between pinyin and Chinese characters, translate or re-spell a name. `evidence` is an exact substring covering that driver's words. Leave packs or weight null if they did not say it — a name alone is a valid profile. Never invent a name, packs or weight.
+  * "recall" — load drivers that are ALREADY SAVED into the form for a run ("Wang and Li are driving today", "use Wang today", "load driver Li", "今天老王出车"). Put the names in `memory_names`. Adding or saving a driver is "remember", not "recall".
+  * "forget" — delete a saved driver ("forget Wang"). Put the names in `memory_names`.
+  * "list" — show who is saved ("which drivers do you know?", "存了哪些司机"). Leave `memory_names` null.
+  A message that names a driver ("driver Wang", "司机老王", or a name listed under SAVED DRIVERS) is memory. Changing the count, packs or weight of the CURRENT vehicles without naming a driver is intent "apply", not memory. Licence plates and vehicle names are not tracked: leave them out.
 - "out_of_scope": anything the form cannot do (weather, traffic, arrival times, running the optimisation, reading results, small talk, unrelated questions). No changes. Say briefly what you cannot do.
 
 AXES (the only fields that exist):
@@ -1856,7 +1865,7 @@ VALUE RULES:
 - `op` is "set" for every axis except addresses, which also accepts "add" and "remove". Resolve relative requests ("one more truck", "5 degrees warmer") against CURRENT FORM STATE and emit the resulting absolute number with op "set".
 - A plain statement of a value ("depot is X", "仓库设在 X", "temperature 30") is intent "apply", even when it already equals CURRENT FORM STATE — emit the change anyway rather than asking whether they want it.
 - An on-topic message with no usable value ("it's really hot today", "the trucks feel heavy") is intent "ask": ask for the number. Reserve "out_of_scope" for things this form genuinely cannot express.
-- Leave `memory_op`, `memory_profiles` and `memory_names` null for every intent except "memory".
+- Leave `memory_op`, `memory_profiles` and `memory_names` null for every intent except "memory". For intent "memory", `memory_op` is never null and `question` is null: do the operation, do not echo the operator's question back.
 - For intent "recommend": whenever the message names a size at all — "22 stops and 3 trucks", "on 25 stops", "for 12 stops" — fill `advice_scenario` with those numbers plus an exact `evidence` substring, even if it reads as a hypothetical. A question about how long a solver takes or how big it scales is `advice_topic` "why"; leave the numbers in `advice_scenario`. If the message names one solver ("should I use Held-Karp?", "is 2-opt good enough?", "Held-Karp 能跑 25 个站吗"), put that solver's key in `advice_about`. Chinese counts too: "25 个站" is 25 stops, "3 辆车" is 3 vehicles. set `need_optimal` true only if they said they require a guaranteed/proven optimum. Otherwise leave `advice_scenario` null and the current form state is used. Leave `advice_topic` and `advice_scenario` null for every other intent.
 - `message`: one short, friendly sentence in the operator's language. For "ask" it must equal `question`. For "recommend" it is ignored — code writes the answer.
 
@@ -1866,13 +1875,12 @@ CURRENT FORM STATE:
 
 
 def build_system_prompt(form_state: dict, pending) -> str:
-    saved = load_memory()['vehicles']
-    saved_block = ("\nSAVED VEHICLES (memory): "
-                   + ", ".join(f"{p['name']} ({p.get('battery_packs')} packs, "
-                               f"{p.get('weight_lbs')} lbs)" for p in saved.values())
-                   + "\nA message naming one of these updates its SAVED profile (intent \"memory\", "
-                     "op \"remember\"), not the current form."
-                   if saved else "\nSAVED VEHICLES (memory): none yet.")
+    saved = load_memory()['drivers']
+    saved_block = ("\nSAVED DRIVERS (memory): "
+                   + ", ".join(describe_profile(p) for p in saved.values())
+                   + "\nA message naming one of these updates or loads that SAVED driver (intent \"memory\"), "
+                     "not the current form."
+                   if saved else "\nSAVED DRIVERS (memory): none yet.")
     pending_block = ""
     if pending and pending.get('question'):
         pending_block = (
@@ -2005,6 +2013,12 @@ def ambiguous_place_in(change: dict):
     return None
 
 
+# Save-type verbs. Read only when the model labelled a message "memory" but
+# filled in no operation. Bare "remember" is left out: "which drivers do you
+# remember?" is a list question.
+SAVE_VERB_RE = re.compile(r'\b(?:save|add|store|register|create)\b|记住|保存|添加|新增|登记', re.I)
+
+
 def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
                         pending_exists: bool = False) -> dict:
     """Apply the coupling rules to a whole extraction. Never trusts the model."""
@@ -2026,7 +2040,14 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
     mem_profiles = raw.get('memory_profiles') if isinstance(raw.get('memory_profiles'), list) else []
     mem_names = [str(n).strip() for n in (raw.get('memory_names') or []) if str(n).strip()]
     if intent == 'memory' and not mem_op:
-        mem_op = 'remember' if mem_profiles else ('recall' if mem_names else 'list')
+        # Nothing extracted: let the operator's verb decide, so someone who asked
+        # to save a driver is told the name was missed rather than shown a list.
+        mem_op = ('remember' if mem_profiles else 'recall' if mem_names
+                  else 'remember' if SAVE_VERB_RE.search(utterance) else 'list')
+    # "remember" with the names in memory_names instead of memory_profiles: same
+    # information, wrong container. validate_profile still checks the name.
+    if intent == 'memory' and mem_op == 'remember' and not mem_profiles and mem_names:
+        mem_profiles = [{'name': n, 'evidence': n} for n in mem_names]
     # "is 2-opt good enough?" is a pick question, not a tradeoff lecture. The model
     # mislabels it as "why" about a third of the time, so the utterance decides.
     if topic == 'why' and not WHY_RE.search(utterance):
@@ -2169,37 +2190,40 @@ def ai_chat():
 
 
 # =============================================================================
-# Fleet memory — named vehicle profiles that survive the session
+# Driver memory — named driver profiles that survive the session
 # =============================================================================
 #
-# The point is not the labels. A profile carries battery_packs and weight_lbs,
-# which feed the energy model and the range check, so recalling "Truck A" puts
-# real parameters into the form. Driver and plate ride along as identification.
+# The memory tracks drivers, not vehicles: no plates, no truck names. A profile
+# is the driver's name plus, optionally, the battery packs and weight of the
+# truck that driver runs. When present those feed the energy model on recall;
+# a name-only profile still records who is driving and leaves the form's
+# vehicle specs alone.
 #
 # Stored as one JSON file next to the server: small, inspectable, and easy to
 # show to someone who asks where it actually lives.
 
 MEMORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fleet_memory.json')
 
+# Optional truck specs on a driver profile → the form axis whose range check they reuse.
 PROFILE_FIELDS = {
-    'battery_packs':     {'axis': 'battery_packs',      'label': 'packs'},
-    'weight_lbs':        {'axis': 'vehicle_weight_lbs', 'label': 'lbs'},
-    'driver':            {'axis': None,                 'label': 'driver'},
-    'plate':             {'axis': None,                 'label': 'plate'},
+    'battery_packs': 'battery_packs',
+    'weight_lbs':    'vehicle_weight_lbs',
 }
 MAX_PROFILES = 40
 MAX_LABEL_LEN = 40
 
 
 def _memory_default() -> dict:
-    return {'vehicles': {}}
+    return {'drivers': {}}
 
 
 def load_memory() -> dict:
+    # A file written before driver profiles holds 'vehicles' (with plates); it
+    # is not carried over, and the next save replaces it.
     try:
         with open(MEMORY_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        if not isinstance(data, dict) or not isinstance(data.get('vehicles'), dict):
+        if not isinstance(data, dict) or not isinstance(data.get('drivers'), dict):
             return _memory_default()
         return data
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -2214,87 +2238,82 @@ def save_memory(mem: dict) -> None:
 
 
 def profile_key(name: str) -> str:
-    """Lookup key: case- and space-insensitive, so "truck a" finds "Truck A"."""
+    """Lookup key: case- and space-insensitive, so "wang" finds "Wang"."""
     return re.sub(r'\s+', '', str(name or '')).lower()
 
 
 def profile_to_vehicle(profile: dict, vid: int) -> dict:
-    """A stored profile in the shape /api/optimize and the form expect."""
-    packs = int(profile.get('battery_packs', 4))
+    """A recalled driver in the shape the form's `fleet` axis expects.
+
+    Packs and weight are None when the profile does not store them; the form
+    then keeps whatever that vehicle slot already has.
+    """
+    packs = profile.get('battery_packs')
     return {
         'id': vid,
-        'name': profile.get('name', f'Vehicle {vid}'),
+        'driver': profile.get('name', ''),
         'battery_packs': packs,
-        'battery_kwh': packs * 20,
-        'weight_lbs': int(profile.get('weight_lbs', 13000)),
-        'driver': profile.get('driver') or '',
-        'plate': profile.get('plate') or '',
+        'battery_kwh': packs * 20 if packs is not None else None,
+        'weight_lbs': profile.get('weight_lbs'),
     }
 
 
 def describe_profile(profile: dict, lang: str = 'en') -> str:
-    packs = profile.get('battery_packs', 4)
-    bits = [f"{packs} packs ({packs * 20} kWh)",
-            f"{int(profile.get('weight_lbs', 13000)):,} lbs"]
-    if profile.get('driver'):
-        bits.append(f"{'司机 ' if lang == 'zh' else 'driver '}{profile['driver']}")
-    if profile.get('plate'):
-        bits.append(profile['plate'])
-    return f"{profile.get('name', '?')} — " + " · ".join(bits)
+    bits = []
+    if profile.get('battery_packs') is not None:
+        packs = profile['battery_packs']
+        bits.append(f"{packs} packs ({packs * 20} kWh)")
+    if profile.get('weight_lbs') is not None:
+        bits.append(f"{int(profile['weight_lbs']):,} lbs")
+    name = profile.get('name', '?')
+    return f"{name} — " + " · ".join(bits) if bits else name
 
 
 def validate_profile(raw: dict, utterance: str, lang: str = 'en'):
-    """Gate for one remembered profile. Returns (profile, None) or (None, reason)."""
+    """Gate for one remembered driver. Returns (profile, None) or (None, reason)."""
     name = _strip_edges(raw.get('name'))[:MAX_LABEL_LEN]
     if not name:
         return None, _m('no_name', lang)
 
     # Same anti-hallucination rule as a form change: the model has to point at
-    # the words it read the profile out of.
+    # the words it read the profile out of. A name-only profile has nothing
+    # else to check, so the name itself must be in the message too.
     evidence = _strip_edges(raw.get('evidence'))
-    if not evidence or _norm(evidence) not in _norm(utterance):
+    if (not evidence or _norm(evidence) not in _norm(utterance)
+            or _norm(name) not in _norm(utterance)):
         return None, _m('no_evidence', lang, name=name)
 
     profile = {'name': name}
-    for field, spec in PROFILE_FIELDS.items():
+    for field, axis in PROFILE_FIELDS.items():
         value = raw.get(field)
         if value is None or value == '':
             continue
-        if spec['axis']:
-            # Reuse the form's own range checks — a profile cannot store a
-            # vehicle the form would refuse.
-            value, reason = check_value(spec['axis'], 'set', value, lang)
-            if reason:
-                return None, f"{name}: {reason}"
-        else:
-            value = str(value).strip()[:MAX_LABEL_LEN]
+        # Reuse the form's own range checks — a profile cannot store a truck
+        # the form would refuse.
+        value, reason = check_value(axis, 'set', value, lang)
+        if reason:
+            return None, f"{name}: {reason}"
         profile[field] = value
-
-    if len(profile) == 1:          # name only, nothing to store
-        return None, _m('no_specs', lang, name=name)
-    # No defaults and no "needs specs" check here: an update that mentions only
-    # the driver is fine for a vehicle we already know. do_remember decides,
-    # because only it can see whether the profile already exists.
     return profile, None
 
 
 MEMORY_TEXT = {
-    'no_name':     {'en': "a profile needs a name", 'zh': "档案得有个名字"},
+    'no_name':     {'en': "a driver profile needs the driver's name", 'zh': "司机档案得有司机的名字"},
+    'no_driver':   {'en': "I couldn't find a driver's name to save. Try: \"save driver Donghua\"",
+                    'zh': "没找到要保存的司机名字。试试：「记住司机东华」"},
     'no_evidence': {'en': "{name}: not found in your message", 'zh': "{name}：在你的话里找不到依据"},
-    'no_specs':    {'en': "{name}: tell me its battery packs or weight",
-                    'zh': "{name}：至少要告诉我电池包数或重量"},
-    'saved':       {'en': "Saved {n} vehicle{s}: {list}", 'zh': "已记住 {n} 辆车：{list}"},
+    'saved':       {'en': "Saved {n} driver{s}: {list}", 'zh': "已记住 {n} 位司机：{list}"},
     'updated':     {'en': "Updated {list}", 'zh': "已更新 {list}"},
-    'full':        {'en': "Memory is full ({max} vehicles). Forget one first.",
-                    'zh': "记忆已满（{max} 辆）。先删掉一辆吧。"},
-    'loaded':      {'en': "Loaded {n} vehicle{s} into the form: {list}",
-                    'zh': "已载入 {n} 辆车到表单：{list}"},
+    'full':        {'en': "Memory is full ({max} drivers). Forget one first.",
+                    'zh': "记忆已满（{max} 位司机）。先删掉一位吧。"},
+    'loaded':      {'en': "Loaded {n} driver{s} into the form: {list}",
+                    'zh': "已载入 {n} 位司机到表单：{list}"},
     'unknown':     {'en': "I don't have {missing} saved. I know: {known}",
                     'zh': "我没存过 {missing}。已存的有：{known}"},
-    'none_saved':  {'en': "No vehicles saved yet. Try: \"Truck A is 6 packs, 15000 lbs, driver Wang\"",
-                    'zh': "还没存过车。试试：「Truck A 是 6 块电池，15000 磅，司机老王」"},
+    'none_saved':  {'en': "No drivers saved yet. Try: \"remember driver Wang, 6 packs, 15000 lbs\"",
+                    'zh': "还没存过司机。试试：「记住司机老王，6 块电池，15000 磅」"},
     'forgot':      {'en': "Forgot {list}", 'zh': "已删除 {list}"},
-    'listing':     {'en': "{n} vehicle{s} saved:", 'zh': "已存 {n} 辆车："},
+    'listing':     {'en': "{n} driver{s} saved:", 'zh': "已存 {n} 位司机："},
 }
 
 
@@ -2322,21 +2341,13 @@ def do_remember(raw_profiles: list, utterance: str, source: str, lang: str) -> d
             rejected.append(reason)
             continue
         key = profile_key(profile['name'])
-        existing = mem['vehicles'].get(key)
-        if existing is None:
-            if len(mem['vehicles']) >= MAX_PROFILES:
-                rejected.append(_m('full', lang, max=MAX_PROFILES))
-                continue
-            # A brand-new vehicle needs at least one real spec; a label alone
-            # would store nothing the optimiser can use.
-            if 'battery_packs' not in profile and 'weight_lbs' not in profile:
-                rejected.append(_m('no_specs', lang, name=profile['name']))
-                continue
-        # Merge, so "Truck A now has 8 packs" keeps the weight, driver and plate.
+        existing = mem['drivers'].get(key)
+        if existing is None and len(mem['drivers']) >= MAX_PROFILES:
+            rejected.append(_m('full', lang, max=MAX_PROFILES))
+            continue
+        # Merge, so "Wang runs 8 packs now" keeps the stored weight.
         merged = {**(existing or {}), **profile}
-        merged.setdefault('battery_packs', 4)
-        merged.setdefault('weight_lbs', 13000)
-        mem['vehicles'][key] = merged
+        mem['drivers'][key] = merged
         saved.append(merged)
 
     if saved:
@@ -2344,31 +2355,31 @@ def do_remember(raw_profiles: list, utterance: str, source: str, lang: str) -> d
     sep = '；' if lang == 'zh' else '; '
     message = (_m('saved', lang, n=len(saved), s='' if len(saved) == 1 else 's',
                   list=sep.join(describe_profile(p, lang) for p in saved))
-               if saved else (sep.join(rejected) if rejected else _m('no_name', lang)))
+               if saved else (sep.join(rejected) if rejected else _m('no_driver', lang)))
     return outcome_memory(message, source, lang, profiles=saved,
                           rejected=rejected if saved else [])
 
 
 def do_recall(names: list, source: str, lang: str) -> dict:
     mem = load_memory()
-    if not mem['vehicles']:
+    if not mem['drivers']:
         return outcome_memory(_m('none_saved', lang), source, lang)
 
-    # No names given → list what is stored rather than guessing.
+    # No names given → list who is stored rather than guessing.
     if not names:
-        lines = [_m('listing', lang, n=len(mem['vehicles']),
-                    s='' if len(mem['vehicles']) == 1 else 's')]
-        lines += [f"· {describe_profile(p, lang)}" for p in mem['vehicles'].values()]
+        lines = [_m('listing', lang, n=len(mem['drivers']),
+                    s='' if len(mem['drivers']) == 1 else 's')]
+        lines += [f"· {describe_profile(p, lang)}" for p in mem['drivers'].values()]
         return outcome_memory("\n".join(lines), source, lang,
-                              profiles=list(mem['vehicles'].values()))
+                              profiles=list(mem['drivers'].values()))
 
     found, missing = [], []
     for n in names:
-        p = mem['vehicles'].get(profile_key(n))
+        p = mem['drivers'].get(profile_key(n))
         (found if p else missing).append(p or n)
     if not found:
         return outcome_memory(_m('unknown', lang, missing=", ".join(missing),
-                                 known=", ".join(p['name'] for p in mem['vehicles'].values())),
+                                 known=", ".join(p['name'] for p in mem['drivers'].values())),
                               source, lang)
 
     fleet = [profile_to_vehicle(p, i + 1) for i, p in enumerate(found)]
@@ -2378,7 +2389,7 @@ def do_recall(names: list, source: str, lang: str) -> dict:
     message = _m('loaded', lang, n=len(found), s='' if len(found) == 1 else 's',
                  list=sep.join(describe_profile(p, lang) for p in found))
     rejected = [_m('unknown', lang, missing=", ".join(missing),
-                   known=", ".join(p['name'] for p in mem['vehicles'].values()))] if missing else []
+                   known=", ".join(p['name'] for p in mem['drivers'].values()))] if missing else []
     return outcome_memory(message, source, lang, changes=[change],
                           profiles=found, rejected=rejected)
 
@@ -2387,21 +2398,21 @@ def do_forget(names: list, source: str, lang: str) -> dict:
     mem = load_memory()
     gone, missing = [], []
     for n in names or []:
-        p = mem['vehicles'].pop(profile_key(n), None)
+        p = mem['drivers'].pop(profile_key(n), None)
         (gone.append(p['name']) if p else missing.append(n))
     if gone:
         save_memory(mem)
         return outcome_memory(_m('forgot', lang, list=", ".join(gone)), source, lang)
-    known = ", ".join(p['name'] for p in mem['vehicles'].values()) or '-'
+    known = ", ".join(p['name'] for p in mem['drivers'].values()) or '-'
     return outcome_memory(_m('unknown', lang, missing=", ".join(missing or ['?']), known=known),
                           source, lang)
 
 
 @app.route('/api/memory', methods=['GET'])
 def get_memory():
-    """The frontend reads this on load so the sidebar can list the saved fleet."""
+    """Lists the saved driver profiles."""
     mem = load_memory()
-    return jsonify({"status": "ok", "vehicles": list(mem['vehicles'].values())})
+    return jsonify({"status": "ok", "drivers": list(mem['drivers'].values())})
 
 
 @app.route('/api/memory', methods=['DELETE'])
@@ -2409,12 +2420,12 @@ def clear_memory():
     name = (request.args.get('name') or '').strip()
     mem = load_memory()
     if name:
-        removed = mem['vehicles'].pop(profile_key(name), None)
+        removed = mem['drivers'].pop(profile_key(name), None)
         save_memory(mem)
         return jsonify({"status": "ok", "removed": removed['name'] if removed else None,
-                        "vehicles": list(mem['vehicles'].values())})
+                        "drivers": list(mem['drivers'].values())})
     save_memory(_memory_default())
-    return jsonify({"status": "ok", "removed": "all", "vehicles": []})
+    return jsonify({"status": "ok", "removed": "all", "drivers": []})
 
 
 # =============================================================================

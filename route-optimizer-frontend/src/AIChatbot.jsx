@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageSquare, X, Send, Loader2, Bot, Sparkles, Zap, Cpu, History, HelpCircle, Ban, Check, Cog, Truck, User } from 'lucide-react';
+import { MessageSquare, X, Send, Loader2, Bot, Sparkles, Zap, Cpu, History, HelpCircle, Ban, Check, Cog, User, Maximize2, Minimize2 } from 'lucide-react';
 
 import { API_BASE } from './api';
 
@@ -18,27 +18,21 @@ const INTENT_STYLE = {
   out_of_scope: 'bg-rose-950/50 text-rose-100 border-rose-800/70',
 };
 
-// Vehicles the memory just saved or loaded. Packs and weight are real inputs to
-// the energy model; driver and plate are identification that rides along.
+// Drivers the memory just saved or loaded. Packs and weight are optional; when
+// a profile has them they are real inputs to the energy model.
 function ProfileCards({ profiles }) {
   if (!profiles?.length) return null;
   return (
     <div className="mt-2 space-y-1">
       {profiles.map((p, i) => (
         <div key={i} className="flex items-center gap-1.5 px-2 py-1 bg-slate-900/70 border border-slate-700 rounded text-[10px]">
-          <Truck className="w-3 h-3 text-teal-400 flex-shrink-0" />
+          <User className="w-3 h-3 text-teal-400 flex-shrink-0" />
           <span className="font-semibold text-slate-200">{p.name}</span>
-          <span className="text-slate-400">{p.battery_packs}p · {p.battery_packs * 20}kWh</span>
-          <span className="text-slate-500">{Number(p.weight_lbs).toLocaleString()} lbs</span>
-          {p.driver && (
-            <span className="text-slate-500 flex items-center gap-0.5 ml-auto">
-              <User className="w-2.5 h-2.5" />{p.driver}
-            </span>
+          {p.battery_packs != null && (
+            <span className="text-slate-400">{p.battery_packs}p · {p.battery_packs * 20}kWh</span>
           )}
-          {p.plate && (
-            <span className="font-mono text-slate-400 bg-slate-800 border border-slate-700 rounded px-1">
-              {p.plate}
-            </span>
+          {p.weight_lbs != null && (
+            <span className="text-slate-500">{Number(p.weight_lbs).toLocaleString()} lbs</span>
           )}
         </div>
       ))}
@@ -81,6 +75,8 @@ function AdviceTable({ advice }) {
 
 export default function AIChatbot({ formState, onApplyChange }) {
   const [open, setOpen] = useState(false);
+  // Full screen: the panel fills the window instead of floating in the corner.
+  const [expanded, setExpanded] = useState(false);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([
     {
@@ -101,7 +97,28 @@ export default function AIChatbot({ formState, onApplyChange }) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
       inputRef.current?.focus();
     }
-  }, [messages, open]);
+  }, [messages, open, expanded]);
+
+  // Grow the input with its text so long messages wrap instead of scrolling
+  // sideways; max-h caps it, after which it scrolls.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input, open, expanded]);
+
+  // Esc leaves full screen, as it does for a video or an image viewer.
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e) => { if (e.key === 'Escape') setExpanded(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [expanded]);
+
+  // In full screen, keep the conversation in a readable centred column.
+  const column = expanded ? 'max-w-3xl mx-auto w-full' : '';
+  const textSize = expanded ? 'text-sm' : 'text-xs';
 
   const send = async () => {
     if (!input.trim() || loading) return;
@@ -197,7 +214,7 @@ export default function AIChatbot({ formState, onApplyChange }) {
             <span>{badge.label}</span>
             {meta.intent === 'ask' && <HelpCircle className="w-2.5 h-2.5 ml-1 text-amber-500" />}
             {meta.intent === 'recommend' && <Cog className="w-2.5 h-2.5 ml-1 text-indigo-400" />}
-            {meta.intent === 'memory' && <Truck className="w-2.5 h-2.5 ml-1 text-teal-400" />}
+            {meta.intent === 'memory' && <User className="w-2.5 h-2.5 ml-1 text-teal-400" />}
           </div>
         )}
       </div>
@@ -223,11 +240,13 @@ export default function AIChatbot({ formState, onApplyChange }) {
 
       {/* Chat panel */}
       {open && (
-        <div className="fixed bottom-6 right-6 w-80 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl flex flex-col z-50"
-          style={{ height: 460 }}>
+        <div className={`fixed bg-slate-900 shadow-2xl flex flex-col z-50 ${
+            expanded ? 'inset-0' : 'bottom-6 right-6 w-80 border border-slate-700 rounded-xl'
+          }`}
+          style={expanded ? undefined : { height: 460 }}>
 
           {/* Header */}
-          <div className="flex items-center gap-2.5 px-4 py-3 border-b border-slate-700 flex-shrink-0 rounded-t-xl bg-slate-800">
+          <div className={`flex items-center gap-2.5 px-4 py-3 border-b border-slate-700 flex-shrink-0 bg-slate-800 ${expanded ? '' : 'rounded-t-xl'}`}>
             <div className="w-7 h-7 bg-[#C8002F] rounded-full flex items-center justify-center flex-shrink-0">
               <Bot className="w-4 h-4 text-white" />
             </div>
@@ -239,7 +258,17 @@ export default function AIChatbot({ formState, onApplyChange }) {
               <span className="text-[10px] text-green-400 font-medium animate-pulse">Form updated</span>
             )}
             <button
-              onClick={() => setOpen(false)}
+              onClick={() => setExpanded(e => !e)}
+              title={expanded ? 'Exit full screen (Esc)' : 'Full screen'}
+              aria-label={expanded ? 'Exit full screen' : 'Full screen'}
+              className="text-slate-500 hover:text-white transition-colors flex-shrink-0 ml-1"
+            >
+              {expanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+            </button>
+            <button
+              onClick={() => { setOpen(false); setExpanded(false); }}
+              title="Close"
+              aria-label="Close"
               className="text-slate-500 hover:text-white transition-colors flex-shrink-0 ml-1"
             >
               <X className="w-4 h-4" />
@@ -247,56 +276,62 @@ export default function AIChatbot({ formState, onApplyChange }) {
           </div>
 
           {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-2">
-            {messages.map((m, i) => (
-              <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[85%] px-3 py-2 rounded-xl text-xs leading-relaxed border ${
-                  m.role === 'user'
-                    ? 'bg-[#C8002F] text-white rounded-br-sm border-transparent'
-                    : `${INTENT_STYLE[m.meta?.intent] || INTENT_STYLE.apply} rounded-bl-sm`
-                }`}>
-                  {m.content}
-                  {m.role === 'assistant' && renderMeta(m.meta)}
+          <div className="flex-1 overflow-y-auto p-3">
+            <div className={`space-y-2 ${column}`}>
+              {messages.map((m, i) => (
+                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] px-3 py-2 rounded-xl ${textSize} leading-relaxed border ${
+                    m.role === 'user'
+                      ? 'bg-[#C8002F] text-white rounded-br-sm border-transparent'
+                      : `${INTENT_STYLE[m.meta?.intent] || INTENT_STYLE.apply} rounded-bl-sm`
+                  }`}>
+                    {m.content}
+                    {m.role === 'assistant' && renderMeta(m.meta)}
+                  </div>
                 </div>
-              </div>
-            ))}
-            {loading && (
-              <div className="flex justify-start">
-                <div className="bg-slate-800 border border-slate-700 px-3 py-2 rounded-xl rounded-bl-sm flex items-center gap-1.5">
-                  <Loader2 className="w-3 h-3 text-slate-400 animate-spin" />
-                  <span className="text-[10px] text-slate-500">Thinking...</span>
+              ))}
+              {loading && (
+                <div className="flex justify-start">
+                  <div className="bg-slate-800 border border-slate-700 px-3 py-2 rounded-xl rounded-bl-sm flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 text-slate-400 animate-spin" />
+                    <span className="text-[10px] text-slate-500">Thinking...</span>
+                  </div>
                 </div>
-              </div>
-            )}
-            <div ref={bottomRef} />
+              )}
+              <div ref={bottomRef} />
+            </div>
           </div>
 
           {/* Pending question reminder */}
           {pending?.question && (
-            <div className="flex-shrink-0 px-3 py-1.5 border-t border-amber-900/60 bg-amber-950/40 text-[10px] text-amber-300 flex items-center gap-1.5">
-              <HelpCircle className="w-3 h-3 flex-shrink-0" />
-              <span className="truncate" title={pending.question}>Waiting for: {pending.question}</span>
+            <div className="flex-shrink-0 px-3 py-1.5 border-t border-amber-900/60 bg-amber-950/40 text-[10px] text-amber-300">
+              <div className={`flex items-center gap-1.5 ${column}`}>
+                <HelpCircle className="w-3 h-3 flex-shrink-0" />
+                <span className="truncate" title={pending.question}>Waiting for: {pending.question}</span>
+              </div>
             </div>
           )}
 
           {/* Input */}
-          <div className="flex-shrink-0 p-3 border-t border-slate-700 flex gap-2">
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKey}
-              placeholder={pending ? 'Answer: yes / no / a value…' : 'e.g. temperature 30 C, or Depot in Anaheim…'}
-              className="flex-1 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent outline-none"
-            />
-            <button
-              onClick={send}
-              disabled={loading || !input.trim()}
-              className="w-8 h-8 bg-[#C8002F] hover:bg-[#a80027] disabled:opacity-30 disabled:cursor-not-allowed rounded-lg flex items-center justify-center text-white transition-all flex-shrink-0"
-            >
-              <Send className="w-3.5 h-3.5" />
-            </button>
+          <div className="flex-shrink-0 p-3 border-t border-slate-700">
+            <div className={`flex items-end gap-2 ${column}`}>
+              <textarea
+                ref={inputRef}
+                rows={1}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={handleKey}
+                placeholder={pending ? 'Answer: yes / no / a value…' : 'e.g. temperature 30 C, or Depot in Anaheim…'}
+                className={`flex-1 px-3 py-2 ${expanded ? 'max-h-40' : 'max-h-24'} resize-none overflow-y-auto leading-relaxed bg-slate-800 border border-slate-700 rounded-lg ${textSize} text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent outline-none`}
+              />
+              <button
+                onClick={send}
+                disabled={loading || !input.trim()}
+                className="w-8 h-8 bg-[#C8002F] hover:bg-[#a80027] disabled:opacity-30 disabled:cursor-not-allowed rounded-lg flex items-center justify-center text-white transition-all flex-shrink-0"
+              >
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       )}

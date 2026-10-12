@@ -322,17 +322,24 @@ function RouteOptimizer() {
         setResults(null);
         break;
       case 'fleet':
-        // A memory recall: each vehicle carries its own packs and weight,
-        // unlike the uniform battery_packs / vehicle_weight_lbs axes.
-        setVehicles(value.map((v, i) => ({
-          id: i + 1,
-          name: v.name || `Vehicle ${i + 1}`,
-          battery_packs: v.battery_packs,
-          battery_kwh: v.battery_kwh ?? v.battery_packs * 20,
-          weight_lbs: v.weight_lbs,
-          driver: v.driver || '',
-          plate: v.plate || '',
-        })));
+        // A memory recall: one vehicle per recalled driver. A driver profile may
+        // carry its truck's packs and weight; whatever it leaves out, that
+        // vehicle slot keeps (packs alone re-derive the weight, as above).
+        setVehicles(prev => value.map((v, i) => {
+          const base = prev[i] || { name: `Vehicle ${i + 1}`, battery_packs: 4, weight_lbs: 13000 };
+          const packs = v.battery_packs ?? base.battery_packs;
+          const weight = v.weight_lbs ?? (v.battery_packs != null
+            ? Math.round(BASE_WEIGHT_NO_BATTERY + packs * PACK_WEIGHT_LBS)
+            : base.weight_lbs);
+          return {
+            id: i + 1,
+            name: base.name,
+            battery_packs: packs,
+            battery_kwh: packs * 20,
+            weight_lbs: weight,
+            driver: v.driver || '',
+          };
+        }));
         setResults(null);
         break;
       default:
@@ -350,7 +357,7 @@ function RouteOptimizer() {
     vehicle_weight_lbs: vehicles[0]?.weight_lbs ?? 13000,
     fleet: vehicles.map(v => ({
       name: v.name, battery_packs: v.battery_packs,
-      weight_lbs: v.weight_lbs, driver: v.driver || '', plate: v.plate || '',
+      weight_lbs: v.weight_lbs, driver: v.driver || '',
     })),
     temperature_c: energyParams.temperature_c,
     unload_time_min: energyParams.unload_time_min,
@@ -544,18 +551,11 @@ function RouteOptimizer() {
                         </button>
                       )}
                     </div>
-                    {(v.driver || v.plate) && (
+                    {v.driver && (
                       <div className="flex items-center gap-2 mb-2 -mt-1">
-                        {v.driver && (
-                          <span className="text-[10px] text-slate-500 flex items-center gap-1">
-                            <User className="w-2.5 h-2.5" />{v.driver}
-                          </span>
-                        )}
-                        {v.plate && (
-                          <span className="text-[9px] font-mono text-slate-400 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5">
-                            {v.plate}
-                          </span>
-                        )}
+                        <span className="text-[10px] text-slate-500 flex items-center gap-1">
+                          <User className="w-2.5 h-2.5" />{v.driver}
+                        </span>
                       </div>
                     )}
                     <div className="grid grid-cols-2 gap-2">
@@ -1038,6 +1038,11 @@ function RouteOptimizer() {
                               {route.vehicle_id}
                             </span>
                             <span className="text-xs font-semibold text-purple-300">{route.vehicle_name || `Vehicle ${route.vehicle_id}`}</span>
+                            {route.driver && (
+                              <span className="text-[10px] text-slate-500 flex items-center gap-1">
+                                <User className="w-2.5 h-2.5" />{route.driver}
+                              </span>
+                            )}
                             <span className="ml-auto text-[10px] text-slate-600">
                               {formatDistance(route.total_distance_m)} · {formatTime(route.total_time_s)}
                             </span>
