@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { MessageSquare, X, Send, Loader2, Bot, Sparkles, Zap, Cpu, History, HelpCircle, Ban, Check, Cog, Truck, User } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5001/api';
+import { API_BASE } from './api';
 
 // Which pipeline stage produced the reply (shown as a tiny badge on each bubble).
 const SOURCE_BADGE = {

@@ -1,0 +1,9 @@
+# Case 2 - Charlotte-Lansing, MI: depot + 7 customers (address | lat, lng | demand | name)
+1055 Mikesell St, Charlotte, MI 48813 | 42.552477, -84.850417 |  | Isuzu Charlotte Depot
+1167 E Clinton Trail, Charlotte, MI 48813 | 42.555382, -84.814040 | 10 | Meijer Charlotte
+1680 Packard Hwy, Charlotte, MI 48813 | 42.580273, -84.804114 | 12 | Walmart Supercenter Charlotte
+1650 Packard Hwy, Charlotte, MI 48813 | 42.579421, -84.805998 | 6 | Tractor Supply Charlotte
+530 W Beech St, Charlotte, MI 48813 | 42.579100, -84.843000 | 8 | Eaton County Health and Rehabilitation Services
+5330 W Saginaw Hwy, Lansing, MI 48917 | 42.743181, -84.627746 | 14 | Lansing Mall
+100 N Capitol Ave, Lansing, MI 48933 | 42.733610, -84.555560 | 9 | Michigan State Capitol
+4100 Capital City Blvd, Lansing, MI 48906 | 42.775028, -84.589139 | 15 | Capital Region International Airport

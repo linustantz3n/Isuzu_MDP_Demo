@@ -1,0 +1,145 @@
+{
+  "id": "demo_anaheim",
+  "name": "Anaheim demo",
+  "description": "Anaheim depot + 5 Southern California stops (frontend demo case)",
+  "created_at": "2026-09-27T21:32:42+00:00",
+  "source_file": "route-optimizer-frontend/public/demo_stops.txt",
+  "locations": [
+    {
+      "address": "1400 S Douglass Rd #100, Anaheim, CA 92806",
+      "formatted_address": "1400 S Douglass Rd #100, Anaheim, CA 92806, USA",
+      "lat": 33.8113241,
+      "lng": -117.8770035
+    },
+    {
+      "address": "13463 Washington Blvd, Marina Del Rey, CA 90292",
+      "formatted_address": "13463 W Washington Blvd, Marina Del Rey, CA 90292, USA",
+      "lat": 33.9930067,
+      "lng": -118.4471483
+    },
+    {
+      "address": "11232 Knott Ave, Stanton, CA 90680",
+      "formatted_address": "11232 Knott Ave, Stanton, CA 90680, USA",
+      "lat": 33.7999268,
+      "lng": -118.0072215
+    },
+    {
+      "address": "10903 Auto Square Dr, Cerritos, CA 90703",
+      "formatted_address": "10903 Auto Square Dr, Cerritos, CA 90703, USA",
+      "lat": 33.8618898,
+      "lng": -118.1018648
+    },
+    {
+      "address": "2114 N Tustin St, Orange, CA 92865",
+      "formatted_address": "2114 N Tustin St, Orange, CA 92865, USA",
+      "lat": 33.8232268,
+      "lng": -117.8366088
+    },
+    {
+      "address": "3301 E Imperial Hwy, Brea, CA 92823",
+      "formatted_address": "3301 E Imperial Hwy, Brea, CA 92823, USA",
+      "lat": 33.9102754,
+      "lng": -117.8513894
+    }
+  ],
+  "distance_m": [
+    [
+      0,
+      72096,
+      19765,
+      25891,
+      6088,
+      15724
+    ],
+    [
+      73660,
+      0,
+      59158,
+      45309,
+      74795,
+      77413
+    ],
+    [
+      21251,
+      58675,
+      0,
+      14650,
+      26326,
+      29278
+    ],
+    [
+      26024,
+      45532,
+      14615,
+      0,
+      30705,
+      33322
+    ],
+    [
+      6198,
+      71642,
+      27551,
+      31350,
+      0,
+      10705
+    ],
+    [
+      15995,
+      74071,
+      34012,
+      33779,
+      10711,
+      0
+    ]
+  ],
+  "time_s": [
+    [
+      0,
+      3005,
+      1156,
+      1387,
+      680,
+      992
+    ],
+    [
+      3082,
+      0,
+      2705,
+      2225,
+      3237,
+      3445
+    ],
+    [
+      1231,
+      2602,
+      0,
+      1231,
+      1479,
+      1859
+    ],
+    [
+      1402,
+      2147,
+      1108,
+      0,
+      1487,
+      1695
+    ],
+    [
+      662,
+      3139,
+      1418,
+      1533,
+      0,
+      1077
+    ],
+    [
+      1054,
+      3352,
+      1819,
+      1746,
+      1096,
+      0
+    ]
+  ]
+}
