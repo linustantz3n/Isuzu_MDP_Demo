@@ -1,10 +1,10 @@
 # Energy model
 
-**Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L197) in `route_optimizer_backend.py`.
+**Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L198) in `route_optimizer_backend.py`.
 It is called once per route leg (one stop to the next) from `optimize_route()`:
 
-- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L832), [return leg](../route_optimizer_backend.py#L888)
-- fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L1030)
+- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L1661), [return leg](../route_optimizer_backend.py#L1717)
+- fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L852)
 
 The model is called **Model E**. It is a polynomial regression for energy per kilometre of an
 Isuzu N-Series EV. The fit statistics quoted in the code are R² = 0.9997, MAPE = 3.46% and test
@@ -38,11 +38,11 @@ depot, because the UI always sends closed routes.
 
 | Symbol | Meaning | Unit | Where the value comes from |
 |---|---|---|---|
-| d | Driving distance of the leg | km | Google Distance Matrix ([`get_distance_matrix`](../route_optimizer_backend.py#L71)), metres ÷ 1000 |
-| v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L308)). No live traffic |
+| d | Driving distance of the leg | km | Google Distance Matrix ([`get_distance_matrix`](../route_optimizer_backend.py#L72)), metres ÷ 1000 |
+| v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L309)). No live traffic |
 | T | Ambient temperature | °C | UI slider, `energy_params.temperature_c` (default 20). Same value for every leg |
 | W | Gross vehicle weight on this leg | tonnes | Vehicle `weight_lbs` ÷ 2204.62, reduced as cargo is delivered (see [Weight model](#weight-model)) |
-| Δh | Elevation change, end minus start (+ = uphill) | m | Google Elevation API at the two stop coordinates ([`get_elevation_data`](../route_optimizer_backend.py#L165)) |
+| Δh | Elevation change, end minus start (+ = uphill) | m | Google Elevation API at the two stop coordinates ([`get_elevation_data`](../route_optimizer_backend.py#L166)) |
 | h | Elevation at the start of the leg | m above sea level | Same call |
 | HVAC | Climate-control overhead | kWh/km | 0.092 when `has_climate_control` is true. Added on top of the regression, not fitted |
 
@@ -105,7 +105,7 @@ HVAC on, not measurements:
 
 ## Weight model
 
-**Code:** [vehicle config](../route_optimizer_backend.py#L740) and [leg weights](../route_optimizer_backend.py#L832) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L1017) for fleet routes.
+**Code:** [vehicle config](../route_optimizer_backend.py#L1557) and [leg weights](../route_optimizer_backend.py#L1661) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L901) for fleet routes.
 
 - Each vehicle's `weight_lbs` is its **gross weight leaving the depot**: truck, batteries and cargo
   together. The form's range is 10,000–19,500 lbs.
@@ -117,18 +117,21 @@ HVAC on, not measurements:
 - The **return leg** to the depot is driven at the empty-truck weight.
 - In the UI, changing the pack count also resets the weight field to
   `13,000 − 4 × 440.9 + packs × 440.9` lbs. That is 13,000 lbs at 4 packs, plus 440.9 lbs for each
-  extra pack ([`updateVehicle`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L65)).
+  extra pack ([`updateVehicle`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L93)).
   You can still edit the weight by hand afterwards.
 
 ## Battery
 
 - Capacity = packs × 20 kWh. The UI allows 3–9 packs, so 60–180 kWh. The default is 4 packs = 80 kWh.
-- **Fleet routes only** (more than one vehicle): each route reports `battery_remaining_kwh`
-  (capacity − route energy, floored at 0), `battery_remaining_pct`, and `battery_depleted`
-  (true when energy > capacity). The UI shows the bar orange below 20% and red when depleted.
-  [Code](../route_optimizer_backend.py#L1080).
-- Single-vehicle results report total energy but **do not check it against the battery**.
-- The model has no charging stops, reserve margin or state-of-charge limits.
+- Every route reports `battery_remaining_kwh` (capacity − route energy, floored at 0),
+  `battery_remaining_pct`, and `battery_depleted` (true when energy > capacity). The
+  single-vehicle routes check against vehicle 1's battery
+  ([`battery_fields()`](../route_optimizer_backend.py#L915)). The UI shows the fleet bar
+  orange below 20% and red when depleted.
+- A **battery reserve** (an optimization goal, 0–50%) is enforced for fleets: no truck may
+  plan more than `capacity × (1 − reserve)`. With one truck it is checked and flagged, not
+  enforced. See [planning.md](planning.md#battery-reserve).
+- The model has no charging stops or state-of-charge curve.
 
 ## Other inputs and what they affect
 
@@ -144,17 +147,23 @@ HVAC on, not measurements:
 
 ## How energy relates to the solvers
 
-**The solvers never see energy.** They minimize the distance matrix (`mode: "distance"`,
-which the UI always sends) or the time matrix (`mode: "time"`). Energy is then calculated leg
-by leg on whatever route the solver returned. "Optimal" here means shortest distance, which is
-not necessarily lowest energy. For example, a route that climbs early while fully loaded can be
-short but costly.
+**By default the solvers never see energy.** They minimize distance, and energy is then
+calculated leg by leg on whatever route the solver returned. "Optimal" here means
+shortest distance, which is not necessarily lowest energy. For example, a route that
+climbs early while fully loaded can be short but costly.
 
-To make routing energy-aware, the hook is the `matrix` that [`optimize_route()`](../route_optimizer_backend.py#L725)
-passes to the solvers. You could build an energy matrix (one `calculate_energy_consumption`
-call per ordered pair of stops) and pass that instead. Two things to handle: weight depends on
-where a leg falls in the route, so a fixed matrix can only approximate it; and OR-Tools needs
-integer costs (for example Wh).
+**With the Energy goal on** ([planning.md](planning.md#optimization-goals)), the solvers
+minimise an energy-weighted cost.
+[`energy_matrix_kwh()`](../route_optimizer_backend.py#L730) makes one
+`calculate_energy_consumption` call per ordered pair of stops. It uses one representative
+weight, halfway between loaded and empty, because a fixed matrix cannot know where in the
+route a leg will fall. Negative (downhill) energy is floored at 0 in the cost, so regen is
+not rewarded. The reported energy is still the exact leg-by-leg value with the real,
+dropping weight.
+
+**With a battery reserve**, each fleet truck also gets an energy limit. It is checked with
+that truck's matrix at its *full* gross weight, rounded up to whole Wh, so the limit errs
+on the safe side.
 
 ## Caveats in the model as coded
 

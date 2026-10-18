@@ -22,14 +22,17 @@ Google calls. The API server imports these functions, and the benchmark reuses t
 | [`solve_tsp_held_karp(matrix, return_to_start=False)`](../solvers.py#L63) | Exact dynamic programming over subsets of stops. **Provably optimal** | O(n²·2ⁿ) time, O(n·2ⁿ) memory. About 125 ms at 14 stops and 1.4 s at 17 stops; each extra stop roughly doubles it |
 | [`solve_tsp_nearest_neighbor(matrix, return_to_start=False)`](../solvers.py#L156) | Greedy: always drive to the closest unvisited stop (roughly what Google Maps' "optimize waypoints" does) | O(n²). Typically 10–25% above optimal |
 | [`solve_tsp_2opt(matrix, initial_order=None, return_to_start=False)`](../solvers.py#L206) | Starts from nearest neighbor, then reverses route segments while the total cost drops | O(n²) per pass. Usually within 0–5% of optimal, and often exactly optimal |
-| [`solve_vrp_ortools(matrix, num_vehicles, first_solution_strategy="PATH_CHEAPEST_ARC", metaheuristic="GUIDED_LOCAL_SEARCH", time_limit_s=None, solution_limit=None)`](../solvers.py#L256) | Multi-vehicle routing with Google OR-Tools | See below |
+| [`solve_vrp_ortools(matrix, num_vehicles, first_solution_strategy="PATH_CHEAPEST_ARC", metaheuristic="GUIDED_LOCAL_SEARCH", time_limit_s=None, solution_limit=None)`](../solvers.py#L256) | Multi-vehicle routing with Google OR-Tools. Used by the benchmark | See below |
+| [`solve_vrp_constrained(cost, num_vehicles, starts, ends, ...)`](../solvers.py#L345) | The same OR-Tools model, with optional extras: per-truck start nodes and start times, a Time dimension with service times and a makespan price, per-truck energy limits, a payload limit, which truck may serve a stop, pickup-and-delivery pairs, and optional stops with a drop penalty. Used by `/api/optimize` for fleets and by `/api/replan` | Returns every truck's route (empty ones too) and the dropped stops |
 
 ### OR-Tools VRP: what it does and does not model
 
 **Models:**
 - `num_vehicles` trucks. Every truck starts and ends at depot 0.
-- **Objective:** the sum of matrix costs over all trucks, so total distance (or total time).
-  It does not minimize the time until the last truck finishes (makespan).
+- **Objective:** the sum of matrix costs over all trucks. In `/api/optimize` the matrix is
+  built from the [optimization goals](planning.md#optimization-goals): total distance by
+  default, or a weighted mix of distance, time and energy. With the Balance goal on, the
+  latest truck's finish time (makespan) is priced too.
 - **One constraint:** a `StopCount` dimension that caps each truck at `ceil(stops / K)` stops.
   This spreads work across the fleet. Without it, one truck doing everything is usually the
   cheapest answer for total distance.
@@ -38,30 +41,33 @@ Google calls. The API server imports these functions, and the benchmark reuses t
   the depot. Guided Local Search keeps searching until the limit, so a fleet solve takes that
   long: 12 s for 6 locations, 30 s for 15 or more.
 
-**Does not model:** payload capacity (weight or volume), battery or energy, time windows, driver
-hours, or differences between trucks. The solver treats all trucks as identical; per-vehicle
-weight and packs only matter in the energy calculation afterwards.
+**Does not model by default:** battery or energy, payload, time windows, driver hours.
+In `/api/optimize`, a [battery reserve](planning.md#battery-reserve) adds a per-truck energy
+limit sized to each truck's packs and weight, and stops that fit no truck are reported as
+`unserved`. The breakdown re-plan also limits payload to the 19,500 lbs gross weight.
+Time windows and driver hours are never modelled.
 
 **Other behaviour:**
 - Trucks that end up with no stops are dropped, so `num_vehicles_used` can be lower than requested.
 - The function raises an error if K is larger than the number of stops, or if no solution is found.
 - Costs must be integers. Google's metres and seconds already are. A stop pair Google cannot
   route between becomes `inf`, which breaks the solver.
-- In `/api/optimize`, the vehicles from the request are matched to the non-empty routes in
-  order. The first route gets `vehicles[0]`'s weight, packs and driver, and so on.
+- In `/api/optimize`, every route keeps the vehicle it was solved for (`routes[].vehicle_index`),
+  with that vehicle's weight, packs and driver. Before, vehicles were matched to the
+  non-empty routes in order, so an empty truck shifted everyone's specs by one.
 
 ---
 
 ## How `/api/optimize` decides what to run
 
-**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L573), called from [`optimize_route()`](../route_optimizer_backend.py#L718).
+**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L574), called from [`optimize_route()`](../route_optimizer_backend.py#L1526).
 
 The request's `solver` field is one of `auto` (default), `held_karp`, `2opt`, `nearest_neighbor` or `ortools_vrp`.
 
 1. **Nearest neighbor and 2-opt always run.** They are cheap and they feed the comparison in the UI.
 2. **Held-Karp runs depending on the setting:**
    - `auto` or `ortools_vrp`: only if the *predicted* runtime is ≤ 2 s. The prediction is
-     [`estimate_held_karp_ms(n)`](../route_optimizer_backend.py#L381) = n²·2ⁿ × 17 ns, measured on
+     [`estimate_held_karp_ms(n)`](../route_optimizer_backend.py#L382) = n²·2ⁿ × 17 ns, measured on
      one machine. With a depot this means **up to 17 stops**.
    - `held_karp` (forced): up to **21 stops** (`HK_HARD_LIMIT_N = 22` locations). Beyond that the
      request is refused and 2-opt is shown instead.
@@ -75,7 +81,7 @@ The request's `solver` field is one of `auto` (default), `held_karp`, `2opt`, `n
 
 An explicit `algorithms` list in the request (`["held_karp", "nearest_neighbor", "2opt"]`) skips
 this logic. Tuning constants are at the top of the solver section:
-[`HK_SEC_PER_UNIT`, `HK_TIME_BUDGET_MS`, `HK_HARD_LIMIT_N`](../route_optimizer_backend.py#L339).
+[`HK_SEC_PER_UNIT`, `HK_TIME_BUDGET_MS`, `HK_HARD_LIMIT_N`](../route_optimizer_backend.py#L340).
 
 | Stops | Held-Karp estimate | `auto` runs it? | Forced `held_karp` runs it? |
 |---|---|---|---|
@@ -92,7 +98,7 @@ this logic. Tuning constants are at the top of the solver section:
 
 `/api/optimize` accepts at most 25 locations (depot + 24 stops).
 
-[`recommend_solver()`](../route_optimizer_backend.py#L499) and [`solver_table()`](../route_optimizer_backend.py#L544)
+[`recommend_solver()`](../route_optimizer_backend.py#L500) and [`solver_table()`](../route_optimizer_backend.py#L545)
 build the same reasoning as text and tables for the chat assistant. They do not change what
 `/api/optimize` runs; `resolve_solver` only uses `recommend_solver` for the `auto` decision.
 

@@ -90,17 +90,17 @@ export default function RouteMap({ results, locations }) {
     if (results.ortools_fleet?.routes) {
       results.ortools_fleet.routes.forEach((route, idx) => {
         const locs = route.ordered_locations;
-        if (locs.length < 3) return;
-        // Detect if depot is repeated at end (fleet format)
+        if (locs.length < 2) return;
+        // Depot at both ends is a full day; a truck that broke down ends where
+        // it stopped, so its line ends there instead of returning to the depot.
         const closedFormat = locs[0].lat === locs[locs.length - 1].lat
           && locs[0].lng === locs[locs.length - 1].lng;
-        const waypoints = closedFormat
-          ? locs.slice(1, -1).map(l => ({ location: { lat: l.lat, lng: l.lng }, stopover: true }))
-          : locs.slice(1).map(l => ({ location: { lat: l.lat, lng: l.lng }, stopover: true }));
+        const end = locs[locs.length - 1];
+        const waypoints = locs.slice(1, -1).map(l => ({ location: { lat: l.lat, lng: l.lng }, stopover: true }));
 
         routesToFetch.push({
           origin: { lat: locs[0].lat, lng: locs[0].lng },
-          destination: { lat: locs[0].lat, lng: locs[0].lng },
+          destination: closedFormat ? { lat: locs[0].lat, lng: locs[0].lng } : { lat: end.lat, lng: end.lng },
           waypoints,
           color: VEHICLE_COLORS[idx % VEHICLE_COLORS.length],
           label: `Vehicle ${route.vehicle_id}`,

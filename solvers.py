@@ -340,3 +340,170 @@ def solve_vrp_ortools(
 
     return routes
 
+
+
+def solve_vrp_constrained(
+    cost: list,
+    num_vehicles: int,
+    starts: list = None,
+    ends: list = None,
+    stop_nodes: list = None,
+    max_stops: list = None,
+    soft_stop_cap: bool = False,
+    time_matrix: list = None,
+    service_s: list = None,
+    start_times: list = None,
+    span_cost: int = 0,
+    energy: list = None,
+    energy_caps: list = None,
+    load_deltas: list = None,
+    start_loads: list = None,
+    load_caps: list = None,
+    allowed: dict = None,
+    pairs: list = None,
+    optional: bool = False,
+    drop_penalty: int = 10 ** 9,
+    time_limit_s: int = 10,
+) -> dict:
+    """
+    OR-Tools VRP with the constraints the planner needs beyond solve_vrp_ortools.
+
+    Every argument after `num_vehicles` is optional; leaving them all out gives
+    a plain VRP on `cost` from depot 0.
+
+    cost         n x n integer arc costs (the objective)
+    starts/ends  node per vehicle (default: depot 0). Trucks already out on the
+                 road start where they are.
+    stop_nodes   nodes that count towards `max_stops` (default: every node that
+                 is not a start or end)
+    max_stops    per-vehicle stop cap. `soft_stop_cap` lets a truck exceed it at
+                 a penalty instead of failing, for when a battery limit forces
+                 an uneven split.
+    time_matrix  n x n seconds. Adds a Time dimension: leaving node i costs
+                 time[i][j] + service_s[i]. `start_times` fixes when each
+                 vehicle is free; `span_cost` puts a price on the latest
+                 finish (fleet balance / makespan).
+    energy       per-vehicle n x n integer energy (Wh, >= 0) with `energy_caps`
+                 per vehicle: a hard battery limit.
+    load_deltas  per-node integer load change (+ pickup, - delivery) with
+                 `start_loads` and `load_caps` per vehicle: a payload limit.
+    allowed      {node: [vehicle, ...]}: which vehicles may serve a node
+                 (cargo already on a truck stays on that truck).
+    pairs        [(pickup, delivery), ...]: same vehicle, pickup first.
+                 Needs `time_matrix`.
+    optional     stops may be left out at `drop_penalty` each, so an
+                 over-constrained problem still returns the stops it can serve.
+
+    Returns {"routes": [[start, ..., end] per vehicle], "dropped": [nodes],
+             "objective": int}. Routes include empty ones ([start, end]).
+    Raises if no solution is found.
+    """
+    n = len(cost)
+    starts = list(starts) if starts is not None else [0] * num_vehicles
+    ends = list(ends) if ends is not None else [0] * num_vehicles
+    terminals = set(starts) | set(ends)
+    visit_nodes = [i for i in range(n) if i not in terminals]
+    stop_set = set(stop_nodes) if stop_nodes is not None else set(visit_nodes)
+
+    manager = pywrapcp.RoutingIndexManager(n, num_vehicles, starts, ends)
+    routing = pywrapcp.RoutingModel(manager)
+    solver = routing.solver()
+
+    def cost_cb(from_index, to_index):
+        return int(cost[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+
+    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cost_cb))
+
+    if max_stops is not None:
+        def stop_cb(from_index):
+            return 1 if manager.IndexToNode(from_index) in stop_set else 0
+
+        stop_idx = routing.RegisterUnaryTransitCallback(stop_cb)
+        if soft_stop_cap:
+            routing.AddDimension(stop_idx, 0, n, True, 'StopCount')
+            dim = routing.GetDimensionOrDie('StopCount')
+            for v in range(num_vehicles):
+                dim.SetCumulVarSoftUpperBound(routing.End(v), int(max_stops[v]), max(1, drop_penalty // 1000))
+        else:
+            routing.AddDimensionWithVehicleCapacity(
+                stop_idx, 0, [int(c) for c in max_stops], True, 'StopCount')
+
+    time_dim = None
+    if time_matrix is not None:
+        service = service_s or [0] * n
+
+        def time_cb(from_index, to_index):
+            a, b = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
+            return int(time_matrix[a][b] + service[a])
+
+        horizon = 7 * 24 * 3600
+        routing.AddDimension(routing.RegisterTransitCallback(time_cb), 0, horizon, False, 'Time')
+        time_dim = routing.GetDimensionOrDie('Time')
+        for v in range(num_vehicles):
+            t0 = int((start_times or [0] * num_vehicles)[v])
+            time_dim.CumulVar(routing.Start(v)).SetRange(t0, t0)
+        if span_cost:
+            time_dim.SetGlobalSpanCostCoefficient(int(span_cost))
+
+    if energy is not None:
+        def make_energy_cb(mat):
+            return lambda i, j: int(mat[manager.IndexToNode(i)][manager.IndexToNode(j)])
+
+        energy_idx = [routing.RegisterTransitCallback(make_energy_cb(energy[v])) for v in range(num_vehicles)]
+        routing.AddDimensionWithVehicleTransitAndCapacity(
+            energy_idx, 0, [max(0, int(c)) for c in energy_caps], True, 'Energy')
+
+    if load_deltas is not None:
+        def load_cb(from_index):
+            return int(load_deltas[manager.IndexToNode(from_index)])
+
+        routing.AddDimensionWithVehicleCapacity(
+            routing.RegisterUnaryTransitCallback(load_cb), 0,
+            [max(0, int(c)) for c in load_caps], False, 'Load')
+        load_dim = routing.GetDimensionOrDie('Load')
+        for v in range(num_vehicles):
+            load_dim.CumulVar(routing.Start(v)).SetValue(int((start_loads or [0] * num_vehicles)[v]))
+
+    # SetAllowedVehiclesForIndex's Python binding rejects every list type in
+    # OR-Tools 9.15, so restrict the vehicle variable directly (-1 = unserved).
+    for node, vehicles in (allowed or {}).items():
+        routing.VehicleVar(manager.NodeToIndex(node)).SetValues([-1] + [int(v) for v in vehicles])
+
+    for p, d in pairs or []:
+        if time_dim is None:
+            raise ValueError("pickup-and-delivery pairs need time_matrix")
+        pi, di = manager.NodeToIndex(p), manager.NodeToIndex(d)
+        routing.AddPickupAndDelivery(pi, di)
+        solver.Add(routing.VehicleVar(pi) == routing.VehicleVar(di))
+        solver.Add(time_dim.CumulVar(pi) <= time_dim.CumulVar(di))
+        if optional:
+            solver.Add(routing.ActiveVar(pi) == routing.ActiveVar(di))
+
+    if optional:
+        for node in visit_nodes:
+            routing.AddDisjunction([manager.NodeToIndex(node)], int(drop_penalty))
+
+    search_params = pywrapcp.DefaultRoutingSearchParameters()
+    constrained = bool(pairs) or energy is not None or load_deltas is not None or optional
+    search_params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION if constrained
+        else routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+    search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_params.time_limit.seconds = int(time_limit_s)
+
+    solution = routing.SolveWithParameters(search_params)
+    if not solution:
+        raise Exception("OR-Tools could not find a valid solution")
+
+    routes = []
+    for v in range(num_vehicles):
+        route, index = [], routing.Start(v)
+        while not routing.IsEnd(index):
+            route.append(manager.IndexToNode(index))
+            index = solution.Value(routing.NextVar(index))
+        route.append(manager.IndexToNode(index))
+        routes.append(route)
+
+    dropped = [node for node in visit_nodes
+               if solution.Value(routing.NextVar(manager.NodeToIndex(node))) == manager.NodeToIndex(node)]
+    return {"routes": routes, "dropped": dropped, "objective": solution.ObjectiveValue()}

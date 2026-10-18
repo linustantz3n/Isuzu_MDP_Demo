@@ -26,6 +26,7 @@ from solvers import (
     solve_tsp_nearest_neighbor,
     solve_tsp_2opt,
     solve_vrp_ortools,
+    solve_vrp_constrained,
 )
 from benchmark import ALGORITHMS as BENCHMARK_ALGORITHMS, list_scenarios, run_benchmark
 
@@ -619,6 +620,813 @@ def resolve_solver(requested: str, num_stops: int, num_vehicles: int) -> dict:
 
 
 # =============================================================================
+# Optimization goals, truck limits and breakdown re-planning
+# =============================================================================
+#
+# The solvers minimise whatever cost matrix they are handed. The goals decide
+# what goes into it: a leg's cost is a weighted mix of its distance, its driving
+# time and its Model E energy, each divided by the average leg so the weights
+# are comparable. "Balance" prices the latest truck's finish time (OR-Tools
+# global span), so with 2+ trucks the work spreads out and everyone is back
+# sooner.
+#
+# Operators are not expected to know weights. The chat assistant picks a level
+# per goal from what they say ("battery is tight today" → energy high), and the
+# table below turns levels into numbers — the model never writes a weight.
+
+MAX_GROSS_LBS = 19500.0          # Isuzu N-Series EV GVWR; also the form's weight limit
+PACK_KWH = 20.0
+PACK_WEIGHT_LBS = 200 * 2.20462  # one pack is 200 kg
+BASE_TRUCK_4PACKS_LBS = 7000.0   # empty truck with 4 packs
+DEFAULT_PACKS = 4
+LBS_PER_TONNE = 2204.62
+
+GOAL_KEYS = ('distance', 'time', 'energy', 'balance')
+GOAL_LEVELS = ('off', 'low', 'medium', 'high')
+GOAL_LEVEL_WEIGHT = {'off': 0, 'low': 1, 'medium': 2, 'high': 4}
+# Distance only, nothing enforced: exactly what the app did before goals existed.
+DEFAULT_GOALS = {'distance': 'high', 'time': 'off', 'energy': 'off', 'balance': 'off',
+                 'battery_reserve_pct': None}
+MAX_RESERVE_PCT = 50
+OBJ_SCALE = 100_000              # cost of one average leg at weight 1 (integer solvers need room)
+DROP_PENALTY = 10 ** 9           # leaving a stop unserved costs more than any route
+TRANSFER_MIN_PER_ORDER = 5       # moving one stop's cargo from a broken-down truck
+
+# Speeds the limits answer prices range at (km/h), flat road.
+SPEED_PROFILES = (('city', 40), ('mixed', 60), ('highway', 90))
+
+
+GOAL_LABEL = {'distance': {'en': 'Distance', 'zh': '距离'}, 'time': {'en': 'Time', 'zh': '时间'},
+              'energy': {'en': 'Energy', 'zh': '电量'}, 'balance': {'en': 'Balance', 'zh': '均衡'}}
+LEVEL_LABEL = {'off': {'en': 'off', 'zh': '关'}, 'low': {'en': 'low', 'zh': '低'},
+               'medium': {'en': 'medium', 'zh': '中'}, 'high': {'en': 'high', 'zh': '高'}}
+
+
+def goals_summary(goals: dict, lang: str = 'en') -> str:
+    """"Energy high · Distance low · reserve 20%": the goals that are on, strongest first."""
+    order = sorted((k for k in GOAL_KEYS if goals.get(k, 'off') != 'off'),
+                   key=lambda k: -GOAL_LEVEL_WEIGHT[goals[k]])
+    parts = [f"{GOAL_LABEL[k][lang if lang == 'zh' else 'en']} {LEVEL_LABEL[goals[k]][lang if lang == 'zh' else 'en']}"
+             for k in order]
+    r = goals.get('battery_reserve_pct')
+    if r is not None:
+        parts.append(f"保留 {r}% 电量" if lang == 'zh' else f"reserve {r}%")
+    return " · ".join(parts)
+
+
+def weights_summary(goals: dict, lang: str = 'en') -> str:
+    """"Energy 67% · Distance 33%"."""
+    w = goal_weights(goals)
+    key = 'zh' if lang == 'zh' else 'en'
+    return " · ".join(f"{GOAL_LABEL[k][key]} {round(w[k] * 100)}%"
+                      for k in sorted(GOAL_KEYS, key=lambda k: -w[k]) if w[k] > 0)
+
+
+def short_stop(address: str) -> str:
+    """"Brea" from "3301 E Imperial Hwy, Brea, CA 92823": the city when there is one."""
+    parts = [p.strip() for p in str(address).split(',') if p.strip()]
+    return parts[1] if len(parts) >= 3 else parts[0] if parts else str(address)
+
+
+def empty_weight_lbs(packs) -> float:
+    """Truck + batteries, no cargo. Same rule as vehicle_base_weight_lbs in optimize_route."""
+    return BASE_TRUCK_4PACKS_LBS + (int(packs) - DEFAULT_PACKS) * PACK_WEIGHT_LBS
+
+
+def normalize_goals(raw) -> dict:
+    """Fill in defaults and drop anything that is not a known level."""
+    goals = dict(DEFAULT_GOALS)
+    if isinstance(raw, dict):
+        for k in GOAL_KEYS:
+            if raw.get(k) in GOAL_LEVELS:
+                goals[k] = raw[k]
+        r = raw.get('battery_reserve_pct')
+        if r is not None and r != '':
+            try:
+                goals['battery_reserve_pct'] = int(max(0, min(MAX_RESERVE_PCT, round(float(r)))))
+            except (TypeError, ValueError):
+                pass
+    if all(goals[k] == 'off' for k in GOAL_KEYS):
+        goals['distance'] = 'high'
+    return goals
+
+
+def goal_weights(goals: dict) -> dict:
+    """Levels → weights that add up to 1 (off 0, low 1, medium 2, high 4)."""
+    raw = {k: GOAL_LEVEL_WEIGHT[goals.get(k, 'off')] for k in GOAL_KEYS}
+    total = sum(raw.values()) or 1
+    return {k: raw[k] / total for k in GOAL_KEYS}
+
+
+def _finite(x) -> bool:
+    return x is not None and isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def mean_offdiag(m: list) -> float:
+    vals = [x for i, row in enumerate(m) for j, x in enumerate(row) if i != j and _finite(x) and x > 0]
+    return sum(vals) / len(vals) if vals else 1.0
+
+
+def energy_matrix_kwh(matrices: dict, elevations: list, weight_lbs: float,
+                      temperature_c: float, has_climate_control: bool) -> list:
+    """Model E energy for every ordered pair of locations at one truck weight."""
+    dist, tim = matrices['distance'], matrices['time']
+    n = len(dist)
+    elev = elevations or [0.0] * n
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d, t = dist[i][j], tim[i][j]
+            if not (_finite(d) and _finite(t)):
+                out[i][j] = float('inf')
+                continue
+            out[i][j] = calculate_energy_consumption(
+                distance_km=d / 1000, avg_speed_kmh=estimate_average_speed(d, t),
+                temperature_c=temperature_c, vehicle_weight_tonnes=weight_lbs / LBS_PER_TONNE,
+                altitude_diff_m=elev[j] - elev[i], altitude_m=elev[i],
+                has_climate_control=has_climate_control)['energy_kwh']
+    return out
+
+
+def energy_matrix_wh(kwh: list) -> list:
+    """Integer Wh for OR-Tools, rounded up and floored at 0: downhill regen is not
+    banked against the battery limit, so the limit errs on the safe side."""
+    return [[int(math.ceil(max(0.0, x) * 1000)) if _finite(x) else 10 ** 9 for x in row] for row in kwh]
+
+
+def objective_matrix(matrices: dict, energy_kwh, goals: dict, num_vehicles: int = 1,
+                     priority=()) -> dict:
+    """The cost matrix the solvers minimise, built from the goals.
+
+    cost[i][j] = OBJ_SCALE · (w_d·d/d̄ + w_t·t/t̄ + w_e·e/ē), where d̄, t̄, ē are the
+    average leg. With one truck, balance folds into time (finishing that one
+    route sooner is the same thing). With only balance on, driving time breaks
+    ties. Pure distance with no priorities returns the distance matrix itself,
+    so the default goals reproduce the original distance-only routes exactly.
+
+    Priority stops: every arc from a regular stop into a priority stop costs an
+    extra M larger than any whole route, so each truck serves its priority
+    stops before its other stops.
+    """
+    w = goal_weights(goals)
+    route_w = {'distance': w['distance'], 'time': w['time'], 'energy': w['energy']}
+    if num_vehicles <= 1:
+        route_w['time'] += w['balance']
+    if sum(route_w.values()) == 0:
+        route_w['time'] = 0.05
+    norms = {'distance': mean_offdiag(matrices['distance']), 'time': mean_offdiag(matrices['time'])}
+    n = len(matrices['distance'])
+
+    plain = route_w['distance'] > 0 and route_w['time'] == 0 and route_w['energy'] == 0
+    if plain and not priority:
+        cost = [[x if _finite(x) else 10 ** 9 for x in row] for row in matrices['distance']]
+    else:
+        sources = {'distance': matrices['distance'], 'time': matrices['time']}
+        if route_w['energy'] > 0:
+            clamped = [[max(0.0, x) if _finite(x) else float('inf') for x in row] for row in energy_kwh]
+            sources['energy'] = clamped
+            norms['energy'] = mean_offdiag(clamped)
+        cost = [[0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                c = 0.0
+                for k, wk in route_w.items():
+                    if wk:
+                        c += wk * sources[k][i][j] / norms[k]
+                cost[i][j] = int(round(c * OBJ_SCALE)) if math.isfinite(c) else 10 ** 9
+
+    if priority:
+        prio = set(priority)
+        big = max((x for row in cost for x in row if x < 10 ** 9), default=1) * (n + 1) + 1
+        cost = [[c + (big if (i not in prio and i != 0 and j in prio) else 0) for j, c in enumerate(row)]
+                for i, row in enumerate(cost)]
+
+    # Balance: OR-Tools prices the latest finish (seconds). Scaled so one average
+    # leg of time costs about what one average leg costs in the routing term,
+    # times the fleet size, so "high" balance competes with the routing cost.
+    span_coef = 0
+    if num_vehicles > 1 and w['balance'] > 0:
+        span_coef = max(1, int(round(w['balance'] * OBJ_SCALE * num_vehicles / norms['time'])))
+    return {'cost': cost, 'weights': w, 'route_weights': route_w, 'span_coef': span_coef}
+
+
+def precomputed_inputs(raw, n: int):
+    """Matrices and elevations the client sends back from an earlier solve of the
+    same locations, so a re-solve needs no Google calls. None if anything is off."""
+    if not isinstance(raw, dict):
+        return None
+
+    def square(m):
+        if not isinstance(m, list) or len(m) != n:
+            return None
+        out = []
+        for row in m:
+            if not isinstance(row, list) or len(row) != n:
+                return None
+            # JSON has no infinity; an unroutable pair comes back as null.
+            if any(x is not None and not isinstance(x, (int, float)) for x in row):
+                return None
+            out.append([float('inf') if x is None else x for x in row])
+        return out
+
+    dist, tim = square(raw.get('distance')), square(raw.get('time'))
+    elev = raw.get('elevations')
+    if dist is None or tim is None or not isinstance(elev, list) or len(elev) != n \
+            or not all(isinstance(x, (int, float)) for x in elev):
+        return None
+    return {'matrices': {'distance': dist, 'time': tim}, 'elevations': [float(x) for x in elev]}
+
+
+def stop_service_s(kind: str, unload_s: float) -> float:
+    if kind in ('stop', 'done', 'rescue'):
+        return unload_s
+    if kind == 'pickup':
+        return TRANSFER_MIN_PER_ORDER * 60
+    return 0.0
+
+
+def evaluate_route(nodes: list, kinds: list, cargo_delta: list, ctx: dict,
+                   start_weight_lbs: float, start_time_s: float = 0.0) -> dict:
+    """Walk a route leg by leg: distance, driving time, energy at the weight the
+    truck carries on that leg, and the arrival / departure time at each node.
+
+    kinds[i] says what happens at nodes[i] ('depot', 'stop', 'done', 'rescue',
+    'pickup') and cargo_delta[i] how much the load changes there (− delivered,
+    + picked up), so the weight leaving node i is the start weight plus every
+    delta up to and including i.
+    """
+    D, T = ctx['matrices']['distance'], ctx['matrices']['time']
+    elev = ctx['elevations'] or [0.0] * len(D)
+    locations = ctx['locations']
+    weight = start_weight_lbs
+    arrive, depart = [start_time_s], []
+    legs, dist_m, travel_s, service_s, energy = [], 0.0, 0.0, 0.0, 0.0
+    for i, node in enumerate(nodes):
+        svc = stop_service_s(kinds[i], ctx['unload_s']) if i > 0 else 0.0
+        service_s += svc
+        depart.append(arrive[i] + svc)
+        weight += cargo_delta[i]
+        if i == len(nodes) - 1:
+            break
+        a, b = node, nodes[i + 1]
+        d, t = D[a][b], T[a][b]
+        e = calculate_energy_consumption(
+            distance_km=d / 1000, avg_speed_kmh=estimate_average_speed(d, t),
+            temperature_c=ctx['temperature_c'], vehicle_weight_tonnes=weight / LBS_PER_TONNE,
+            altitude_diff_m=elev[b] - elev[a], altitude_m=elev[a],
+            has_climate_control=ctx['has_climate_control'])['energy_kwh']
+        legs.append({
+            "from": locations[a], "to": locations[b],
+            "distance_m": d, "distance_mi": d / 1609.34,
+            "time_s": t, "time_min": t / 60,
+            "vehicle_weight_lbs": round(weight, 1),
+            "vehicle_weight_tonnes": round(weight / LBS_PER_TONNE, 3),
+            "energy_kwh": e,
+            "return_leg": b == 0 and i + 1 == len(nodes) - 1,
+            "to_kind": kinds[i + 1],
+        })
+        dist_m += d
+        travel_s += t
+        energy += e
+        arrive.append(depart[i] + t)
+    return {'legs': legs, 'distance_m': dist_m, 'travel_s': travel_s, 'service_s': service_s,
+            'energy_kwh': energy, 'arrive_s': arrive, 'depart_s': depart,
+            'end_s': depart[-1] if depart else start_time_s}
+
+
+def vehicle_numbers(vcfg: dict) -> dict:
+    """Gross, empty, cargo and battery for one vehicle config from the request."""
+    packs = int(vcfg.get('battery_packs', DEFAULT_PACKS) or DEFAULT_PACKS)
+    if 'weight_lbs' in vcfg:
+        gross = float(vcfg['weight_lbs'])
+    elif 'weight_tonnes' in vcfg:
+        gross = float(vcfg['weight_tonnes']) * LBS_PER_TONNE
+    else:
+        gross = 13000.0
+    base = empty_weight_lbs(packs)
+    return {'packs': packs, 'gross': gross, 'base': base, 'cargo': max(0.0, gross - base),
+            'battery_kwh': float(vcfg.get('battery_kwh') or packs * PACK_KWH)}
+
+
+def battery_fields(capacity_kwh: float, energy_kwh: float, reserve_pct) -> dict:
+    remaining = max(0.0, capacity_kwh - energy_kwh)
+    pct = (remaining / capacity_kwh * 100) if capacity_kwh > 0 else 0
+    out = {"battery_capacity_kwh": capacity_kwh,
+           "battery_remaining_kwh": round(remaining, 2),
+           "battery_remaining_pct": round(pct, 1),
+           "battery_depleted": energy_kwh > capacity_kwh}
+    if reserve_pct is not None:
+        out["battery_reserve_pct"] = reserve_pct
+        out["battery_reserve_ok"] = energy_kwh <= capacity_kwh * (1 - reserve_pct / 100) + 1e-6
+    return out
+
+
+def maps_url(locs: list) -> str:
+    if not locs:
+        return ''
+    origin = f"{locs[0]['lat']},{locs[0]['lng']}"
+    dest = f"{locs[-1]['lat']},{locs[-1]['lng']}"
+    url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={dest}"
+    mid = "|".join(f"{l['lat']},{l['lng']}" for l in locs[1:-1])
+    return url + (f"&waypoints={mid}" if mid else '')
+
+
+def fleet_route_payload(v_idx: int, vcfg: dict, nodes: list, kinds: list, ev: dict,
+                        num: dict, ctx: dict, reserve_pct, status: str = None) -> dict:
+    """One truck's route in the shape the results panel reads (ortools_fleet.routes[])."""
+    stops = sum(1 for k in kinds if k in ('stop', 'done', 'rescue'))
+    out = {
+        "vehicle_index": v_idx,
+        "vehicle_id": vcfg.get('id', v_idx + 1),
+        "vehicle_name": vcfg.get('name', f'Vehicle {v_idx + 1}'),
+        "driver": vcfg.get('driver') or '',
+        "vehicle_config": {
+            "total_weight_lbs": num['gross'], "cargo_weight_lbs": num['cargo'],
+            "weight_per_stop_lbs": round(num.get('cargo_per_stop', 0.0), 1),
+            "battery_kwh": num['battery_kwh'], "battery_packs": num['packs'],
+        },
+        "order": list(nodes),
+        "stop_kinds": list(kinds),
+        "eta_s": [round(x) for x in ev['arrive_s']],
+        "ordered_locations": [ctx['locations'][i] for i in nodes],
+        "total_distance_m": ev['distance_m'],
+        "total_distance_mi": ev['distance_m'] / 1609.34,
+        "travel_time_s": ev['travel_s'],
+        "unload_time_s": ev['service_s'],
+        "total_time_s": ev['end_s'],
+        "total_time_min": ev['end_s'] / 60,
+        "num_delivery_stops": stops,
+        "total_energy_kwh": ev['energy_kwh'],
+        "google_maps_url": maps_url([ctx['locations'][i] for i in nodes]),
+        "legs": ev['legs'],
+        **battery_fields(num['battery_kwh'], ev['energy_kwh'], reserve_pct),
+    }
+    if status:
+        out['status'] = status
+    return out
+
+
+def fleet_totals(routes: list, extra: dict) -> dict:
+    total_dist = sum(r['total_distance_m'] for r in routes)
+    total_energy = sum(r['total_energy_kwh'] for r in routes)
+    makespan = max((r['total_time_s'] for r in routes), default=0)
+    return {
+        "num_vehicles_used": len(routes),
+        "routes": routes,
+        "total_distance_m": total_dist,
+        "total_distance_mi": total_dist / 1609.34,
+        "makespan_s": makespan,
+        "makespan_min": makespan / 60,
+        "travel_makespan_s": max((r['travel_time_s'] for r in routes), default=0),
+        "total_travel_time_s": sum(r['travel_time_s'] for r in routes),
+        "total_unload_time_s": sum(r['unload_time_s'] for r in routes),
+        "total_driver_time_s": sum(r['total_time_s'] for r in routes),
+        "total_energy_kwh": total_energy,
+        "avg_energy_per_mile": total_energy / (total_dist / 1609.34) if total_dist > 0 else 0,
+        **extra,
+    }
+
+
+def solve_fleet(ctx: dict, vehicles_config: list, goals: dict, priority=(), time_limit_s: int = None) -> dict:
+    """Split the stops across the fleet with OR-Tools, under the goals.
+
+    Defaults (distance only, no reserve) build the same model as
+    solve_vrp_ortools: distance cost and a cap of ceil(stops / K) per truck.
+    A battery reserve adds a per-truck energy limit (planned at full load, so
+    it errs on the safe side), softens the stop cap so a big-battery truck can
+    take extra stops, and lets stops that fit nowhere be reported as unserved.
+    """
+    matrices, n = ctx['matrices'], len(ctx['matrices']['distance'])
+    K = len(vehicles_config)
+    num_stops = n - 1
+    if K > num_stops:
+        raise Exception(f"Too many vehicles ({K}) for only {num_stops} stops. Use at most {num_stops} vehicles.")
+    nums = [vehicle_numbers(v) for v in vehicles_config]
+    reserve = goals.get('battery_reserve_pct')
+    w = goal_weights(goals)
+
+    energy_obj = None
+    if w['energy'] > 0:
+        mid = sum((x['gross'] + x['base']) / 2 for x in nums) / K
+        energy_obj = energy_matrix_kwh(matrices, ctx['elevations'], mid, ctx['temperature_c'],
+                                       ctx['has_climate_control'])
+    obj = objective_matrix(matrices, energy_obj, goals, K, priority)
+
+    kw = {'max_stops': [math.ceil(num_stops / K)] * K}
+    if obj['span_coef']:
+        kw.update(time_matrix=matrices['time'],
+                  service_s=[0] + [ctx['unload_s']] * num_stops, span_cost=obj['span_coef'])
+    if reserve is not None:
+        kw.update(energy=[energy_matrix_wh(energy_matrix_kwh(
+                      matrices, ctx['elevations'], x['gross'], ctx['temperature_c'], ctx['has_climate_control']))
+                      for x in nums],
+                  energy_caps=[x['battery_kwh'] * (1 - reserve / 100) * 1000 for x in nums],
+                  soft_stop_cap=True, optional=True, drop_penalty=DROP_PENALTY)
+
+    start = time.time()
+    sol = solve_vrp_constrained(obj['cost'], K, time_limit_s=time_limit_s or max(5, min(30, n * 2)), **kw)
+    solve_ms = (time.time() - start) * 1000
+
+    routes = []
+    for v_idx, route in enumerate(sol['routes']):
+        if len(route) <= 2:
+            continue                       # trucks left without stops stay home
+        num = dict(nums[v_idx])
+        stops = len(route) - 2
+        num['cargo_per_stop'] = num['cargo'] / stops
+        kinds = ['depot'] + ['stop'] * stops + ['depot']
+        delta = [0.0] + [-num['cargo_per_stop']] * stops + [0.0]
+        ev = evaluate_route(route, kinds, delta, ctx, num['gross'])
+        routes.append(fleet_route_payload(v_idx, vehicles_config[v_idx], route, kinds, ev, num, ctx, reserve))
+
+    unserved = [{"index": i, "location": ctx['locations'][i]} for i in sol['dropped']]
+    return fleet_totals(routes, {
+        "num_vehicles_requested": K,
+        "unserved": unserved,
+        "solve_time_ms": solve_ms,
+        "goals": goals,
+        "weights": obj['weights'],
+    })
+
+
+# ---- breakdown re-plan -------------------------------------------------------
+#
+# A truck breaks down part-way through the day. Every truck left the depot at
+# the same time, so at that moment each one is somewhere on its route:
+#
+#   • the broken truck has delivered its first k stops; the rest are stranded
+#     with their cargo on board at the breakdown site (its k-th stop).
+#   • every other truck finishes the stop it is driving to or unloading at,
+#     then continues from there with the battery and cargo it has left. Its own
+#     remaining stops stay on it — that cargo is already loaded.
+#   • stranded stops go to whichever truck can take them. That truck first
+#     drives to the breakdown site and moves the cargo across (pickup before
+#     delivery, same truck, TRANSFER_MIN_PER_ORDER per stop), within its
+#     battery and the 19,500 lbs gross limit.
+#   • optionally a spare truck leaves the depot at the moment of the breakdown.
+#
+# Stops no truck can fit are reported as unserved rather than silently dropped.
+
+REPLAN_TEXT = {
+    'nothing':   {'en': "{veh} had already finished its {n} deliveries by then — nothing to re-plan.",
+                  'zh': "{veh} 那时已经送完全部 {n} 个站——不需要重新规划。"},
+    'summary':   {'en': "{veh} broke down {when} ({at} after dispatch). {n} stranded stop{s}: {moves}.",
+                  'zh': "{veh} {when}抛锚（出发后 {at}）。{n} 个滞留站点：{moves}。"},
+    'after_k':   {'en': "after stop {k}", 'zh': "在第 {k} 站之后"},
+    'at_depot':  {'en': "leaving the depot", 'zh': "刚离开仓库时"},
+    'move':      {'en': "{stop} → {veh}", 'zh': "{stop} → {veh}"},
+    'unserved':  {'en': "{stop} → unserved", 'zh': "{stop} → 无车可送"},
+    'finish':    {'en': " Last truck back {end} (was {was}).", 'zh': "最后一辆车 {end} 返回（原计划 {was}）。"},
+    'need_spare': {'en': " No truck had the battery or payload left for {n} stranded stop{s} — ask me to send "
+                         "a spare truck.",
+                   'zh': "有 {n} 个滞留站点没有车有足够的电量或载重——可以让我派一辆备用车。"},
+    'own_short': {'en': " {veh} doesn't have the battery left for {stops}.",
+                  'zh': "{veh} 剩下的电量不够跑 {stops}。"},
+    'spare':     {'en': "Spare truck", 'zh': "备用车"},
+    'spare_unused': {'en': " The spare truck wasn't needed — the trucks on the road cover it more cheaply.",
+                     'zh': "不需要备用车——路上的车接手更省。"},
+}
+
+
+def _rt(key: str, lang: str, **kw) -> str:
+    return REPLAN_TEXT[key].get(lang, REPLAN_TEXT[key]['en']).format(**kw)
+
+
+def fmt_clock(seconds: float) -> str:
+    """+H:MM after dispatch."""
+    m = int(round(seconds / 60))
+    return f"+{m // 60}:{m % 60:02d}"
+
+
+def short_place(loc: dict) -> str:
+    """First part of an address: "11232 Knott Ave" from "11232 Knott Ave, Stanton, CA 90680"."""
+    text = loc.get('formatted_address') or loc.get('address') or '?'
+    return text.split(',')[0].strip()
+
+
+def vehicle_label(vcfg: dict, idx: int) -> str:
+    name = vcfg.get('name') or f'Vehicle {idx + 1}'
+    return f"{name} ({vcfg['driver']})" if vcfg.get('driver') else name
+
+
+def replan_breakdown(ctx: dict, vehicles_config: list, plan: list, event: dict,
+                     goals: dict, lang: str = 'en', time_limit_s: int = None) -> dict:
+    """Re-plan the rest of the day after a breakdown. See the notes above."""
+    matrices, locations = ctx['matrices'], ctx['locations']
+    reserve = goals.get('battery_reserve_pct')
+    nums = [vehicle_numbers(v) for v in vehicles_config]
+
+    # 1. Replay the original plan: when is every truck where?
+    timelines = []
+    for p in plan:
+        v, order = int(p['vehicle_index']), list(p['order'])
+        if order[-1] != 0:
+            order.append(0)
+        stops = len(order) - 2
+        num = dict(nums[v])
+        num['cargo_per_stop'] = num['cargo'] / stops if stops else 0.0
+        kinds = ['depot'] + ['stop'] * stops + ['depot']
+        delta = [0.0] + [-num['cargo_per_stop']] * stops + [0.0]
+        timelines.append({'v': v, 'order': order, 'num': num, 'kinds': kinds, 'delta': delta,
+                          'ev': evaluate_route(order, kinds, delta, ctx, num['gross'])})
+    was_makespan = max(t['ev']['end_s'] for t in timelines)
+
+    broken = next((t for t in timelines if t['v'] == int(event['vehicle_index'])), None)
+    if broken is None:
+        raise ValueError("That vehicle has no route in the current plan")
+    b_order, b_ev = broken['order'], broken['ev']
+    b_stops = len(b_order) - 2
+    b_label = vehicle_label(vehicles_config[broken['v']], broken['v'])
+
+    # 2. When and where it broke down.
+    if event.get('at_minute') is not None:
+        t_break = float(event['at_minute']) * 60
+        k = sum(1 for j in range(1, b_stops + 1) if b_ev['depart_s'][j] <= t_break)
+    else:
+        k = max(0, int(event.get('after_stop') or 0))
+        t_break = b_ev['depart_s'][k] if 1 <= k <= b_stops else 0.0
+    if k >= b_stops:
+        return {'nothing': True, 'message': _rt('nothing', lang, veh=b_label, n=b_stops)}
+    crash = b_order[k] if k >= 1 else 0
+    stranded = b_order[k + 1:b_stops + 1]
+    b_cps = broken['num']['cargo_per_stop']
+
+    # 3. Where every other truck picks up from.
+    fleet = []          # one entry per truck in the re-plan
+    for t in timelines:
+        if t is broken:
+            continue
+        order, ev, stops = t['order'], t['ev'], len(t['order']) - 2
+        j = next((j for j in range(1, stops + 1) if ev['depart_s'][j] >= t_break), None)
+        if j is None:                      # done for the day: free once back at the depot
+            done_nodes, start_node = order, 0
+            start_time = max(t_break, ev['end_s'])
+            used = ev['energy_kwh']
+            remaining = []
+        else:
+            done_nodes, start_node = order[:j + 1], order[j]
+            start_time = ev['depart_s'][j]
+            used = sum(l['energy_kwh'] for l in ev['legs'][:j])
+            remaining = order[j + 1:stops + 1]
+        cps = t['num']['cargo_per_stop']
+        fleet.append({'v': t['v'], 'num': t['num'], 'done': done_nodes, 'start': start_node,
+                      'start_time': start_time, 'used': used, 'remaining': remaining,
+                      'load': len(remaining) * int(cps), 'cps': cps,
+                      'weight': t['num']['base'] + len(remaining) * cps, 'spare': False})
+
+    spare_requested = bool(event.get('spare_truck')) or not fleet
+    spare_cfg = None
+    if spare_requested:
+        spare_cfg = dict(vehicles_config[broken['v']])
+        spare_cfg.update(id=max(int(v.get('id', i + 1)) for i, v in enumerate(vehicles_config)) + 1,
+                         name=_rt('spare', lang), driver='')
+        num = vehicle_numbers(spare_cfg)
+        num.update(gross=num['base'], cargo=0.0, cargo_per_stop=0.0)
+        fleet.append({'v': len(vehicles_config), 'num': num, 'done': [0], 'start': 0,
+                      'start_time': t_break, 'used': 0.0, 'remaining': [], 'load': 0, 'cps': 0.0,
+                      'weight': num['base'], 'spare': True})
+
+    # 4. The re-plan problem: local node 0 is the depot; then each truck's start,
+    #    its own remaining stops, the stranded stops and one pickup per stranded
+    #    stop at the breakdown site.
+    local = [{'orig': 0, 'kind': 'depot'}]
+    starts = []
+    for f in fleet:
+        if f['start'] == 0:
+            starts.append(0)
+        else:
+            starts.append(len(local))
+            local.append({'orig': f['start'], 'kind': 'start'})
+    allowed, deltas, pairs = {}, {}, []
+    for vi, f in enumerate(fleet):
+        for s in f['remaining']:
+            allowed[len(local)] = [vi]
+            deltas[len(local)] = -int(f['cps'])
+            local.append({'orig': s, 'kind': 'stop'})
+    for s in stranded:
+        d_idx = len(local)
+        local.append({'orig': s, 'kind': 'rescue'})
+        p_idx = len(local)
+        local.append({'orig': crash, 'kind': 'pickup'})
+        deltas[d_idx], deltas[p_idx] = -int(b_cps), int(b_cps)
+        pairs.append((p_idx, d_idx))
+    m = len(local)
+    orig = [x['orig'] for x in local]
+
+    def sub(mat):
+        return [[0 if a == b else mat[orig[a]][orig[b]] for b in range(m)] for a in range(m)]
+
+    stranded_lbs = len(stranded) * b_cps
+    energy_obj = None
+    w = goal_weights(goals)
+    if w['energy'] > 0:
+        mid = sum(f['weight'] for f in fleet) / len(fleet) + stranded_lbs / 2
+        energy_obj = energy_matrix_kwh(matrices, ctx['elevations'], mid, ctx['temperature_c'],
+                                       ctx['has_climate_control'])
+    obj = objective_matrix(matrices, energy_obj, goals, len(fleet))
+    energies = []
+    for f in fleet:
+        heavy = min(MAX_GROSS_LBS, f['weight'] + stranded_lbs)
+        energies.append(sub(energy_matrix_wh(energy_matrix_kwh(
+            matrices, ctx['elevations'], heavy, ctx['temperature_c'], ctx['has_climate_control']))))
+    usable = [max(0.0, f['num']['battery_kwh'] * (1 - (reserve or 0) / 100) - f['used']) * 1000 for f in fleet]
+
+    sol = solve_vrp_constrained(
+        sub(obj['cost']), len(fleet), starts=starts, ends=[0] * len(fleet),
+        time_matrix=sub(matrices['time']),
+        service_s=[stop_service_s(x['kind'], ctx['unload_s']) if x['kind'] != 'start' else 0 for x in local],
+        start_times=[f['start_time'] for f in fleet], span_cost=obj['span_coef'],
+        energy=energies, energy_caps=usable,
+        load_deltas=[deltas.get(i, 0) for i in range(m)], start_loads=[f['load'] for f in fleet],
+        load_caps=[MAX_GROSS_LBS - f['num']['base'] for f in fleet],
+        allowed=allowed, pairs=pairs, optional=True, drop_penalty=DROP_PENALTY,
+        time_limit_s=time_limit_s or max(3, min(10, m)))
+
+    # 5. Stitch each truck's day back together and price it leg by leg.
+    routes, moves = [], []
+    for vi, f in enumerate(fleet):
+        new = sol['routes'][vi][1:]                         # after the start node
+        done_kinds = ['depot'] + ['done'] * (len(f['done']) - 1)
+        if f['start'] == 0 and len(f['done']) > 1:
+            done_kinds[-1] = 'depot'                        # finished, back at the depot
+        nodes = list(f['done']) + [orig[x] for x in new]
+        kinds = done_kinds + [('depot' if local[x]['kind'] == 'depot' else local[x]['kind']) for x in new]
+        if f['spare'] and len(nodes) <= 2:
+            continue                                        # spare not needed
+        delta = []
+        for kind in kinds:
+            delta.append(-f['cps'] if kind in ('done', 'stop') else -b_cps if kind == 'rescue'
+                         else b_cps if kind == 'pickup' else 0.0)
+        start_weight = f['num']['gross'] if not f['spare'] else f['num']['base']
+        ev = evaluate_route(nodes, kinds, delta, ctx, start_weight,
+                            start_time_s=f['start_time'] if f['spare'] else 0.0)
+        cfg = spare_cfg if f['spare'] else vehicles_config[f['v']]
+        took = [orig[x] for x in new if local[x]['kind'] == 'rescue']
+        moves += [(s, vehicle_label(cfg, f['v'])) for s in took]
+        status = 'spare' if f['spare'] else ('rescue' if took else 'continues')
+        num = dict(f['num'])
+        routes.append(fleet_route_payload(f['v'], cfg, nodes, kinds, ev, num, ctx, reserve, status))
+
+    b_nodes = b_order[:k + 1]
+    b_kinds = ['depot'] + ['done'] * k
+    b_delta = [0.0] + [-b_cps] * k
+    b_eval = evaluate_route(b_nodes, b_kinds, b_delta, ctx, broken['num']['gross'])
+    b_route = fleet_route_payload(broken['v'], vehicles_config[broken['v']], b_nodes, b_kinds,
+                                  b_eval, broken['num'], ctx, reserve, 'broken_down')
+    b_route['total_time_s'] = t_break
+    b_route['total_time_min'] = t_break / 60
+    b_route['breakdown_index'] = k
+    routes.insert(0, b_route)
+    routes.sort(key=lambda r: r['vehicle_index'])
+
+    dropped = [orig[x] for x in sol['dropped'] if local[x]['kind'] in ('rescue', 'stop')]
+    # Stops the plan already left unserved (no truck fit them) are still unserved.
+    planned = {i for t in timelines for i in t['order']}
+    already = [i for i in range(1, len(locations)) if i not in planned]
+    own_short = {}                      # truck label -> its own stops it can no longer reach
+    for x in sol['dropped']:
+        if local[x]['kind'] == 'stop':
+            vi = allowed[x][0]
+            label = vehicle_label(vehicles_config[fleet[vi]['v']], fleet[vi]['v'])
+            own_short.setdefault(label, []).append(short_place(locations[orig[x]]))
+    stranded_dropped = [orig[x] for x in sol['dropped'] if local[x]['kind'] == 'rescue']
+    unserved = ([{"index": i, "location": locations[i]} for i in dropped]
+                + [{"index": i, "location": locations[i], "before_breakdown": True} for i in already])
+    rescued = {s for s, _ in moves}
+    move_text = [_rt('move', lang, stop=short_place(locations[s]), veh=label) for s, label in moves]
+    move_text += [_rt('unserved', lang, stop=short_place(locations[s])) for s in stranded if s not in rescued]
+
+    fleet_out = fleet_totals(routes, {
+        "num_vehicles_requested": len(vehicles_config) + (1 if any(r.get('status') == 'spare' for r in routes) else 0),
+        "unserved": unserved, "goals": goals, "weights": obj['weights'],
+        "solve_time_ms": None,
+    })
+    sep = '；' if lang == 'zh' else '; '
+    message = _rt('summary', lang, veh=b_label,
+                  when=_rt('after_k', lang, k=k) if k else _rt('at_depot', lang),
+                  at=fmt_clock(t_break)[1:], n=len(stranded), s='' if len(stranded) == 1 else 's',
+                  moves=sep.join(move_text))
+    message += _rt('finish', lang, end=fmt_clock(fleet_out['makespan_s']), was=fmt_clock(was_makespan))
+    for label, stops in own_short.items():
+        message += _rt('own_short', lang, veh=label, stops=', '.join(stops))
+    if spare_cfg and not any(r.get('status') == 'spare' for r in routes):
+        message += _rt('spare_unused', lang)
+    if stranded_dropped and not spare_cfg:
+        message += _rt('need_spare', lang, n=len(stranded_dropped), s='' if len(stranded_dropped) == 1 else 's')
+    fleet_out['disruption'] = {
+        "type": "breakdown",
+        "vehicle_index": broken['v'],
+        "vehicle_label": b_label,
+        "after_stop": k,
+        "at_s": t_break,
+        "crash_site": locations[crash],
+        "stranded": [locations[s] for s in stranded],
+        "reassigned": [{"location": locations[s], "to": label} for s, label in moves],
+        "spare_used": any(r.get('status') == 'spare' for r in routes),
+        "was_makespan_s": was_makespan,
+        "transfer_min_per_order": TRANSFER_MIN_PER_ORDER,
+        "message": message,
+    }
+    return {'nothing': False, 'fleet': fleet_out, 'message': message}
+
+
+# ---- truck limits ------------------------------------------------------------
+
+LIMITS_TEXT = {
+    'head': {'en': "A {packs}-pack truck carries {kwh:.0f} kWh{usable}. Empty it weighs {empty:,.0f} lbs, so it "
+                   "can take up to {payload:,.0f} lbs of cargo before the {gross:,.0f} lbs limit.",
+             'zh': "{packs} 块电池包的卡车共 {kwh:.0f} kWh{usable}。空车 {empty:,.0f} lbs，"
+                   "在 {gross:,.0f} lbs 上限前最多能装 {payload:,.0f} lbs 货。"},
+    'usable': {'en': " ({usable:.0f} kWh usable with a {r}% reserve)", 'zh': "（保留 {r}% 后可用 {usable:.0f} kWh）"},
+    'range': {'en': " At {temp:.0f} °C with climate control {hvac}, mixed driving uses {lo:.2f}–{hi:.2f} kWh/mi "
+                    "(empty → {w:,.0f} lbs), so it reaches about {rlo:.0f}–{rhi:.0f} miles per charge.",
+              'zh': "在 {temp:.0f} °C、空调{hvac}的条件下，混合路况耗电 {lo:.2f}–{hi:.2f} kWh/英里"
+                    "（空车 → {w:,.0f} lbs），一次充电约能跑 {rlo:.0f}–{rhi:.0f} 英里。"},
+    'plan_ok': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — this truck covers it{kept} with "
+                      "{left:.0f}% of the battery to spare.",
+                'zh': "今天最长的路线（{veh}）需要 {need:.1f} kWh——这辆车跑得下{kept}，还能多出 {left:.0f}% 电量。"},
+    'kept': {'en': ", keeps the {r}% reserve,", 'zh': "并保住 {r}% 的保留电量"},
+    'plan_short': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — {short:.1f} kWh more than "
+                         "this truck can use. It needs at least {min_packs} packs, or a shorter route.",
+                   'zh': "今天最长的路线（{veh}）需要 {need:.1f} kWh——比这辆车可用的多 {short:.1f} kWh。"
+                         "至少需要 {min_packs} 块电池包，或者缩短路线。"},
+    'plan_none': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — more than even 9 packs "
+                        "can cover; split it across more trucks.",
+                  'zh': "今天最长的路线（{veh}）需要 {need:.1f} kWh——9 块电池包也不够，需要分给更多车。"},
+    'on': {'en': 'on', 'zh': '开'}, 'off': {'en': 'off', 'zh': '关'},
+}
+
+
+def _lt(key: str, lang: str, **kw) -> str:
+    return LIMITS_TEXT[key].get(lang, LIMITS_TEXT[key]['en']).format(**kw)
+
+
+def truck_limits(packs: int, temperature_c: float = 20.0, has_climate_control: bool = True,
+                 weight_lbs: float = None, reserve_pct=None, plan: dict = None, lang: str = 'en') -> dict:
+    """Everything the assistant says about what a truck can do, computed here.
+
+    Range comes from Model E on a flat road at three average speeds, empty and
+    loaded to `weight_lbs` (default: the 19,500 lbs limit). The plan check uses
+    the energy each truck's route needed in the last solve.
+    """
+    packs = int(packs)
+    kwh = packs * PACK_KWH
+    usable = kwh * (1 - (reserve_pct or 0) / 100)
+    empty = empty_weight_lbs(packs)
+    loaded = min(MAX_GROSS_LBS, max(empty, float(weight_lbs))) if weight_lbs else MAX_GROSS_LBS
+
+    def kwh_per_mile(speed, w_lbs):
+        e = calculate_energy_consumption(10.0, speed, temperature_c, w_lbs / LBS_PER_TONNE, 0, 0,
+                                         has_climate_control)
+        return e['energy_per_mile']
+
+    rows = []
+    for profile, speed in SPEED_PROFILES:
+        lo, hi = kwh_per_mile(speed, empty), kwh_per_mile(speed, loaded)
+        rows.append({'profile': profile, 'speed_kmh': speed, 'speed_mph': round(speed * 0.621371),
+                     'empty_kwh_mi': round(lo, 3), 'loaded_kwh_mi': round(hi, 3),
+                     'range_empty_mi': round(usable / lo, 1), 'range_loaded_mi': round(usable / hi, 1)})
+    mixed = next(r for r in rows if r['profile'] == 'mixed')
+
+    msg = _lt('head', lang, packs=packs, kwh=kwh, empty=empty, payload=MAX_GROSS_LBS - empty,
+              gross=MAX_GROSS_LBS,
+              usable=_lt('usable', lang, usable=usable, r=reserve_pct) if reserve_pct else '')
+    msg += _lt('range', lang, temp=temperature_c, hvac=_lt('on' if has_climate_control else 'off', lang),
+               lo=mixed['empty_kwh_mi'], hi=mixed['loaded_kwh_mi'], w=loaded,
+               rlo=mixed['range_loaded_mi'], rhi=mixed['range_empty_mi'])
+
+    plan_check = None
+    routes = [r for r in (plan or {}).get('vehicles') or [] if _finite(r.get('energy_kwh'))]
+    if routes:
+        worst = max(routes, key=lambda r: r['energy_kwh'])
+        need = float(worst['energy_kwh'])
+        veh = worst.get('name') or f"Vehicle {worst.get('number', 1)}"
+        if worst.get('driver'):
+            veh += f" · {worst['driver']}"
+        per_pack = PACK_KWH * (1 - (reserve_pct or 0) / 100)
+        min_packs = max(3, math.ceil(need / per_pack - 1e-9)) if per_pack > 0 else None
+        plan_check = {'vehicle': veh, 'need_kwh': round(need, 1), 'usable_kwh': round(usable, 1),
+                      'fits': need <= usable, 'min_packs': min_packs}
+        if need <= usable:
+            msg += _lt('plan_ok', lang, veh=veh, need=need, left=(usable - need) / kwh * 100,
+                       kept=_lt('kept', lang, r=reserve_pct) if reserve_pct else '')
+        elif min_packs and min_packs <= 9:
+            msg += _lt('plan_short', lang, veh=veh, need=need, short=need - usable, min_packs=min_packs)
+        else:
+            msg += _lt('plan_none', lang, veh=veh, need=need)
+
+    return {'packs': packs, 'battery_kwh': kwh, 'usable_kwh': round(usable, 1), 'reserve_pct': reserve_pct,
+            'empty_weight_lbs': round(empty), 'max_payload_lbs': round(MAX_GROSS_LBS - empty),
+            'max_gross_lbs': MAX_GROSS_LBS, 'loaded_weight_lbs': round(loaded),
+            'temperature_c': temperature_c, 'has_climate_control': has_climate_control,
+            'rows': rows, 'plan_check': plan_check, 'message': msg, 'lang': lang}
+
+
+# =============================================================================
 # API Endpoints
 # =============================================================================
 
@@ -719,13 +1527,22 @@ def optimize_route():
     if algorithms is None:
         algorithms = solver_decision['algorithms']
 
-    try:
-        # Get distance matrix from Google
-        matrices = get_distance_matrix(locations)
-        matrix = matrices['distance'] if mode == 'distance' else matrices['time']
+    # Optimization goals. Without any, `mode` keeps its old meaning: minimise
+    # distance, or driving time when mode is "time".
+    if data.get('goals') is not None:
+        goals = normalize_goals(data['goals'])
+    else:
+        goals = normalize_goals({'distance': 'off', 'time': 'high'} if mode == 'time' else None)
+    priority = sorted({int(i) for i in data.get('priority_stops') or []
+                       if str(i).lstrip('-').isdigit() and 0 < int(i) < len(locations)})
 
-        # Get elevation data for energy calculations
-        elevations = get_elevation_data(locations)
+    try:
+        # Distance / time matrices and elevations: from the client when it sends
+        # back the ones it got for these same locations (a re-solve after a chat
+        # change), otherwise from Google.
+        pre = precomputed_inputs(data.get('precomputed'), len(locations))
+        matrices = pre['matrices'] if pre else get_distance_matrix(locations)
+        elevations = pre['elevations'] if pre else get_elevation_data(locations)
 
         # Extract energy model parameters from request (with defaults)
         energy_params = data.get('energy_params', {})
@@ -771,6 +1588,18 @@ def optimize_route():
         hk_base_weight_tonnes = hk_base_weight_lbs / 2204.62
         cargo_weight_lbs    = max(0.0, total_weight_lbs - hk_base_weight_lbs)
         total_weight_tonnes = total_weight_lbs / 2204.62
+
+        # What the single-vehicle solvers minimise: the goals' weighted mix of
+        # distance, time and energy (energy priced at vehicle 1's mid-load weight).
+        energy_obj = None
+        if goal_weights(goals)['energy'] > 0:
+            energy_obj = energy_matrix_kwh(matrices, elevations, (total_weight_lbs + hk_base_weight_lbs) / 2,
+                                           temperature_c, has_climate_control)
+        objective = objective_matrix(matrices, energy_obj, goals, 1, priority)
+        matrix = objective['cost']
+        hk_battery_kwh = float(hk_cfg.get('battery_kwh') or
+                               int(hk_cfg.get('battery_packs', DEFAULT_PACKS)) * PACK_KWH)
+        reserve = goals.get('battery_reserve_pct')
 
         # Run requested algorithms
         results = {}
@@ -950,6 +1779,15 @@ def optimize_route():
                 'weight_per_stop_lbs': round(weight_per_stop_lbs, 1),
                 'num_delivery_stops': num_delivery_stops,
             }
+            # Checked against vehicle 1's battery. One truck has to visit every
+            # stop, so the limit is reported here, not enforced.
+            result.update(battery_fields(hk_battery_kwh, total_energy_kwh, reserve))
+            # Arrival at each location after dispatch: driving, plus unloading at every stop before it.
+            eta, t = [0], 0.0
+            for i, leg in enumerate(legs):
+                t += leg['time_s'] + (unload_time_min * 60 if i > 0 else 0)
+                eta.append(round(t))
+            result['eta_s'] = eta
         
         # Name the solver whose route the baseline panel is actually showing.
         baseline_key = ('held_karp' if 'held_karp' in algorithms
@@ -1001,144 +1839,10 @@ def optimize_route():
 
         # ── OR-Tools fleet routing (only when num_vehicles > 1) ──────────────
         if num_vehicles > 1:
-            start = time.time()
-            vrp_routes = solve_vrp_ortools(matrix, num_vehicles)
-            solve_ms = (time.time() - start) * 1000
-
-            fleet_routes = []
-            fleet_total_dist = 0
-            fleet_total_energy = 0
-
-            for v_idx, route in enumerate(vrp_routes):
-                # route = [0, a, b, 0] — depot at both ends
-                v_dist = sum(matrices['distance'][route[i]][route[i+1]] for i in range(len(route)-1))
-                v_time = sum(matrices['time'][route[i]][route[i+1]] for i in range(len(route)-1))
-
-                # Per-vehicle config (weight, battery)
-                vcfg = vehicles_config[v_idx] if v_idx < len(vehicles_config) else vehicles_config[-1]
-                if 'weight_lbs' in vcfg:
-                    v_total_weight_lbs = float(vcfg['weight_lbs'])
-                elif 'weight_tonnes' in vcfg:
-                    v_total_weight_lbs = float(vcfg['weight_tonnes']) * 2204.62
-                else:
-                    v_total_weight_lbs = DEFAULT_WEIGHT_LBS
-                v_base_weight_lbs = vehicle_base_weight_lbs(vcfg)
-                v_cargo_weight_lbs = max(0.0, v_total_weight_lbs - v_base_weight_lbs)
-                v_weight = vcfg.get('weight_tonnes', v_total_weight_lbs / 2204.62)
-                v_battery = vcfg.get('battery_kwh', DEFAULT_BATTERY_KWH)
-
-                # Build legs with energy for this vehicle (progressive weight unloading)
-                v_num_delivery_stops = len(route) - 2  # excludes depot at both ends
-                v_weight_per_stop_lbs = v_cargo_weight_lbs / v_num_delivery_stops if v_num_delivery_stops > 0 else 0
-
-                v_legs = []
-                v_energy = 0
-                for i in range(len(route) - 1):
-                    from_idx = route[i]
-                    to_idx = route[i+1]
-                    distance_m = matrices['distance'][from_idx][to_idx]
-                    time_s = matrices['time'][from_idx][to_idx]
-                    distance_km = distance_m / 1000
-                    avg_speed_kmh = estimate_average_speed(distance_m, time_s)
-                    altitude_diff_m = elevations[to_idx] - elevations[from_idx]
-
-                    is_return = (i == len(route) - 2)
-                    if is_return:
-                        leg_weight_lbs = v_base_weight_lbs
-                    else:
-                        leg_weight_lbs = v_total_weight_lbs - i * v_weight_per_stop_lbs
-                    leg_weight_tonnes = leg_weight_lbs / 2204.62
-
-                    energy_data = calculate_energy_consumption(
-                        distance_km=distance_km,
-                        avg_speed_kmh=avg_speed_kmh,
-                        temperature_c=temperature_c,
-                        vehicle_weight_tonnes=leg_weight_tonnes,
-                        altitude_diff_m=altitude_diff_m,
-                        altitude_m=elevations[from_idx],
-                        has_climate_control=has_climate_control
-                    )
-                    v_energy += energy_data['energy_kwh']
-                    v_legs.append({
-                        "from": locations[from_idx],
-                        "to": locations[to_idx],
-                        "distance_m": distance_m,
-                        "distance_mi": distance_m / 1609.34,
-                        "time_s": time_s,
-                        "time_min": time_s / 60,
-                        "vehicle_weight_lbs": round(leg_weight_lbs, 1),
-                        "vehicle_weight_tonnes": round(leg_weight_tonnes, 3),
-                        "energy_kwh": energy_data['energy_kwh'],
-                        "return_leg": is_return
-                    })
-
-                # Time breakdown
-                v_travel_time_s = v_time
-                v_unload_time_s = int(unload_time_min * 60 * v_num_delivery_stops)
-                v_total_time_s  = v_travel_time_s + v_unload_time_s
-
-                # Battery state
-                battery_remaining = max(0.0, v_battery - v_energy)
-                battery_pct = (battery_remaining / v_battery * 100) if v_battery > 0 else 0
-
-                # Google Maps URL for this vehicle (closed — origin == destination)
-                depot_loc = locations[route[0]]
-                origin_str = f"{depot_loc['lat']},{depot_loc['lng']}"
-                waypoints_str = "|".join(
-                    f"{locations[route[i]]['lat']},{locations[route[i]]['lng']}"
-                    for i in range(1, len(route) - 1)
-                )
-                v_url = f"https://www.google.com/maps/dir/?api=1&origin={origin_str}&destination={origin_str}"
-                if waypoints_str:
-                    v_url += f"&waypoints={waypoints_str}"
-
-                fleet_total_dist += v_dist
-                fleet_total_energy += v_energy
-                fleet_routes.append({
-                    "vehicle_id": vcfg.get('id', v_idx + 1),
-                    "vehicle_name": vcfg.get('name', f'Vehicle {v_idx + 1}'),
-                    "driver": vcfg.get('driver') or '',
-                    "vehicle_config": {
-                        "total_weight_lbs": v_total_weight_lbs,
-                        "cargo_weight_lbs": v_cargo_weight_lbs,
-                        "weight_per_stop_lbs": round(v_weight_per_stop_lbs, 1),
-                        "battery_kwh": v_battery,
-                    },
-                    "ordered_locations": [locations[i] for i in route],
-                    "total_distance_m": v_dist,
-                    "total_distance_mi": v_dist / 1609.34,
-                    "travel_time_s": v_travel_time_s,
-                    "unload_time_s": v_unload_time_s,
-                    "total_time_s": v_total_time_s,
-                    "total_time_min": v_total_time_s / 60,
-                    "num_delivery_stops": v_num_delivery_stops,
-                    "total_energy_kwh": v_energy,
-                    "battery_capacity_kwh": v_battery,
-                    "battery_remaining_kwh": round(battery_remaining, 2),
-                    "battery_remaining_pct": round(battery_pct, 1),
-                    "battery_depleted": v_energy > v_battery,
-                    "google_maps_url": v_url,
-                    "legs": v_legs
-                })
-
-            makespan_s = max(r["total_time_s"] for r in fleet_routes)
-            travel_makespan_s = max(r["travel_time_s"] for r in fleet_routes)
-            results['ortools_fleet'] = {
-                "num_vehicles_requested": num_vehicles,
-                "num_vehicles_used": len(fleet_routes),
-                "routes": fleet_routes,
-                "total_distance_m": fleet_total_dist,
-                "total_distance_mi": fleet_total_dist / 1609.34,
-                "makespan_s": makespan_s,
-                "makespan_min": makespan_s / 60,
-                "travel_makespan_s": travel_makespan_s,
-                "total_travel_time_s": sum(r["travel_time_s"] for r in fleet_routes),
-                "total_unload_time_s": sum(r["unload_time_s"] for r in fleet_routes),
-                "total_driver_time_s": sum(r["total_time_s"] for r in fleet_routes),
-                "total_energy_kwh": fleet_total_energy,
-                "avg_energy_per_mile": fleet_total_energy / (fleet_total_dist / 1609.34) if fleet_total_dist > 0 else 0,
-                "solve_time_ms": solve_ms
-            }
+            ctx = {'matrices': matrices, 'elevations': elevations, 'locations': locations,
+                   'temperature_c': temperature_c, 'has_climate_control': has_climate_control,
+                   'unload_s': unload_time_min * 60}
+            results['ortools_fleet'] = solve_fleet(ctx, vehicles_config, goals, priority)
 
         return jsonify({
             "status": "ok",
@@ -1158,9 +1862,12 @@ def optimize_route():
             "matrices": {
                 "distance": matrices['distance'],
                 "time": matrices['time']
-            }
+            },
+            "elevations": elevations,
+            "goals": {**goals, "weights": objective['weights']},
+            "priority_stops": priority,
         })
-        
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -1183,6 +1890,63 @@ def get_route_directions():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/replan', methods=['POST'])
+def replan_route():
+    """
+    Simulate a breakdown on the current plan and re-plan the rest of the day.
+
+    Request body:
+    {
+        "locations": [...],              same as /api/optimize, index 0 = depot
+        "vehicles": [...],               same as /api/optimize
+        "energy_params": {...},
+        "goals": {...},
+        "plan": [{"vehicle_index": 1, "order": [0, 3, 1, 0]}, ...],
+        "event": {"vehicle_index": 1, "after_stop": 2}     or "at_minute": 90;
+                 "spare_truck": true sends a spare from the depot
+        "precomputed": {"distance", "time", "elevations"}  from the plan's solve
+        "lang": "en" | "zh"
+    }
+    """
+    data = request.json or {}
+    locations = data.get('locations') or []
+    vehicles_config = data.get('vehicles') or []
+    plan = data.get('plan') or []
+    event = data.get('event') or {}
+    lang = data.get('lang') if data.get('lang') in ('en', 'zh') else 'en'
+    if len(locations) < 2 or not vehicles_config or not plan:
+        return jsonify({"status": "error", "message": "Need locations, vehicles and the current plan"}), 400
+    n = len(locations)
+    for p in plan:
+        order = p.get('order') or []
+        if (not isinstance(p.get('vehicle_index'), int) or not 0 <= p['vehicle_index'] < len(vehicles_config)
+                or not order or order[0] != 0 or any(not isinstance(i, int) or not 0 <= i < n for i in order)):
+            return jsonify({"status": "error", "message": "Malformed plan"}), 400
+    if not isinstance(event.get('vehicle_index'), int):
+        return jsonify({"status": "error", "message": "event.vehicle_index is required"}), 400
+
+    energy_params = data.get('energy_params') or {}
+    try:
+        pre = precomputed_inputs(data.get('precomputed'), n)
+        ctx = {
+            'matrices': pre['matrices'] if pre else get_distance_matrix(locations),
+            'elevations': pre['elevations'] if pre else get_elevation_data(locations),
+            'locations': locations,
+            'temperature_c': float(energy_params.get('temperature_c', 20.0)),
+            'has_climate_control': bool(energy_params.get('has_climate_control', True)),
+            'unload_s': float(energy_params.get('unload_time_min', 30.0)) * 60,
+        }
+        out = replan_breakdown(ctx, vehicles_config, plan, event, normalize_goals(data.get('goals')), lang)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    if out['nothing']:
+        return jsonify({"status": "ok", "nothing": True, "message": out['message']})
+    return jsonify({"status": "ok", "nothing": False, "message": out['message'],
+                    "results": {"ortools_fleet": out['fleet']}})
 
 
 # =============================================================================
@@ -1209,11 +1973,15 @@ def get_route_directions():
 # The model only *proposes*; every value that reaches the form has passed
 # through plain Python checks in this section.
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4o-mini"
+# Any OpenAI-compatible chat endpoint: OpenAI by default, or set LLM_BASE_URL,
+# LLM_API_KEY and LLM_MODEL in .env, e.g. for the U-M GPT Toolkit
+# (https://api.toolkit.umgpt.umich.edu/v1), which serves the same gpt-4o-mini.
+LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1').rstrip('/')
+OPENAI_API_KEY = os.environ.get('LLM_API_KEY') or os.environ.get('OPENAI_API_KEY', '')
+OPENAI_CHAT_URL = f"{LLM_BASE_URL}/chat/completions"
+OPENAI_MODEL = os.environ.get('LLM_MODEL', 'gpt-4o-mini')
 
-INTENTS = ('apply', 'ask', 'confirm', 'recommend', 'memory', 'out_of_scope')
+INTENTS = ('apply', 'ask', 'confirm', 'recommend', 'memory', 'goals', 'limits', 'disruption', 'out_of_scope')
 
 # Closed vocabulary: every axis the chatbot may touch, its value type and hard
 # limits. Anything not listed here is out of scope by definition.
@@ -1227,14 +1995,19 @@ AXES = {
     'unload_time_min':     {'type': 'number', 'label': 'Unload time',    'min': 5,     'max': 120,   'unit': ' min'},
     'has_climate_control': {'type': 'bool',   'label': 'Climate control'},
     'solver':              {'type': 'enum',   'label': 'Solver', 'choices': SOLVER_CHOICES},
+    # Stops served before the others on their truck. Values are stops already on the form.
+    'priority_stops':      {'type': 'list',   'label': 'Priority stops'},
     # Set only by a memory recall: one vehicle per recalled driver, not a uniform value.
     'fleet':               {'type': 'fleet',  'label': 'Fleet'},
+    # Set only by the "goals" intent: levels per goal plus the battery reserve.
+    'goals':               {'type': 'goals',  'label': 'Goals'},
 }
 
 AXIS_LABEL_ZH = {
     'depot': '仓库', 'addresses': '站点', 'vehicle_count': '车辆数', 'battery_packs': '电池包',
     'vehicle_weight_lbs': '整车重量', 'temperature_c': '温度', 'unload_time_min': '卸货时间',
     'has_climate_control': '空调', 'solver': '求解器', 'fleet': '车队',
+    'priority_stops': '优先站点', 'goals': '优化目标',
 }
 
 CAPABILITIES_ZH = [
@@ -1248,6 +2021,10 @@ CAPABILITIES_ZH = [
     "开启或关闭空调",
     "根据问题规模推荐求解器，并切换过去",
     "按名字记住司机（可附带所开卡车的电池包数和重量），之后直接调用",
+    "根据你的情况设定优化目标（距离、时间、电量、均衡）和电量保留",
+    "把某些站点设为优先，先送",
+    "回答卡车的极限：电量、载重、续航，以及今天的路线跑不跑得下",
+    "模拟某辆车抛锚，重新分配它没送完的站点（可派备用车）",
 ]
 
 
@@ -1267,6 +2044,10 @@ CAPABILITIES = [
     "Turn climate control on or off",
     "Recommend which solver fits your problem size, and switch to it",
     "Remember a driver by name (optionally with their truck's packs and weight) and load them back later",
+    "Set what to optimize for (distance, time, energy, balance) and a battery reserve — just describe the day",
+    "Mark stops as priority so they are served first",
+    "Explain a truck's limits: battery, payload, range, and whether today's routes fit",
+    "Simulate a truck breaking down and re-plan its stranded stops (optionally with a spare truck)",
 ]
 
 # One utterance → one applied change. Further validated changes are queued and
@@ -1280,6 +2061,17 @@ NUMERIC_EVIDENCE_RE = re.compile(
     r'\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|'
     r'a|an|another|more|less|fewer|half|double|twice)\b'
     r'|[一二两三四五六七八九十零半]|多|少|再|加|减', re.I)
+
+
+SIZE_STOPS_RE = re.compile(r'(\d+)\s*(?:delivery\s+)?(?:stops?|locations?|addresses|个站|个站点|站)', re.I)
+SIZE_VEH_RE = re.compile(r'(\d+)\s*(?:trucks?|vehicles?|vans?|辆|台)', re.I)
+NEED_OPTIMAL_RE = re.compile(r'guarantee|proven|exact|optimal|optimum|最优|精确|保证', re.I)
+
+DEPOT_LEAD_RE = re.compile(r'^(?:the\s+)?(?:depot|warehouse|base)(?:\s+(?:is|in|at|to|=)|\s*[:=])\s+', re.I)
+
+SOLVER_EVIDENCE_RE = re.compile(
+    r'solver|algorithm|algo|held|karp|2.?opt|two.?opt|\bopt\b|nearest|neighbou?r|greedy|or.?tools|vrp|'
+    r'exact|optimal|optimum|guarantee|proven|auto|heuristic|求解器|算法|精确|最优|最近邻|贪心|自动', re.I)
 
 
 BOOL_EVIDENCE_RE = re.compile(
@@ -1321,6 +2113,15 @@ def describe_change(change: dict, lang: str = 'en') -> str:
         names = ", ".join(v.get('driver') or v.get('name', '?') for v in value)
         return (f"{label} → {names}（{len(value)} 辆）" if zh
                 else f"{label} → {names} ({len(value)} vehicle{'s' if len(value) != 1 else ''})")
+    if spec['type'] == 'goals':
+        return f"{label} → {goals_summary(value, lang)}"
+    if change['axis'] == 'priority_stops':
+        names = ", ".join(short_stop(v) for v in value)
+        if op == 'remove':
+            return f"取消优先 → {names}" if zh else f"Not priority → {names}"
+        if op == 'add':
+            return f"优先 → {names}" if zh else f"Priority → {names}"
+        return f"{label} → {names or ('无' if zh else 'none')}"
     if spec['type'] == 'enum':
         return f"{label} → {'Auto' if value == 'auto' else SOLVERS[value]['label']}"
     if spec['type'] == 'bool':
@@ -1361,6 +2162,7 @@ REJECT = {
     'no_onoff':      {'en': "{label}: you didn't say on or off", 'zh': "{label}：你没有说开还是关"},
     'slot':          {'en': "{label}: value slot mismatch (got {got}, need {need})",
                       'zh': "{label}：值的类型不对（收到 {got}，应为 {need}）"},
+    'not_a_stop':    {'en': "{label}: \"{v}\" is not one of your stops", 'zh': "{label}：「{v}」不在你的站点里"},
 }
 
 
@@ -1390,6 +2192,9 @@ def check_value(axis: str, op: str, value, lang: str = 'en'):
             return None, _r('out_of_range', lang, label=label, lo=spec['min'], hi=spec['max'], unit=unit)
     elif spec['type'] == 'text':
         value = str(value or '').strip()
+        if axis == 'depot':
+            # "depot in Anaheim CA" quoted whole: the address is what follows.
+            value = DEPOT_LEAD_RE.sub('', value).strip() or value
         if not value:
             return None, _r('empty', lang, label=label)
     elif spec['type'] == 'list':
@@ -1401,6 +2206,10 @@ def check_value(axis: str, op: str, value, lang: str = 'en'):
     elif spec['type'] == 'fleet':
         if not isinstance(value, list) or not value:
             return None, _r('empty', lang, label=label)
+    elif spec['type'] == 'goals':
+        if not isinstance(value, dict):
+            return None, _r('empty', lang, label=label)
+        value = normalize_goals(value)
     elif spec['type'] == 'bool':
         value = bool(value)
     elif spec['type'] == 'enum':
@@ -1574,6 +2383,339 @@ def outcome_recommend(topic: str, num_stops: int, num_vehicles: int, current: st
     }
 
 
+# ---- optimisation in plain language: goals, limits, disruptions -------------
+# The model classifies the situation and quotes the operator; everything said
+# back — weights, ranges, which truck takes which stop — is computed here.
+
+GOALS_TEXT = {
+    'updated':   {'en': "Optimization goals: {changes}. Weights now {weights}.",
+                  'zh': "优化目标：{changes}。现在的权重：{weights}。"},
+    'because':   {'en': " You said: “{evidence}”.", 'zh': "（依据你说的：「{evidence}」）"},
+    'eff_energy': {'en': " Energy prices every leg with the Model E energy model — speed, climbs and the weight "
+                         "still on board — so loaded trucks avoid costly climbs and fast highway stretches.",
+                   'zh': "电量目标用 Model E 能耗模型给每一段路定价——速度、爬坡和车上剩余的货重都算进去，"
+                         "所以满载时会避开费电的爬坡和高速路段。"},
+    'eff_time':  {'en': " Time prices every leg by its typical driving time, so faster roads win even when longer.",
+                  'zh': "时间目标按每段路的常规行驶时间定价，所以即使远一点，更快的路也会胜出。"},
+    'eff_distance': {'en': " Distance favours the fewest total miles.", 'zh': "距离目标偏向总里程最短。"},
+    'eff_balance': {'en': " Balance charges for the latest truck's finish time, so stops spread out and the whole "
+                          "fleet is back sooner.",
+                    'zh': "均衡目标会为最晚回来的那辆车计费，所以站点会分得更均匀，整个车队更早收工。"},
+    'balance_single': {'en': " Balance only matters with 2+ trucks; with one truck it counts as time.",
+                       'zh': "均衡只在 2 辆及以上时有意义；只有 1 辆车时它按时间目标算。"},
+    'reserve_on': {'en': " Battery reserve: every truck must finish with at least {pct}% left; stops that fit "
+                         "no truck are reported as unserved.",
+                   'zh': "电量保留：每辆车收工时至少剩 {pct}%；哪辆车都放不下的站点会标为无法配送。"},
+    'reserve_zero': {'en': " Battery limit on: no truck may plan more energy than its battery holds.",
+                     'zh': "电量上限已启用：任何车都不能规划超过电池容量的能耗。"},
+    'reserve_off': {'en': " Battery limit off: battery is reported, not enforced.",
+                    'zh': "电量上限已关闭：只报告电量，不强制约束。"},
+    'reserve_single': {'en': " With one truck the limit is checked and flagged, not enforced — it has to visit "
+                             "every stop.",
+                       'zh': "只有 1 辆车时只检查并提示，不强制——它必须跑完所有站点。"},
+    'nochange':  {'en': "Those goals are already set: {levels}. Weights {weights}.",
+                  'zh': "这些目标已经是这样了：{levels}。权重：{weights}。"},
+    'explain':   {'en': "Current goals: {levels} — weights {weights}. Every leg costs w_distance × (miles ÷ the "
+                        "average leg) + w_time × (minutes ÷ average) + w_energy × (kWh ÷ average); balance adds "
+                        "the latest truck's finish time. Levels map to off 0 · low 1 · medium 2 · high 4, scaled "
+                        "to 100%. You don't need to pick numbers — tell me about the day (\"battery is tight\", "
+                        "\"we're running late\") and I'll set them.",
+                  'zh': "当前目标：{levels}——权重 {weights}。每段路的代价 = w_距离 ×（里程 ÷ 平均每段）"
+                        "+ w_时间 ×（分钟 ÷ 平均）+ w_电量 ×（kWh ÷ 平均）；均衡再加上最晚那辆车的收工时间。"
+                        "档位对应：关 0 · 低 1 · 中 2 · 高 4，再换算成 100%。你不用自己定数字——"
+                        "告诉我今天的情况（「电量紧张」「今天赶时间」），我来设。"},
+    'no_evidence': {'en': "I couldn't tie that goal change to your words — what matters most today?",
+                    'zh': "我没法从你的话里确认要怎么改目标——今天最看重什么？"},
+    'reserve_range': {'en': "Battery reserve must be between 0 and {max}%", 'zh': "电量保留必须在 0 到 {max}% 之间"},
+    'reserve_no_number': {'en': "Battery reserve: I couldn't find {pct}% in your message",
+                          'zh': "电量保留：你的话里没有 {pct}%"},
+}
+
+LIMITS_TEXT.update({
+    'no_plan': {'en': " Run Optimize and I'll also check today's routes against it.",
+                'zh': "运行优化后，我还能帮你核对今天的路线跑不跑得下。"},
+})
+
+DISRUPT_TEXT = {
+    'no_plan':   {'en': "Run Optimize first — I simulate a breakdown on the current plan.",
+                  'zh': "请先运行优化——抛锚模拟是在当前方案上做的。"},
+    'which':     {'en': "Which truck broke down? The plan has {list}.", 'zh': "哪辆车抛锚了？当前方案里有：{list}。"},
+    'no_driver': {'en': "No truck in the current plan is driven by {name}. The plan has {list}.",
+                  'zh': "当前方案里没有 {name} 开的车。方案里有：{list}。"},
+    'no_truck':  {'en': "Vehicle {n} has no route in the current plan. The plan has {list}.",
+                  'zh': "当前方案里车辆 {n} 没有路线。方案里有：{list}。"},
+    'when':      {'en': "When did {veh} break down — after which stop (0 = leaving the depot), or how many "
+                        "minutes after dispatch?",
+                  'zh': "{veh} 是什么时候抛锚的——第几站之后（0 = 刚出仓库），还是出发后多少分钟？"},
+    'finished':  {'en': "{veh} only has {n} stop{s}; after stop {k} it is done for the day — nothing to re-plan.",
+                  'zh': "{veh} 只有 {n} 个站；送完第 {k} 站就收工了——不需要重新规划。"},
+    'bad_time':  {'en': "That time is outside the working day (0–{max} minutes).",
+                  'zh': "这个时间超出了一天的范围（0–{max} 分钟）。"},
+    'go':        {'en': "Simulating a breakdown: {veh} {when}{spare}. Re-planning the rest of the day…",
+                  'zh': "模拟抛锚：{veh} {when}{spare}。正在重新规划当天剩下的配送……"},
+    'after_k':   {'en': "after stop {k} of {n}", 'zh': "在第 {k}/{n} 站之后"},
+    'at_depot':  {'en': "leaving the depot", 'zh': "刚离开仓库时"},
+    'at_min':    {'en': "{m} minutes after dispatch", 'zh': "出发后 {m} 分钟"},
+    'spare':     {'en': ", with a spare truck from the depot", 'zh': "，并从仓库派一辆备用车"},
+    'spare_only': {'en': ", with a spare truck from the depot (the only truck in the plan)",
+                   'zh': "，并从仓库派一辆备用车（方案里只有这一辆车）"},
+}
+
+ACTION_TEXT = {
+    'resolve': {'en': "Re-solving with the current settings…", 'zh': "按当前设置重新求解……"},
+}
+
+LIMITS_WORD_RE = re.compile(r'\bpacks?\b|batter(?:y|ies)|\brange\b|how\s+far|payload|\bcargo\b|\blimits?\b|'
+                            r'kwh|电池|续航|载重|极限', re.I)
+PACKS_IN_TEXT_RE = re.compile(r'(\d+)\s*-?\s*(?:battery\s*)?packs?\b|(\d+)\s*(?:块|个)?\s*电池', re.I)
+LIMITS_FIELD_OF_AXIS = {'battery_packs': 'battery_packs', 'vehicle_weight_lbs': 'weight_lbs',
+                        'temperature_c': 'temperature_c'}
+
+ORDINAL_RE = re.compile(r'\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\b'
+                        r'|第', re.I)
+RESET_RE = re.compile(r'\breset\b|\bdefaults?\b|back\s+to\s+normal|start\s+over|重置|恢复|默认', re.I)
+DEPOT_WORD_RE = re.compile(r'depot|warehouse|before\s+(?:its|the|any)\s+first|leav|outset|仓库|刚出|还没', re.I)
+TIME_WORD_RE = re.compile(r'\b(?:min(?:ute)?s?|hours?|hrs?)\b|分钟|小时|钟头', re.I)
+SPARE_RE = re.compile(r'spare|backup|back-up|extra|another\s+(?:truck|van|vehicle)|replacement|备用|替补|再派', re.I)
+# A request to run the optimizer itself.
+RESOLVE_RE = re.compile(r'^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:re-?\s*)?(?:optimi[sz]e|solve|run|plan)'
+                        r'(?:\s+(?:it|this|that|again|now|please|for\s+me|the\s+routes?|the\s+plan|'
+                        r'the\s+optimi[sz](?:er|ation)))*\s*[?.!]*\s*$'
+                        r'|^\s*(?:重新|再)(?:优化|规划|计算|求解)(?:一(?:次|遍|下))?\s*[。!！]*\s*$', re.I)
+
+
+def _gt(key: str, lang: str, **kw) -> str:
+    return GOALS_TEXT[key].get(lang, GOALS_TEXT[key]['en']).format(**kw)
+
+
+def _dt(key: str, lang: str, **kw) -> str:
+    return DISRUPT_TEXT[key].get(lang, DISRUPT_TEXT[key]['en']).format(**kw)
+
+
+def _has_number(text: str) -> bool:
+    return bool(NUMERIC_EVIDENCE_RE.search(text or '') or ORDINAL_RE.search(text or ''))
+
+
+_NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
+_ORDINAL_WORDS = ['', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth']
+_ZH_DIGITS = '零一二三四五六七八九十'
+
+
+def number_stated(n: int, text: str) -> bool:
+    """Is this exact number written in the text — as digits, a word or an
+    ordinal? "A truck broke down" must not count as truck 1."""
+    n, text = int(n), str(text or '')
+    if re.search(rf'(?<!\d){n}(?!\d)', text):
+        return True
+    words = []
+    if 0 <= n <= 10:
+        words += [_NUMBER_WORDS[n], _ORDINAL_WORDS[n]] + ([_ZH_DIGITS[n]] if n <= 10 else [])
+    if n == 2:
+        words.append('两')
+    return any(w and (re.search(rf'\b{w}\b', text, re.I) if w.isascii() else w in text) for w in words)
+
+
+def _outcome(intent: str, message: str, source: str, **extra) -> dict:
+    out = {'status': 'ok', 'intent': intent, 'source': source, 'message': message,
+           'changes': [], 'pending': None, 'capabilities': None, 'rejected': [],
+           'advice': None, 'profiles': [], 'action': None, 'limits': None, 'goals_info': None}
+    out.update(extra)
+    return out
+
+
+def outcome_goals(raw, utterance: str, form_state: dict, source: str, lang: str = 'en') -> dict:
+    """Turn the model's reading of the situation into goal levels. The levels
+    are a closed enum, the motivating words must be in the message, and the
+    reply — weights and what each goal does — is written here."""
+    before = normalize_goals(form_state.get('goals'))
+    multi = int(form_state.get('vehicle_count') or 1) > 1
+    raw = raw if isinstance(raw, dict) else {}
+    info = {'before': before, 'after': before, 'weights_before': goal_weights(before),
+            'weights_after': goal_weights(before), 'evidence': None}
+    wants_change = (raw.get('reset') or raw.get('battery_reserve_pct') is not None
+                    or any(raw.get(k) for k in GOAL_KEYS))
+    if not wants_change:
+        return _outcome('goals', _gt('explain', lang, levels=goals_summary(before, lang),
+                                     weights=weights_summary(before, lang)), source, goals_info=info)
+
+    evidence = _strip_edges(raw.get('evidence'))
+    if raw.get('reset') and (not evidence or _norm(evidence) not in _norm(utterance)):
+        m = RESET_RE.search(utterance)     # "reset the goals" says so itself
+        evidence = m.group(0) if m else evidence
+    if not evidence or _norm(evidence) not in _norm(utterance):
+        return outcome_ask(_gt('no_evidence', lang), None, source, lang=lang)
+
+    after = dict(DEFAULT_GOALS) if raw.get('reset') else dict(before)
+    for k in GOAL_KEYS:
+        lvl = raw.get(k)
+        if lvl in GOAL_LEVELS:
+            after[k] = lvl
+        elif lvl in ('raise', 'lower'):
+            i = GOAL_LEVELS.index(after[k]) + (1 if lvl == 'raise' else -1)
+            after[k] = GOAL_LEVELS[max(0, min(len(GOAL_LEVELS) - 1, i))]
+
+    rejected = []
+    r = raw.get('battery_reserve_pct')
+    if r is not None and not raw.get('reset'):
+        r = int(round(float(r)))
+        if r < 0:
+            after['battery_reserve_pct'] = None
+        elif r > MAX_RESERVE_PCT:
+            rejected.append(_gt('reserve_range', lang, max=MAX_RESERVE_PCT))
+        elif r > 0 and not re.search(rf'(?<!\d){r}(?!\d)', utterance):
+            rejected.append(_gt('reserve_no_number', lang, pct=r))
+        else:
+            after['battery_reserve_pct'] = r
+    after = normalize_goals(after)
+
+    if after == before:
+        out = _outcome('goals', _gt('nochange', lang, levels=goals_summary(before, lang),
+                                    weights=weights_summary(before, lang)), source, goals_info=info)
+        out['rejected'] = rejected
+        return out
+
+    key = 'zh' if lang == 'zh' else 'en'
+    moved = [f"{GOAL_LABEL[k][key]} {LEVEL_LABEL[before[k]][key]} → {LEVEL_LABEL[after[k]][key]}"
+             for k in GOAL_KEYS if after[k] != before[k]]
+    if after['battery_reserve_pct'] != before['battery_reserve_pct']:
+        fmt = lambda v: ('关' if key == 'zh' else 'off') if v is None else f"{v}%"
+        moved.append(f"{'电量保留' if key == 'zh' else 'Battery reserve'} "
+                     f"{fmt(before['battery_reserve_pct'])} → {fmt(after['battery_reserve_pct'])}")
+    sep = '；' if lang == 'zh' else '; '
+    msg = _gt('updated', lang, changes=sep.join(moved), weights=weights_summary(after, lang))
+    for k in GOAL_KEYS:
+        if GOAL_LEVEL_WEIGHT[after[k]] > GOAL_LEVEL_WEIGHT[before[k]]:
+            msg += _gt('balance_single' if k == 'balance' and not multi else f'eff_{k}', lang)
+    if after['battery_reserve_pct'] != before['battery_reserve_pct']:
+        r = after['battery_reserve_pct']
+        msg += (_gt('reserve_off', lang) if r is None else _gt('reserve_zero', lang) if r == 0
+                else _gt('reserve_on', lang, pct=r))
+        if r is not None and not multi:
+            msg += _gt('reserve_single', lang)
+    msg += _gt('because', lang, evidence=evidence)
+
+    change = make_change('goals', 'set', after, evidence, lang)
+    info.update(after=after, weights_after=goal_weights(after), evidence=evidence)
+    out = _outcome('goals', msg, source, changes=[change], goals_info=info)
+    out['rejected'] = rejected
+    return out
+
+
+def outcome_limits(raw, utterance: str, form_state: dict, source: str, lang: str = 'en') -> dict:
+    """What a truck can do, at the numbers the operator stated or the form's own."""
+    raw = raw if isinstance(raw, dict) else {}
+    rejected = []
+
+    def evidenced(field):
+        ev = _strip_edges((raw.get('evidence_by_field') or {}).get(field) or raw.get('evidence'))
+        return bool(ev) and _norm(ev) in _norm(utterance) and _has_number(ev)
+
+    def stated(field, axis):
+        v = raw.get(field)
+        if v is None:
+            return None
+        if not evidenced(field):
+            rejected.append(_r('no_number', lang, label=axis_label(axis, lang)))
+            return None
+        val, reason = check_value(axis, 'set', v, lang)
+        if reason:
+            rejected.append(reason)
+            return None
+        return val
+
+    packs = stated('battery_packs', 'battery_packs')
+    weight = stated('weight_lbs', 'vehicle_weight_lbs')
+    temp = stated('temperature_c', 'temperature_c')
+    packs = packs if packs is not None else int(form_state.get('battery_packs') or DEFAULT_PACKS)
+    temp = temp if temp is not None else float(form_state.get('temperature_c', 20))
+    goals = normalize_goals(form_state.get('goals'))
+    data = truck_limits(packs, temp, bool(form_state.get('has_climate_control', True)), weight,
+                        goals['battery_reserve_pct'], form_state.get('plan'), lang)
+    msg = data['message']
+    if not data['plan_check']:
+        msg += _lt('no_plan', lang)
+    out = _outcome('limits', msg, source, limits=data)
+    out['rejected'] = rejected
+    return out
+
+
+def outcome_disruption(raw, utterance: str, form_state: dict, source: str, lang: str = 'en') -> dict:
+    """Validate a breakdown against the current plan and hand the client an
+    action to run (/api/replan). Never guesses the truck or the moment."""
+    plan_vehicles = ((form_state.get('plan') or {}).get('vehicles')) or []
+    if not plan_vehicles:
+        return _outcome('disruption', _dt('no_plan', lang), source)
+    raw = raw if isinstance(raw, dict) else {}
+    ev = _strip_edges(raw.get('evidence'))
+    ev_ok = bool(ev) and _norm(ev) in _norm(utterance)
+
+    def label(v):
+        name = v.get('name') or f"Vehicle {v.get('number')}"
+        return f"{name} ({v['driver']})" if v.get('driver') else name
+
+    listing = ", ".join(label(v) for v in plan_vehicles)
+    veh = None
+    driver, number = raw.get('driver'), raw.get('vehicle_number')
+    driver = re.sub(r"['’]s$", '', str(driver).strip()) if driver else None       # "Wang's" → "Wang"
+    if driver and name_in(driver, utterance):
+        veh = next((v for v in plan_vehicles
+                    if v.get('driver') and profile_key(v['driver']) == profile_key(driver)), None)
+    elif number is not None and number_stated(number, utterance):
+        veh = next((v for v in plan_vehicles if int(v.get('number', 0)) == int(number)), None)
+        if veh is None:
+            return outcome_ask(_dt('no_truck', lang, n=number, list=listing), None, source, lang=lang)
+    if veh is None:
+        # Nothing usable from the model ("Wang's truck" as the name, or a
+        # guessed number), but one driver on today's plan is named in the message.
+        named = [v for v in plan_vehicles if v.get('driver') and name_in(v['driver'], utterance)]
+        if len(named) == 1:
+            veh = named[0]
+        elif driver and name_in(driver, utterance):
+            return outcome_ask(_dt('no_driver', lang, name=driver, list=listing), None, source, lang=lang)
+        elif len(plan_vehicles) == 1:
+            veh = plan_vehicles[0]
+        else:
+            return outcome_ask(_dt('which', lang, list=listing), None, source, lang=lang)
+
+    k, minute = raw.get('after_stop'), raw.get('at_minute')
+    if k is not None and minute is not None:
+        k, minute = (None, minute) if TIME_WORD_RE.search(utterance) else (k, None)
+    # Stop 0 is "it never got going": it needs depot / before-the-first-stop
+    # words, or "an hour in" would come back as stop 0.
+    if k is not None and int(k) == 0 and not (DEPOT_WORD_RE.search(utterance) or re.search(r'\b0\b', utterance)):
+        k = None
+    if k is not None and int(k) > 0 and not number_stated(k, utterance):
+        k = None
+    if minute is not None and not (ev_ok and _has_number(ev)):
+        minute = None
+    if k is None and minute is None:
+        return outcome_ask(_dt('when', lang, veh=label(veh)), None, source, lang=lang)
+
+    stops = int(veh.get('stops') or 0)
+    if k is not None:
+        k, minute = int(k), None
+        if k < 0:
+            return outcome_ask(_dt('when', lang, veh=label(veh)), None, source, lang=lang)
+        if k >= stops:
+            return _outcome('disruption', _dt('finished', lang, veh=label(veh), n=stops,
+                                              s='' if stops == 1 else 's', k=k), source)
+        when = _dt('after_k', lang, k=k, n=stops) if k else _dt('at_depot', lang)
+    else:
+        minute = int(minute)
+        if not 0 <= minute <= 24 * 60:
+            return outcome_ask(_dt('bad_time', lang, max=24 * 60), None, source, lang=lang)
+        when = _dt('at_min', lang, m=minute)
+
+    only_truck = len(plan_vehicles) == 1
+    spare = only_truck or (bool(raw.get('spare_truck')) and bool(SPARE_RE.search(utterance)))
+    action = {'type': 'breakdown', 'vehicle_index': int(veh.get('vehicle_index', int(veh.get('number', 1)) - 1)),
+              'vehicle_label': label(veh), 'after_stop': k, 'at_minute': minute,
+              'spare_truck': spare, 'lang': lang}
+    spare_text = _dt('spare_only', lang) if only_truck else _dt('spare', lang) if spare else ''
+    return _outcome('disruption', _dt('go', lang, veh=label(veh), when=when, spare=spare_text), source,
+                    action=action)
+
+
 # ---- 1. lexicon fast path ----------------------------------------------------
 # Known phrasings for the numeric / boolean axes. A hit skips the model entirely.
 # Free-text axes (depot, stops) are never fast-pathed: they always go through
@@ -1665,6 +2807,16 @@ QUESTION_RE = re.compile(r'[?？]\s*$|^\s*(?:what|which|how|why|should|can|could
 # a regex table and always go to the model.
 LEXICON_MAX_LEN = 60
 
+# Talk about goals, limits or a breakdown always goes to the model. Without
+# this, "truck 2 broke down after 2 stops" sets the fleet to 2 trucks and
+# "leave the battery at 20%" asks for 20 battery packs.
+NOT_A_FORM_VALUE_RE = re.compile(
+    r'%|percent|reserve|\brange\b|how\s+far|\blimits?\b|capacity|payload|\bbroke|break\s*down|crash|accident|'
+    r'collision|stranded|\bstuck\b|flat\s+tyre|flat\s+tire|\btow(?:ed|ing)?\b|\bgoals?\b|priorit|urgent|\bfirst\b|'
+    r'\bweights\b|optimi[sz]e\s+for|minimi[sz]|maximi[sz]|\bsav(?:e|ing)\s+(?:energy|battery|power|time)|faster|'
+    r'fastest|\bquick|shortest|balanc|\bfair|\btight\b|\blate\b|\bhurry|'
+    r'故障|抛锚|事故|撞|坏了|续航|极限|载重|省电|最快|最短|均衡|优先|权重|目标|保留', re.I)
+
 
 # "one more truck" / "再加一辆车": a +1 / -1 move resolved against the form.
 RELATIVE_LEXICON = [
@@ -1736,7 +2888,14 @@ def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
                 return outcome_ask(reason + ('。' if lang == 'zh' else '.'), axis, source='lexicon', lang=lang)
             return outcome_apply([make_change(axis, 'set', value, m.group(0).strip(), lang)], source='lexicon', lang=lang)
 
+    # "re-optimize", "run it again": the client runs the optimizer.
+    if RESOLVE_RE.match(utterance):
+        return _outcome('apply', ACTION_TEXT['resolve'].get(lang, ACTION_TEXT['resolve']['en']), 'lexicon',
+                        action={'type': 'resolve', 'lang': lang})
+
     is_question = bool(QUESTION_RE.search(utterance))
+    if NOT_A_FORM_VALUE_RE.search(utterance):
+        return None
 
     # "Wang runs 8 packs now" must update the stored profile, not the form.
     # The regex table cannot tell those apart, so any saved driver's name sends
@@ -1792,10 +2951,13 @@ def lexicon_fast_path(utterance: str, pending, form_state: dict = None):
 # check null coupling instead of guessing what a string means.
 
 _NULLABLE_STR = {"type": ["string", "null"]}
+# "raise" / "lower" nudge a goal one level from where it is now.
+_GOAL_LEVEL = {"anyOf": [{"type": "string", "enum": list(GOAL_LEVELS) + ["raise", "lower"]}, {"type": "null"}]}
 
 # The axes the model may name. 'fleet' is left out: only a driver recall sets
 # it, and offering it lets the model emit a fleet change that is then rejected.
-MODEL_AXES = [a for a in AXES if a != 'fleet']
+# 'goals' likewise: the model fills `goal_update`, and code builds the change.
+MODEL_AXES = [a for a in AXES if a not in ('fleet', 'goals')]
 
 # One step = one action. A message usually has one; "delete Han, then list all
 # drivers" has two, and run_steps executes them in order.
@@ -1853,11 +3015,47 @@ STEP_SCHEMA = {
             },
             "required": ["stops", "vehicles", "need_optimal", "evidence"],
         }, {"type": "null"}]},
+        "goal_update": {"anyOf": [{
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                **{k: _GOAL_LEVEL for k in GOAL_KEYS},
+                "battery_reserve_pct": {"type": ["number", "null"]},
+                "reset": {"type": "boolean"},
+                "evidence": {"type": "string"},
+            },
+            "required": list(GOAL_KEYS) + ["battery_reserve_pct", "reset", "evidence"],
+        }, {"type": "null"}]},
+        "limits_query": {"anyOf": [{
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "battery_packs": {"type": ["integer", "null"]},
+                "weight_lbs": {"type": ["integer", "null"]},
+                "temperature_c": {"type": ["number", "null"]},
+                "evidence": {"type": "string"},
+            },
+            "required": ["battery_packs", "weight_lbs", "temperature_c", "evidence"],
+        }, {"type": "null"}]},
+        "disruption": {"anyOf": [{
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "vehicle_number": {"type": ["integer", "null"]},
+                "driver": _NULLABLE_STR,
+                "after_stop": {"type": ["integer", "null"]},
+                "at_minute": {"type": ["integer", "null"]},
+                "spare_truck": {"type": "boolean"},
+                "evidence": {"type": "string"},
+            },
+            "required": ["vehicle_number", "driver", "after_stop", "at_minute", "spare_truck", "evidence"],
+        }, {"type": "null"}]},
         "message": {"type": "string"},
     },
     "required": ["intent", "changes", "question", "question_axis", "ambiguous_term",
                  "advice_topic", "advice_about", "advice_scenario",
-                 "memory_op", "memory_profiles", "memory_names", "message"],
+                 "memory_op", "memory_profiles", "memory_names",
+                 "goal_update", "limits_query", "disruption", "message"],
 }
 
 EXTRACTION_SCHEMA = {
@@ -1874,7 +3072,7 @@ You never change the form yourself. You only EXTRACT what the operator asked for
 STEPS: return `steps`, normally exactly ONE. Use several steps only when the operator asks for separate actions in sequence ("delete Han and Linus, then list all drivers", "save driver Wang and load him for today", "use 3 trucks, then tell me which solver to use"). One step per action, in the order asked; code runs them in that order, so a later step sees the result of an earlier one. Never split a single action: several form values in one sentence ("2 trucks with 6 packs", "set temperature to 28 and use 3 trucks") are ONE "apply" step with several `changes`, and saving or deleting several drivers is ONE "memory" step listing all of them. Each step fills every field below on its own, with its own `evidence` and `message`. Resolve pronouns to names ("load him" → the name).
 
 INTENTS (each step has exactly one):
-- "apply": the operator asked to change one or more form fields. List every requested change in `changes`, in the order mentioned, one entry per axis.
+- "apply": the operator asked to change one or more form fields. List every requested change in `changes`, in the order mentioned, one entry per axis. A situation or a priority ("we're late", "battery is tight", "be fair to the drivers") is never "apply" — that is "goals".
 - "ask": the request is ambiguous or incomplete (a place name that exists in several states or countries, a number whose unit or target field is unclear, a missing value). Put the clarifying question in `question`, name the field in `question_axis` when there is one, copy the ambiguous word(s) into `ambiguous_term`, and leave `changes` empty.
 - "confirm": ONLY when a PENDING QUESTION is listed below AND the message is nothing but a yes/no answer to it. If there is no pending question, never use this intent.
 - "recommend": the operator is asking WHICH SOLVER / ALGORITHM to use, why one is better, why not always use the optimal one, or which one is active. This includes questions about how long a solver takes, how many stops it can handle, or whether one is fast/good enough — route them here rather than declining. Set `advice_topic`: "which" (what should I use / can solver X handle this), "why" (why not always the exact one / how slow is it / explain the tradeoff), "current" (what am I running now). Do NOT answer with runtimes, limits or a pick of your own — code computes all of that and writes the reply. No changes.
@@ -1884,7 +3082,17 @@ INTENTS (each step has exactly one):
   * "forget" — delete saved drivers the operator NAMES ("forget Wang", "delete driver Li"). Put the names in `memory_names` exactly as written. "delete everything", "clear all" or "remove all" with no driver named are about the STOPS (axis addresses), never memory.
   * "list" — show who is saved ("which drivers do you know?", "存了哪些司机"). Leave `memory_names` null.
   A message that names a driver ("driver Wang", "司机老王", or a name listed under SAVED DRIVERS) is memory. Changing the count, packs or weight of the CURRENT vehicles without naming a driver is intent "apply", not memory. Licence plates and vehicle names are not tracked: leave them out.
-- "out_of_scope": anything the form cannot do (weather, traffic, arrival times, running the optimisation, reading results, resetting the whole form, small talk, unrelated questions). No changes. Say briefly what you cannot do.
+- "goals": the operator describes their day, a constraint or what matters ("battery is tight today", "we're running late", "drivers say the routes are unfair", "it's freezing", "save electricity", "keep 20% battery in every truck"), or asks how the goals / weights work. They will rarely name weights — YOU choose which goals move, and code turns your levels into numbers. Fill `goal_update`: for each goal give "off" | "low" | "medium" | "high", or "raise" / "lower" to nudge it one level from CURRENT FORM STATE goals, and null to leave it as it is. Guide:
+  * battery tight, small battery (3 packs), cold or very hot weather, hills, long routes, save energy / electricity / charging cost → energy "high"; distance "low" if distance is currently "high"
+  * running late, urgent, customers waiting, finish sooner, overtime costs → time "high", and balance "medium" when there are 2+ vehicles
+  * workloads uneven, unfair routes, everyone back at the same time, one driver doing everything → balance "high"
+  * fewest miles, tyre wear, mileage cost → distance "high"
+  * "back to normal" / "reset the goals" → reset true, every level null
+  Change only the goals the situation calls for, and never set a goal to "off" unless the operator says it does not matter — to shift the emphasis, lower it to "low". Apply every cue in the message: "battery is tight, keep 20% in every truck" raises energy AND sets the reserve; quote the whole span that covers them as `evidence`.
+  `battery_reserve_pct`: % of each truck's battery that must be left at the end of its route — "keep 20% in reserve" → 20; "make sure no truck runs out" / "never run flat" → 0; "stop enforcing the battery limit" → -1; otherwise null. `evidence`: the exact words of the message that motivated the change. A question about how goals or weights work, or what they are now, is "goals" with `goal_update` null. Code writes the reply.
+- "limits": a question about what a truck can do — battery capacity, range, how far it gets, payload, max weight, how many packs a route needs ("what are the limits of a truck with 3 battery packs?", "how far can a 5-pack truck go when it's -5 C?", "can 4 packs handle today's routes?"). Fill `limits_query` with only the numbers the operator stated (packs, gross weight in lbs, temperature in °C; convert °F) and an exact `evidence` substring; null where not stated. Do NOT answer with numbers yourself — code computes the answer. No changes.
+- "disruption": a truck breaks down, crashes, has an accident, a flat tyre or gets stuck — simulate it on the current plan ("truck 2 broke down after its second stop", "simulate a crash for Wang's truck an hour in", "vehicle 1 had an accident leaving the depot, send a spare"). Fill `disruption`: `vehicle_number` (1-based: "truck 2", "the second van"), or `driver` (the driver's name exactly as written), `after_stop` (stops it completed first: "after its 2nd stop" → 2, "leaving the depot" / "before its first stop" → 0) OR `at_minute` (minutes after dispatch: "an hour in" → 60, "after 90 minutes" → 90), `spare_truck` true only if they ask for a spare / backup / extra truck, and an exact `evidence` substring. Use at_minute for any time ("an hour in", "at 90 minutes") and after_stop for a stop count — never both. Leave anything not said null — never guess the truck or the stop; with the truck or the moment missing it is still "disruption" (code asks). No changes.
+- "out_of_scope": anything the form cannot do (weather forecasts, live traffic, delivery time windows, reading individual results, small talk, unrelated questions). Resetting or clearing the whole form ("reset the form", "start over") is out_of_scope too — only resetting the GOALS is "goals". No changes. Say briefly what you cannot do.
 
 AXES (the only fields that exist):
 - depot (text): the depot / warehouse / start address
@@ -1895,6 +3103,7 @@ AXES (the only fields that exist):
 - temperature_c (integer −10 to 40; convert °F to °C)
 - unload_time_min (integer 5–120; minutes per stop)
 - has_climate_control (boolean; AC / HVAC on or off)
+- priority_stops (list of text): stops to serve before the others on their truck ("deliver to Brea first", "Stanton is urgent", "Cerritos is no longer a priority"). op "add" / "remove" / "set"; the values are the stop names as the operator wrote them. Only when the message names the stop — being late or in a hurry without naming a stop is "goals", never a priority stop.
 - solver — one of: "auto" (let the app decide), "held_karp" (the exact / optimal / proven / guaranteed solver), "2opt" (fast approximation), "nearest_neighbor" (greedy, like Google Maps), "ortools_vrp" (multi-vehicle). "force the exact solver", "I want the guaranteed optimum" → held_karp, never auto. an instruction naming a solver ("switch to 2-opt", "use nearest neighbor", "force the exact solver", "go back to auto") is intent "apply" on this axis. A question ABOUT solvers ("which one should I use", "why not the optimal one") is intent "recommend".
 
 VALUE RULES:
@@ -1904,9 +3113,10 @@ VALUE RULES:
 - `op` is "set" for every axis except addresses, which also accepts "add" and "remove". Resolve relative requests ("one more truck", "5 degrees warmer") against CURRENT FORM STATE and emit the resulting absolute number with op "set".
 - A plain statement of a value ("depot is X", "仓库设在 X", "temperature 30") is intent "apply", even when it already equals CURRENT FORM STATE — emit the change anyway rather than asking whether they want it.
 - An on-topic message with no usable value ("it's really hot today", "the trucks feel heavy") is intent "ask": ask for the number. Reserve "out_of_scope" for things this form genuinely cannot express.
+- Leave `goal_update`, `limits_query` and `disruption` null except for their own intents ("goals", "limits", "disruption").
 - Leave `memory_op`, `memory_profiles` and `memory_names` null for every intent except "memory". For intent "memory", `memory_op` is never null and `question` is null: do the operation, do not echo the operator's question back.
 - For intent "recommend": whenever the message names a size at all — "22 stops and 3 trucks", "on 25 stops", "for 12 stops" — fill `advice_scenario` with those numbers plus an exact `evidence` substring, even if it reads as a hypothetical. A question about how long a solver takes or how big it scales is `advice_topic` "why"; leave the numbers in `advice_scenario`. If the message names one solver ("should I use Held-Karp?", "is 2-opt good enough?", "Held-Karp 能跑 25 个站吗"), put that solver's key in `advice_about`. Chinese counts too: "25 个站" is 25 stops, "3 辆车" is 3 vehicles. set `need_optimal` true only if they said they require a guaranteed/proven optimum. Otherwise leave `advice_scenario` null and the current form state is used. Leave `advice_topic` and `advice_scenario` null for every other intent.
-- `message`: one short, friendly sentence in the operator's language. For "ask" it must equal `question`. For "recommend" it is ignored — code writes the answer.
+- `message`: one short, friendly sentence in the operator's language. For "ask" it must equal `question`. For "recommend", "goals", "limits" and "disruption" it is ignored — code writes the answer.
 
 CURRENT FORM STATE:
 {form_state}
@@ -1950,21 +3160,22 @@ def call_extraction(utterance: str, history: list, form_state: dict, pending) ->
             messages.append({"role": h['role'], "content": str(h['content'])})
     messages.append({"role": "user", "content": utterance})
 
-    response = requests.post(
-        OPENAI_CHAT_URL,
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": OPENAI_MODEL,
-            "messages": messages,
-            "temperature": 0,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "route_chat_extraction", "strict": True,
-                                "schema": extraction_schema_for(pending)},
-            },
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "route_chat_extraction", "strict": True,
+                            "schema": extraction_schema_for(pending)},
         },
-        timeout=30,
-    )
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    response = requests.post(OPENAI_CHAT_URL, headers=headers, json=body, timeout=60)
+    # Reasoning models (gpt-5 and later) only accept the default temperature.
+    if response.status_code == 400 and 'temperature' in response.text:
+        body.pop('temperature')
+        response = requests.post(OPENAI_CHAT_URL, headers=headers, json=body, timeout=60)
     if response.status_code != 200:
         raise RuntimeError(f"OpenAI {response.status_code}: {response.text[:300]}")
 
@@ -1998,7 +3209,9 @@ def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: st
         # but only when the operator's words say so. Filling in the current
         # list turns it into an ordinary change the gates can see.
         current = [a for a in (form_state.get('addresses') or []) if str(a).strip()]
-        if (axis == 'addresses' and op in ('remove', 'set') and current
+        if axis == 'priority_stops':
+            current = list(form_state.get('priority_stops') or [])
+        if (axis in ('addresses', 'priority_stops') and op in ('remove', 'set') and current
                 and CLEAR_ALL_RE.search(_strip_edges(raw.get('evidence')))):
             raw = dict(raw, value_list=list(current))
             op = 'remove'
@@ -2029,6 +3242,9 @@ def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: st
     if spec['type'] == 'list' and filled == ['text']:
         # one stop written into the text slot: same information, wrong container
         slots['list'], slots['text'], filled = [slots['text']], None, ['list']
+    if spec['type'] == 'number' and filled == ['text'] and re.fullmatch(r'\s*-?\d+(?:\.\d+)?\s*', str(slots['text'])):
+        # "6" for battery packs: a number in the text slot, same information
+        slots['number'], slots['text'], filled = float(slots['text']), None, ['number']
     # An enum is carried as a string; check_value below maps it onto the choices.
     slot = 'text' if spec['type'] == 'enum' else spec['type']
     if slot not in filled:
@@ -2051,8 +3267,56 @@ def validate_change(raw: dict, utterance: str, form_state: dict = None, lang: st
         return None, _r('no_number', lang, label=label)
     if spec['type'] == 'bool' and not BOOL_EVIDENCE_RE.search(evidence):
         return None, _r('no_onoff', lang, label=label)
+    # "get everyone back sooner" is a goal, not a request for nearest neighbor.
+    if axis == 'solver' and not SOLVER_EVIDENCE_RE.search(evidence):
+        return None, _r('no_evidence', lang, label=label)
+
+    # A priority stop has to be a stop already on the form; store it as written there.
+    if axis == 'priority_stops':
+        pool = (form_state.get('priority_stops') if op == 'remove' else form_state.get('addresses')) or []
+        matched = []
+        for v in value:
+            hit = next((a for a in pool if v.lower() in a.lower() or a.lower() in v.lower()), None)
+            if not hit:
+                # "deliver to Brea first" names the stop by its city.
+                named = [a for a in pool if any(
+                    len(part) >= 3 and re.search(r'[^\W\d_]', part) and not _STATE_ZIP.match(part)
+                    and re.search(rf'(?<!\w){re.escape(part)}(?!\w)', v, re.I)
+                    for part in (x.strip() for x in a.split(',')))]
+                hit = named[0] if len(named) == 1 else None
+            if not hit:
+                return None, _r('not_a_stop', lang, label=label, v=v)
+            # The operator has to name the stop: "we're running late" must not
+            # turn into a priority stop the model picked.
+            parts = [v] + [x.strip() for x in hit.split(',') if len(x.strip()) >= 3 and not _STATE_ZIP.match(x.strip())]
+            if not any(_loose(x) and _loose(x) in _loose(utterance) for x in parts):
+                return None, _r('no_evidence', lang, label=label)
+            if hit not in matched:
+                matched.append(hit)
+        value = matched
 
     return make_change(axis, op, value, evidence, lang), None
+
+
+_STATE_ZIP = re.compile(r'^(?:[A-Z]{2}(?:\s+\d{5}(?:-\d{4})?)?|USA|United States)$')
+
+
+def _loose(s: str) -> str:
+    """Letters and digits only: "1400 S Douglass Rd, Anaheim" ~ "1400 s douglass rd anaheim"."""
+    return re.sub(r'[\W_]+', '', str(s)).lower()
+
+
+def restates_unwritten_place(change: dict, form_state: dict, utterance: str) -> bool:
+    if change['axis'] == 'depot':
+        current, values = form_state.get('depot'), [change['value']]
+    elif change['axis'] == 'addresses' and change['op'] == 'set':
+        current, values = form_state.get('addresses'), change['value']
+        values = values if list(values) == list(current or []) else None
+    else:
+        return False
+    if values is None or (change['axis'] == 'depot' and change['value'] != current):
+        return False
+    return not any(_loose(v) in _loose(utterance) for v in values)
 
 
 def ambiguous_place_in(change: dict):
@@ -2122,6 +3386,33 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
                             'need_optimal': bool(raw_scen.get('need_optimal'))}
         topic = topic or 'which'
 
+    goal_update = raw.get('goal_update') if isinstance(raw.get('goal_update'), dict) else None
+    limits_query = raw.get('limits_query') if isinstance(raw.get('limits_query'), dict) else None
+    disruption = raw.get('disruption') if isinstance(raw.get('disruption'), dict) else None
+    # "can 4 packs handle today's routes?" is about the truck, not the solver.
+    # The model files it under "recommend" often enough that the words decide.
+    if (intent == 'recommend' and LIMITS_WORD_RE.search(utterance)
+            and not SOLVER_EVIDENCE_RE.search(utterance) and not re.search(_SOLVER_WORD, utterance, re.I)):
+        intent = 'limits'
+        m = PACKS_IN_TEXT_RE.search(utterance)
+        limits_query = ({'battery_packs': float(m.group(1) or m.group(2)), 'evidence': m.group(0)}
+                        if m else None)
+    if intent == 'limits':
+        # "how far can a 5-pack truck go at -5 C?" often comes back with the
+        # numbers as form changes: same information, wrong container. They are
+        # a hypothetical truck, never applied to the form.
+        limits_query = dict(limits_query or {})
+        for c in raw.get('changes') or []:
+            field = LIMITS_FIELD_OF_AXIS.get((c or {}).get('axis')) if isinstance(c, dict) else None
+            val = c.get('value_number') if field and c.get('value_number') is not None else (c or {}).get('value_text')
+            if not field or val is None or limits_query.get(field) is not None:
+                continue
+            try:
+                limits_query[field] = float(val)
+            except (TypeError, ValueError):
+                continue
+            limits_query.setdefault('evidence_by_field', {})[field] = c.get('evidence')
+
     changes, rejected = [], []
     if intent in ('apply', 'confirm'):
         for c in raw.get('changes') or []:
@@ -2140,7 +3431,23 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
                 continue
             seen_evidence.add(ev)
             kept.append(c)
-        changes = kept
+        # An address "change" that is just the form's current value, which the
+        # operator never wrote ("reset the form" → depot = the current depot),
+        # is padding too.
+        changes = [c for c in kept if not restates_unwritten_place(c, form_state, utterance)]
+
+    # "I need a guaranteed optimal route for 12 stops" names a problem size,
+    # so it asks what fits that size; it does not pin the solver on this form.
+    if intent == 'apply' and changes and all(c['axis'] == 'solver' for c in changes):
+        m_s, m_v = SIZE_STOPS_RE.search(utterance), SIZE_VEH_RE.search(utterance)
+        n_s = int(m_s.group(1)) if m_s else None
+        n_v = int(m_v.group(1)) if m_v else None
+        if (n_s is not None and n_s != len(form_state.get('addresses') or [])) or \
+                (n_v is not None and n_v != int(form_state.get('vehicle_count') or 1)):
+            intent, topic = 'recommend', 'which'
+            about = changes[0]['value'] if changes[0]['value'] in SOLVERS else None
+            scenario = {'stops': n_s, 'vehicles': n_v, 'need_optimal': bool(NEED_OPTIMAL_RE.search(utterance))}
+            changes = []
 
     # Ambiguity flag / term: an ambiguous extraction may never be applied.
     # The model may raise the flag; the place check below raises it regardless.
@@ -2170,7 +3477,7 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
         # The model labelled a plain instruction as a confirmation. The changes
         # passed validation, so honour them instead of dropping them.
         intent = 'apply'
-    if intent in ('confirm', 'out_of_scope', 'recommend', 'memory'):
+    if intent in ('confirm', 'out_of_scope', 'recommend', 'memory', 'goals', 'limits', 'disruption'):
         changes, question = [], None
     if intent == 'out_of_scope' and not message:
         message = "这个我帮不了。" if lang == 'zh' else "I can't help with that."
@@ -2179,7 +3486,8 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
             'question': question, 'question_axis': question_axis, 'message': message,
             'advice_topic': topic, 'advice_scenario': scenario, 'advice_about': about,
             'memory_op': mem_op, 'memory_profiles': mem_profiles, 'memory_names': mem_names,
-            'memory_names_refused': names_refused, 'utterance': utterance}
+            'memory_names_refused': names_refused, 'utterance': utterance,
+            'goal_update': goal_update, 'limits_query': limits_query, 'disruption': disruption}
 
 
 def _single_rejected_axis(raw: dict):
@@ -2212,6 +3520,12 @@ def route_outcome(verdict: dict, pending, source: str, form_state: dict = None) 
                else do_recall(names if op == 'recall' else [], source, lang))
         out['rejected'] = refused + out['rejected']
         return out
+    if intent == 'goals':
+        return outcome_goals(verdict.get('goal_update'), verdict.get('utterance', ''), form_state, source, lang)
+    if intent == 'limits':
+        return outcome_limits(verdict.get('limits_query'), verdict.get('utterance', ''), form_state, source, lang)
+    if intent == 'disruption':
+        return outcome_disruption(verdict.get('disruption'), verdict.get('utterance', ''), form_state, source, lang)
     if intent == 'recommend':
         scen = verdict.get('advice_scenario') or {}
         stops = scen.get('stops')
@@ -2251,6 +3565,15 @@ def advance_form_state(state: dict, changes: list) -> dict:
             else:
                 current = list(value)
             state['addresses'] = current
+        elif axis == 'priority_stops':
+            current = list(state.get('priority_stops') or [])
+            if op == 'add':
+                current += [v for v in value if v not in current]
+            elif op == 'remove':
+                current = [a for a in current if a not in value]
+            else:
+                current = list(value)
+            state['priority_stops'] = current
         elif axis == 'fleet':
             state['fleet'] = value
             state['vehicle_count'] = len(value)
@@ -2294,7 +3617,9 @@ def run_steps(raw_steps: list, utterance: str, pending, source: str, form_state:
             out = outcome_hold(verdict['changes'], source, verdict.get('lang', 'en'))
         else:
             out = route_outcome(verdict, pending, source, state)
-        moved_form |= out['intent'] == 'apply' and bool(out['changes'])
+            if out['intent'] == 'goals' and out['changes'] and moved_form and ONE_CHANGE_PER_TURN:
+                out = outcome_hold(out['changes'], source, verdict.get('lang', 'en'))
+        moved_form |= out['intent'] in ('apply', 'goals') and bool(out['changes'])
         state = advance_form_state(state, out['changes'])
         outcomes.append(out)
         if out['pending']:
@@ -2317,6 +3642,9 @@ def run_steps(raw_steps: list, utterance: str, pending, source: str, form_state:
         'rejected': [r for o in outcomes for r in o['rejected']],
         'advice': next((o['advice'] for o in reversed(outcomes) if o['advice']), None),
         'profiles': [p for o in outcomes for p in o['profiles']],
+        'action': next((o.get('action') for o in outcomes if o.get('action')), None),
+        'limits': next((o.get('limits') for o in reversed(outcomes) if o.get('limits')), None),
+        'goals_info': next((o.get('goals_info') for o in reversed(outcomes) if o.get('goals_info')), None),
     }
 
 
@@ -2340,7 +3668,7 @@ def ai_chat():
     # 2. constrained extraction
     if not OPENAI_API_KEY:
         return jsonify(outcome_out_of_scope(
-            "AI extraction is unavailable (OPENAI_API_KEY is not set). "
+            "AI extraction is unavailable (no LLM_API_KEY or OPENAI_API_KEY is set). "
             "Short phrasings still work without it, e.g. \"temperature 30 C\" or \"6 battery packs\":",
             source='lexicon'))
     try:
@@ -2668,7 +3996,8 @@ if __name__ == '__main__':
     print("Route Optimization Server")
     print("=" * 60)
     print(f"API Key Set: {'Yes' if GOOGLE_API_KEY else 'No - set GOOGLE_MAPS_API_KEY env var'}")
-    print(f"OpenAI Key Set: {'Yes' if OPENAI_API_KEY else 'No - lexicon fast path only'}")
+    print(f"Chat model: {OPENAI_MODEL} at {LLM_BASE_URL}" if OPENAI_API_KEY
+          else "Chat model: none (no LLM_API_KEY / OPENAI_API_KEY) - lexicon fast path only")
     print()
     print("Endpoints:")
     print("  POST /api/set_key        - Set Google Maps API key")

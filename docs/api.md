@@ -13,6 +13,7 @@ to `http://localhost:5001/api`.
 | `/api/geocode_batch` | POST | `{addresses: [...]}` → `{results: [...], errors: [...]}`; `status` is `partial` if any failed |
 | **`/api/optimize`** | POST | **The main endpoint.** Solve the routes and estimate energy (below) |
 | `/api/directions` | POST | `{locations, order}` → raw Google Directions response |
+| `/api/replan` | POST | Simulate a breakdown on a plan and re-plan the rest of the day (below) |
 | `/api/chat` | POST | Chat assistant. See [chat-assistant.md](chat-assistant.md) |
 | `/api/memory` | GET / DELETE | Saved driver profiles. See [chat-assistant.md](chat-assistant.md#driver-memory) |
 | `/api/benchmark/scenarios` | GET | Saved benchmark scenarios |
@@ -25,14 +26,15 @@ Every endpoint returns `"status": "ok"` on success, or `"status": "error"` with 
 
 ## `POST /api/optimize`
 
-**Code:** [`optimize_route()`](../route_optimizer_backend.py#L681).
+**Code:** [`optimize_route()`](../route_optimizer_backend.py#L1489).
 
 The steps:
 
-1. Fetch the distance and time matrices from Google, in 10×10 batches.
-2. Fetch the elevation of every location.
+1. Fetch the distance and time matrices from Google, in 10×10 batches, unless the request
+   sends back the ones from an earlier solve of the same locations (`precomputed`).
+2. Fetch the elevation of every location (same exception).
 3. Pick which solvers run.
-4. Solve.
+4. Build the cost matrix from the optimization goals, and solve.
 5. For every route, compute distance, time and per-leg energy.
 6. If there is more than one vehicle, also solve with OR-Tools and compute per-vehicle energy and battery.
 
@@ -55,7 +57,10 @@ The steps:
     "temperature_c": 20,
     "unload_time_min": 30,
     "has_climate_control": true
-  }
+  },
+  "goals": {"distance": "low", "time": "off", "energy": "high", "balance": "off", "battery_reserve_pct": 20},
+  "priority_stops": [3],
+  "precomputed": {"distance": [[...]], "time": [[...]], "elevations": [...]}
 }
 ```
 
@@ -72,6 +77,9 @@ The steps:
 | `energy_params.has_climate_control` | `true` | Adds 0.092 kWh/km |
 | `energy_params.total_weight_lbs`, `base_weight_lbs` | 19,500 / 7,000 | Effectively unused (see [energy-model.md](energy-model.md#other-inputs-and-what-they-affect)) |
 | `algorithms` | (from `solver`) | Explicit list to run (`held_karp` / `optimal`, `nearest_neighbor` / `greedy`, `2opt`). Overrides `solver` |
+| `goals` | distance only | Levels `off` / `low` / `medium` / `high` for `distance`, `time`, `energy`, `balance`, plus `battery_reserve_pct` (`null` = report only, 0–50 = enforce on fleets). What the solvers minimise; see [planning.md](planning.md#optimization-goals). Without `goals`, `mode: "time"` still means "minimise time" |
+| `priority_stops` | `[]` | Location indices (1 … n−1) to serve before the other stops on their truck |
+| `precomputed` | — | `{distance, time, elevations}` as returned by an earlier solve of the **same** locations. Skips every Google call. Ignored if the shapes do not match `locations` |
 
 What the vehicle defaults mean: 13,000 lbs, 4 packs and 80 kWh. One pack is 20 kWh and 200 kg.
 The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md](energy-model.md#weight-model).
@@ -113,6 +121,9 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 | `legs[]` | One per leg (below); the last one has `return_leg: true` |
 | `google_maps_url` | Opens the route in Google Maps |
 | `return_to_start` | Echo of the request |
+| `battery_capacity_kwh`, `battery_remaining_kwh`, `battery_remaining_pct`, `battery_depleted` | Vehicle 1's battery against this route. Checked, not enforced: one truck has to visit every stop |
+| `battery_reserve_pct`, `battery_reserve_ok` | Present when a reserve is set |
+| `eta_s` | Arrival time at each location, in seconds after dispatch (unload time included) |
 
 **`legs[]`** (single-vehicle routes):
 
@@ -140,12 +151,18 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 | `total_travel_time_s`, `total_unload_time_s`, `total_driver_time_s` | Sums over trucks. Driver time is a proxy for labour cost |
 | `total_energy_kwh`, `avg_energy_per_mile` | All trucks combined |
 | `solve_time_ms` | OR-Tools solve time |
+| `unserved` | `[{index, location}]`: stops no truck could take within the battery reserve. Empty without a reserve |
+| `goals`, `weights` | The goals used and the weights they became |
 
-**`routes[]`**: `vehicle_id`, `vehicle_name`, `driver`, `vehicle_config` `{total_weight_lbs, cargo_weight_lbs, weight_per_stop_lbs, battery_kwh}`,
-`ordered_locations` (depot at both ends), `total_distance_m/_mi`, `travel_time_s`, `unload_time_s`, `total_time_s/_min`,
-`num_delivery_stops`, `total_energy_kwh`, `battery_capacity_kwh`, `battery_remaining_kwh`, `battery_remaining_pct`,
-`battery_depleted`, `google_maps_url`, and `legs[]`. Fleet legs are a lighter version of the single-vehicle legs:
-`from`, `to`, `distance_m/_mi`, `time_s/_min`, `vehicle_weight_lbs/_tonnes`, `energy_kwh`, `return_leg`.
+**`routes[]`**: `vehicle_index` (position in the request's `vehicles`), `vehicle_id`, `vehicle_name`, `driver`,
+`vehicle_config` `{total_weight_lbs, cargo_weight_lbs, weight_per_stop_lbs, battery_kwh, battery_packs}`,
+`order` (location indices, depot at both ends), `stop_kinds` (one per location: `depot` / `stop`, and after a
+breakdown also `done` / `pickup` / `rescue`), `eta_s`, `ordered_locations`, `total_distance_m/_mi`, `travel_time_s`,
+`unload_time_s`, `total_time_s/_min`, `num_delivery_stops`, `total_energy_kwh`, `battery_capacity_kwh`,
+`battery_remaining_kwh`, `battery_remaining_pct`, `battery_depleted`, `battery_reserve_pct/_ok` (with a reserve),
+`google_maps_url`, and `legs[]`. Fleet legs are a lighter version of the single-vehicle legs:
+`from`, `to`, `distance_m/_mi`, `time_s/_min`, `vehicle_weight_lbs/_tonnes`, `energy_kwh`, `return_leg`, `to_kind`.
+Each route keeps its own vehicle's weight, packs and driver, and trucks left without stops are dropped.
 
 **`comparison`**: present when both `optimal` and `greedy` ran. Contains `distance_saved_m/_mi/_percent`,
 `time_saved_s/_min/_percent` and `energy_saved_kwh/_percent`, each computed as greedy minus optimal.
@@ -163,6 +180,11 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 | `baseline_solver`, `baseline_label`, `baseline_exact` | Which solver's route `results.optimal` holds, and whether it is the proven optimum |
 
 **`energy_params`**: `temperature_c`, `temperature_f`, `vehicle_weight_tonnes`, `vehicle_weight_lbs` (vehicle 1), `has_climate_control`, `model`.
+
+Also at the top level: `elevations` (metres, one per location; send them back with the
+matrices as `precomputed`), `goals` (the goals used, with `weights`) and `priority_stops`.
+The routes' `cost` fields are in the goals' objective units, not metres, unless the goals
+are the default distance-only ones.
 
 ### Example
 
@@ -182,3 +204,51 @@ curl -s -X POST http://localhost:5001/api/optimize -H "Content-Type: application
 This needs `GOOGLE_MAPS_API_KEY` in `.env`. Each call makes `ceil(n/10)²` Distance Matrix
 requests and one Elevation request, where n is the number of locations. Geocoding happens
 earlier, in the UI's "Validate Addresses" step.
+
+---
+
+## `POST /api/replan`
+
+**Code:** [`replan_route()`](../route_optimizer_backend.py#L1894) →
+[`replan_breakdown()`](../route_optimizer_backend.py#L1116). The model behind it is
+explained in [planning.md](planning.md#breakdown-re-planning).
+
+Simulates one truck breaking down part-way through a plan, and re-plans the rest of the day.
+
+```json
+{
+  "locations": [...],                  same as /api/optimize; index 0 is the depot
+  "vehicles": [...],                   same as /api/optimize
+  "energy_params": {...},
+  "goals": {...},                      the reserve, if any, also limits the re-plan
+  "plan": [{"vehicle_index": 0, "order": [0, 2, 1, 3, 0]},
+           {"vehicle_index": 1, "order": [0, 5, 4, 0]}],
+  "event": {"vehicle_index": 1, "after_stop": 1, "spare_truck": false},
+  "precomputed": {"distance": [[...]], "time": [[...]], "elevations": [...]},
+  "lang": "en"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `plan` | The routes being driven: `routes[].vehicle_index` and `routes[].order` from `/api/optimize`. For a single-truck plan, `[{"vehicle_index": 0, "order": optimal.order + [0]}]` |
+| `event.vehicle_index` | The truck that breaks down |
+| `event.after_stop` | Stops it completed first. 0 = it broke down leaving the depot |
+| `event.at_minute` | Instead of `after_stop`: minutes after dispatch |
+| `event.spare_truck` | Allow a spare truck from the depot. Always allowed for a single-truck plan |
+| `precomputed` | Optional; without it the matrices and elevations are fetched from Google |
+
+**Response:** `{"status": "ok", "nothing": false, "message": "...", "results": {"ortools_fleet": <fleet>}}`.
+The fleet has the `/api/optimize` shape. It covers the whole day, from dispatch, and adds:
+
+- per route: `status` (`broken_down`, `rescue`, `continues`, `spare`), with `stop_kinds` marking
+  stops already delivered or under way (`done`), cargo pickups at the breakdown site
+  (`pickup`) and stranded stops (`rescue`). The broken truck's route ends where it stopped,
+  and its `total_time_s` is the moment of the breakdown;
+- `unserved`: stops nobody could take, plus any the plan had already left unserved
+  (`before_breakdown: true`);
+- `disruption`: `{vehicle_index, vehicle_label, after_stop, at_s, crash_site, stranded,
+  reassigned: [{location, to}], spare_used, was_makespan_s, transfer_min_per_order, message}`.
+
+If the truck had already finished its deliveries at that moment, the response is
+`{"status": "ok", "nothing": true, "message": "..."}`.
