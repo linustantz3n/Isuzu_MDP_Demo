@@ -3,7 +3,7 @@
 **Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L198) in `route_optimizer_backend.py`.
 It is called once per route leg (one stop to the next) from `optimize_route()`:
 
-- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L1661), [return leg](../route_optimizer_backend.py#L1717)
+- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L1689), [return leg](../route_optimizer_backend.py#L1745)
 - fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L852)
 
 The model is called **Model E**. It is a polynomial regression for energy per kilometre of an
@@ -105,7 +105,7 @@ HVAC on, not measurements:
 
 ## Weight model
 
-**Code:** [vehicle config](../route_optimizer_backend.py#L1557) and [leg weights](../route_optimizer_backend.py#L1661) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L901) for fleet routes.
+**Code:** [vehicle config](../route_optimizer_backend.py#L1585) and [leg weights](../route_optimizer_backend.py#L1689) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L901) for fleet routes.
 
 - Each vehicle's `weight_lbs` is its **gross weight leaving the depot**: truck, batteries and cargo
   together. The form's range is 10,000–19,500 lbs.
@@ -128,6 +128,13 @@ HVAC on, not measurements:
   single-vehicle routes check against vehicle 1's battery
   ([`battery_fields()`](../route_optimizer_backend.py#L915)). The UI shows the fleet bar
   orange below 20% and red when depleted.
+- When a route needs more than the battery holds, `battery_depletion` says where it runs out
+  ([`battery_depletion()`](../route_optimizer_backend.py#L928)): the leg, and how far into it.
+  The model gives one energy total per leg, so the energy is spread evenly along the leg and
+  the point is approximate. The map marks it with a red **0%** marker on the drawn road (click
+  it for the distances, the time after dispatch and the energy needed), and the route's card
+  says "runs out ~24.0 mi after Marina Del Rey, 22.3 mi before Brea". With a fleet, only the
+  fleet's trucks are marked, not the single-truck comparison route.
 - A **battery reserve** (an optimization goal, 0–50%) is enforced for fleets: no truck may
   plan more than `capacity × (1 − reserve)`. With one truck it is checked and flagged, not
   enforced. See [planning.md](planning.md#battery-reserve).

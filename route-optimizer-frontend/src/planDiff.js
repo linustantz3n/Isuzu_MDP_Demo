@@ -24,6 +24,16 @@ export function formatClock(seconds) {
   return `+${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
 }
 
+// "runs out ~24.0 mi after Marina Del Rey, 22.3 mi before Brea" for a route's
+// battery_depletion; empty when the battery lasts the whole route.
+export function depletionText(dep) {
+  if (!dep) return '';
+  const mi = (m) => (m / 1609.34).toFixed(1);
+  const from = dep.from_depot ? 'the depot' : shortPlace(dep.from);
+  const to = dep.to_depot ? 'the depot' : shortPlace(dep.to);
+  return `runs out ~${mi(dep.distance_into_leg_m)} mi after ${from}, ${mi(dep.distance_left_m)} mi before ${to}`;
+}
+
 // One plan's routes and headline numbers. With a fleet the fleet is the plan;
 // otherwise it is the single truck's route.
 export function planOf(results) {

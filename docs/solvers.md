@@ -60,7 +60,7 @@ Time windows and driver hours are never modelled.
 
 ## How `/api/optimize` decides what to run
 
-**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L574), called from [`optimize_route()`](../route_optimizer_backend.py#L1526).
+**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L574), called from [`optimize_route()`](../route_optimizer_backend.py#L1517).
 
 The request's `solver` field is one of `auto` (default), `held_karp`, `2opt`, `nearest_neighbor` or `ortools_vrp`.
 

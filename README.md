@@ -23,10 +23,10 @@ plan before and after side by side.
 |---|---|
 | **The energy model**: formula, coefficients, inputs, weight and battery logic | [docs/energy-model.md](docs/energy-model.md) · code: [`calculate_energy_consumption()`](route_optimizer_backend.py#L198) |
 | **The solvers** and how one gets picked | [docs/solvers.md](docs/solvers.md) · code: [`solvers.py`](solvers.py), [`resolve_solver()`](route_optimizer_backend.py#L574) |
-| **What a solve takes as input and returns** | [docs/api.md](docs/api.md) · code: [`optimize_route()`](route_optimizer_backend.py#L1489) |
+| **What a solve takes as input and returns** | [docs/api.md](docs/api.md) · code: [`optimize_route()`](route_optimizer_backend.py#L1517) |
 | **What every file and function does** | [docs/code-map.md](docs/code-map.md) |
 | The chat assistant and driver memory | [docs/chat-assistant.md](docs/chat-assistant.md) |
-| **Optimization goals (weights), battery reserve, priority stops, breakdown re-planning, truck limits** | [docs/planning.md](docs/planning.md) · code: [`objective_matrix()`](route_optimizer_backend.py#L759), [`solve_fleet()`](route_optimizer_backend.py#L994), [`replan_breakdown()`](route_optimizer_backend.py#L1116) |
+| **Optimization goals (weights), battery reserve, priority stops, breakdown re-planning, truck limits** | [docs/planning.md](docs/planning.md) · code: [`objective_matrix()`](route_optimizer_backend.py#L759), [`solve_fleet()`](route_optimizer_backend.py#L1022), [`replan_breakdown()`](route_optimizer_backend.py#L1144) |
 | The before / after comparison | [`PlanComparison.jsx`](route-optimizer-frontend/src/PlanComparison.jsx), [`planDiff.js`](route-optimizer-frontend/src/planDiff.js) |
 | The algorithm benchmark | [docs/solvers.md#benchmark](docs/solvers.md#benchmark) · code: [`benchmark/`](benchmark/) |
 | The web UI | [`route-optimizer-frontend/src/RouteOptimizer.jsx`](route-optimizer-frontend/src/RouteOptimizer.jsx) |

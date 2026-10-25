@@ -1,7 +1,7 @@
 # Chat assistant
 
-**Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L1950)
-(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L3610)), and the UI in
+**Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L1982)
+(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L3726)), and the UI in
 [`AIChatbot.jsx`](../route-optimizer-frontend/src/AIChatbot.jsx).
 
 The assistant tunes the optimizer in plain language. The operator describes the day ("battery
@@ -35,13 +35,13 @@ operator utterance
 
 | Stage | Code |
 |---|---|
-| Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L1982) |
-| What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L2030) |
-| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L2713), [`lexicon_fast_path()`](../route_optimizer_backend.py#L2846) |
-| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3036), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3044), [`call_extraction()`](../route_optimizer_backend.py#L3131) |
-| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L3170), [`validate_extraction()`](../route_optimizer_backend.py#L3305), [`route_outcome()`](../route_optimizer_backend.py#L3457) |
-| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L3561) |
-| Goals, limits, breakdowns | [`outcome_goals()`](../route_optimizer_backend.py#L2511), [`outcome_limits()`](../route_optimizer_backend.py#L2586), [`outcome_disruption()`](../route_optimizer_backend.py#L2624) |
+| Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L2018) |
+| What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L2066) |
+| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L2791), [`lexicon_fast_path()`](../route_optimizer_backend.py#L2924) |
+| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3114), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3122), [`call_extraction()`](../route_optimizer_backend.py#L3209) |
+| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L3249), [`validate_extraction()`](../route_optimizer_backend.py#L3392), [`route_outcome()`](../route_optimizer_backend.py#L3573) |
+| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L3677) |
+| Goals, limits, breakdowns | [`outcome_goals()`](../route_optimizer_backend.py#L2581), [`outcome_limits()`](../route_optimizer_backend.py#L2657), [`outcome_disruption()`](../route_optimizer_backend.py#L2695) |
 | Building the reply | `outcome_apply / outcome_ask / outcome_recommend / outcome_memory / outcome_out_of_scope` |
 | Re-solving after a turn | `handleChatTurn` → `runChatResolve` / `runBreakdown` in `RouteOptimizer.jsx`; `onTurn` in `AIChatbot.jsx` |
 | Applying a change in the UI | [`applyChatChange`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L440) in `RouteOptimizer.jsx` |
@@ -78,7 +78,7 @@ of steps, and the server runs them in that order:
 
 - **A later step sees what an earlier one did.** The list runs after the deletion. "Use 3
   trucks, then tell me which solver to use" gets advice for 3 trucks
-  ([`advance_form_state()`](../route_optimizer_backend.py#L3510) carries the form forward between steps).
+  ([`advance_form_state()`](../route_optimizer_backend.py#L3626) carries the form forward between steps).
 - **Most messages are still one step.** Several values in one sentence ("2 trucks with 6 packs")
   form one step with several changes, and deleting several drivers is one step.
 - **One form change per message still holds.** If a second step would change the form again, it
@@ -115,6 +115,14 @@ weights. The same gates as every other change apply, plus a few of their own:
 
 - **Goal changes need the operator's words.** The `evidence` span must appear in the
   message. A battery reserve above 0% also needs its number written in the message.
+- **A goal request filed as a form change still counts.** Late in a chat, "keep at least
+  20% battery in each truck" came back as a form change with empty battery-pack values,
+  and "we're running late" as priority stops nobody named, both answered with "I couldn't
+  verify that". When no form value survives, the model's goal update is used instead. A
+  reserve written out in the message (a percentage, a keep / reserve word, and a battery or
+  truck word, see [`reserve_from_words()`](../route_optimizer_backend.py#L2573)) is applied even
+  if the model left it out, or quoted words from earlier in the chat. A question about a
+  reserve ("what does a 20% reserve do?") only gets an explanation.
 - **A situation is never a solver switch.** "Get everyone back sooner" once came back as
   "solver → nearest neighbor". A solver change now needs a solver word in its evidence:
   solver, algorithm, Held-Karp, 2-opt, exact, optimal and the like.
@@ -222,8 +230,8 @@ saved. If the model recognises a save request but returns no name, the reply ask
   Linus with 6 packs" would set the form's packs to 6. Names are matched as whole words, so a
   driver called "Li" does not capture "climate".
 
-Code: [`do_remember()`](../route_optimizer_backend.py#L3798), [`do_recall()`](../route_optimizer_backend.py#L3830),
-[`do_forget()`](../route_optimizer_backend.py#L3863), [`validate_profile()`](../route_optimizer_backend.py#L3721).
+Code: [`do_remember()`](../route_optimizer_backend.py#L3914), [`do_recall()`](../route_optimizer_backend.py#L3946),
+[`do_forget()`](../route_optimizer_backend.py#L3979), [`validate_profile()`](../route_optimizer_backend.py#L3837).
 
 The memory is stored in one JSON file, `fleet_memory.json`, next to the server. It is gitignored
 because it is runtime state. Its shape is

@@ -104,6 +104,24 @@ def test_battery_reserve_is_enforced_and_unreachable_stops_reported(ctx):
     assert [u['index'] for u in fleet['unserved']] == [1]    # Marina Del Rey: ~40 mi out
 
 
+def test_depletion_marks_the_leg_and_the_share_of_it_driven():
+    legs = [{'energy_kwh': e, 'distance_m': 10000, 'time_s': 600, 'from': {}, 'to': {}} for e in (30, -2, 60)]
+    assert be.battery_depletion(legs, 100) is None              # 88 kWh in all
+    d = be.battery_depletion(legs, 58, depart_s=[0, 2400, 4800])
+    assert d['leg_index'] == 2 and d['fraction'] == pytest.approx(0.5)   # 28 used, 30 of 60 left
+    assert d['distance_into_leg_m'] == 5000 and d['at_s'] == 4800 + 300
+    assert d['from_depot'] is False and d['route_energy_kwh'] == 88
+
+
+def test_a_fleet_route_says_where_its_battery_runs_out(ctx):
+    fleet = be.solve_fleet(ctx, [truck(0, 3), truck(1, 3)], be.DEFAULT_GOALS, time_limit_s=1)
+    for r in fleet['routes']:
+        assert (r['battery_depletion'] is not None) == r['battery_depleted']
+        if r['battery_depletion']:
+            leg = r['legs'][r['battery_depletion']['leg_index']]
+            assert r['battery_depletion']['to'] == leg['to']
+
+
 # ---- breakdown re-plan ---------------------------------------------------------
 
 PLAN = [{'vehicle_index': 0, 'order': [0, 2, 1, 3, 0]}, {'vehicle_index': 1, 'order': [0, 5, 4, 0]}]
@@ -310,3 +328,66 @@ def test_a_named_driver_wins_over_a_bad_extraction(extracted):
     u = "Wang's truck crashed an hour in"
     raw = disruption_raw(at_minute=60, evidence='an hour in', **extracted)
     assert be.outcome_disruption(raw, u, FORM, 'model')['action']['vehicle_index'] == 0
+
+
+# A goal request the model filed as a form change: no form value survives, so
+# the goal update (or a reserve said outright) is the request.
+def padding(axis, evidence):
+    return {'axis': axis, 'op': 'set', 'value_text': None, 'value_number': None,
+            'value_bool': None, 'value_list': None, 'evidence': evidence}
+
+
+def run_turn(raw, utterance):
+    return be.run_steps([raw], utterance, None, 'model', FORM)
+
+
+def test_a_reserve_filed_as_empty_pack_changes_still_sets_the_reserve():
+    u = 'keep at least 20% battery in each truck'
+    raw = {'intent': 'apply', 'changes': [padding('battery_packs', u)] * 3,
+           'goal_update': goal_raw(energy='high', battery_reserve_pct=20, evidence=u)}
+    out = run_turn(raw, u)
+    assert out['intent'] == 'goals' and out['changes'][0]['value']['battery_reserve_pct'] == 20
+    assert out['changes'][0]['value']['energy'] == 'high'
+    # No goal update at all: the words carry the reserve on their own.
+    out = run_turn({'intent': 'apply', 'changes': [padding('battery_packs', u)]}, u)
+    assert out['intent'] == 'goals' and out['changes'][0]['value']['battery_reserve_pct'] == 20
+
+
+def test_running_late_filed_as_unnamed_priority_stops_moves_the_goals():
+    u = "We're running late, get everyone back sooner"
+    stop = dict(padding('priority_stops', 'get everyone back sooner'), op='add', value_list=['Stanton'])
+    raw = {'intent': 'apply', 'changes': [stop],
+           'goal_update': goal_raw(time='high', balance='medium', evidence="We're running late")}
+    out = run_turn(raw, u)
+    assert out['intent'] == 'goals' and out['changes'][0]['value']['time'] == 'high'
+
+
+def test_a_real_form_change_that_fails_is_still_a_question():
+    u = 'add a stop at Fooville'
+    stop = dict(padding('addresses', 'Fooville'), op='add', value_list=['Springfield'])
+    assert run_turn({'intent': 'apply', 'changes': [stop]}, u)['intent'] == 'ask'
+
+
+@pytest.mark.parametrize('utterance, pct', [
+    ('keep at least 20% battery in each truck', 20), ('a 15% reserve on every truck', 15),
+    ('never go below 10 percent charge', 10), ('每辆车至少保留20%电量', 20),
+    ('cut energy use by 20%', None), ('leave 20% of the stops for tomorrow', None), ('use 3 trucks', None)])
+def test_reserve_read_from_the_words(utterance, pct):
+    said = be.reserve_from_words(utterance)
+    assert (said and said['battery_reserve_pct']) == pct
+
+
+def test_a_reserve_quoted_from_earlier_in_the_chat_uses_this_messages_words():
+    u = 'keep 20% battery in each truck'
+    raw = {'intent': 'goals', 'changes': [],
+           'goal_update': goal_raw(energy='high', battery_reserve_pct=20, evidence='Battery is tight today')}
+    out = run_turn(raw, u)
+    assert out['changes'] and out['changes'][0]['value']['battery_reserve_pct'] == 20
+
+
+def test_a_question_about_a_reserve_sets_nothing():
+    u = 'what does a 20% reserve do to each truck?'
+    out = run_turn({'intent': 'goals', 'changes': [], 'goal_update': goal_raw()}, u)
+    assert out['intent'] == 'goals' and not out['changes']
+    out = run_turn({'intent': 'out_of_scope', 'changes': []}, 'could you keep 20% battery in each truck?')
+    assert out['changes'][0]['value']['battery_reserve_pct'] == 20

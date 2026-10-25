@@ -7,7 +7,7 @@ import BenchmarkPanel from './BenchmarkPanel';
 import GoalsPanel from './GoalsPanel';
 import PlanComparison from './PlanComparison';
 import { DEFAULT_GOALS, goalsSummary } from './goals';
-import { planOf, metricRows, impactText, shortPlace, formatClock } from './planDiff';
+import { planOf, metricRows, impactText, shortPlace, formatClock, depletionText } from './planDiff';
 import { API_BASE } from './api';
 
 const locationsKey = (locs) => locs.map(l => `${l.lat},${l.lng}`).join('|');
@@ -247,7 +247,7 @@ function RouteOptimizer() {
     if (data.status === 'error') throw new Error(data.message);
     return {
       // `solver` rides along on results so the panel and the data stay in sync.
-      results: { ...data.results, solver: data.solver, goals: data.goals },
+      results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [] },
       inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations },
     };
   };
@@ -1077,6 +1077,9 @@ function RouteOptimizer() {
                         </span>
                       </div>
                     )}
+                    {hk.battery_depletion && (
+                      <p className="text-[10px] text-red-300/80 text-right -mt-1">{depletionText(hk.battery_depletion)}</p>
+                    )}
                   </div>
                 </div>
 
@@ -1375,6 +1378,9 @@ function RouteOptimizer() {
                                   style={{ width: `${Math.min(100, route.battery_remaining_pct || 0)}%` }}
                                 />
                               </div>
+                              {route.battery_depletion && (
+                                <p className="text-[10px] text-red-300/80 mt-1">{depletionText(route.battery_depletion)}</p>
+                              )}
                             </div>
                           )}
                           <div className="space-y-1.5 pl-1">

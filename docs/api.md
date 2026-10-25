@@ -26,7 +26,7 @@ Every endpoint returns `"status": "ok"` on success, or `"status": "error"` with 
 
 ## `POST /api/optimize`
 
-**Code:** [`optimize_route()`](../route_optimizer_backend.py#L1489).
+**Code:** [`optimize_route()`](../route_optimizer_backend.py#L1517).
 
 The steps:
 
@@ -123,6 +123,7 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 | `return_to_start` | Echo of the request |
 | `battery_capacity_kwh`, `battery_remaining_kwh`, `battery_remaining_pct`, `battery_depleted` | Vehicle 1's battery against this route. Checked, not enforced: one truck has to visit every stop |
 | `battery_reserve_pct`, `battery_reserve_ok` | Present when a reserve is set |
+| `battery_depletion` | Where the battery runs out, or `null` if it lasts: `{leg_index, fraction, distance_into_leg_m, distance_left_m, from, to, from_depot, to_depot, at_s, capacity_kwh, route_energy_kwh}`. `fraction` is how far into leg `leg_index`; approximate, because the energy is spread evenly along the leg |
 | `eta_s` | Arrival time at each location, in seconds after dispatch (unload time included) |
 
 **`legs[]`** (single-vehicle routes):
@@ -160,6 +161,7 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 breakdown also `done` / `pickup` / `rescue`), `eta_s`, `ordered_locations`, `total_distance_m/_mi`, `travel_time_s`,
 `unload_time_s`, `total_time_s/_min`, `num_delivery_stops`, `total_energy_kwh`, `battery_capacity_kwh`,
 `battery_remaining_kwh`, `battery_remaining_pct`, `battery_depleted`, `battery_reserve_pct/_ok` (with a reserve),
+`battery_depletion` (as for single-vehicle routes),
 `google_maps_url`, and `legs[]`. Fleet legs are a lighter version of the single-vehicle legs:
 `from`, `to`, `distance_m/_mi`, `time_s/_min`, `vehicle_weight_lbs/_tonnes`, `energy_kwh`, `return_leg`, `to_kind`.
 Each route keeps its own vehicle's weight, packs and driver, and trucks left without stops are dropped.
@@ -209,8 +211,8 @@ earlier, in the UI's "Validate Addresses" step.
 
 ## `POST /api/replan`
 
-**Code:** [`replan_route()`](../route_optimizer_backend.py#L1894) →
-[`replan_breakdown()`](../route_optimizer_backend.py#L1116). The model behind it is
+**Code:** [`replan_route()`](../route_optimizer_backend.py#L1926) →
+[`replan_breakdown()`](../route_optimizer_backend.py#L1144). The model behind it is
 explained in [planning.md](planning.md#breakdown-re-planning).
 
 Simulates one truck breaking down part-way through a plan, and re-plans the rest of the day.

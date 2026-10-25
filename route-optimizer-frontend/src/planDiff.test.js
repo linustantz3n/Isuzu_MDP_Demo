@@ -1,4 +1,4 @@
-import { planOf, metricRows, movedStops, addedStops, impactText, settingChanges } from './planDiff';
+import { planOf, metricRows, movedStops, addedStops, impactText, settingChanges, depletionText } from './planDiff';
 import { DEFAULT_GOALS, goalWeights } from './goals';
 
 const loc = (name, lat) => ({ formatted_address: `1 Main St, ${name}, CA 90000, USA`, lat, lng: -118 });
@@ -57,4 +57,11 @@ test('weights mirror the backend table', () => {
   expect(goalWeights({ ...DEFAULT_GOALS, distance: 'low', energy: 'high' })).toEqual(
     { distance: 0.2, time: 0, energy: 0.8, balance: 0 });
   expect(goalWeights({ distance: 'off', time: 'off', energy: 'off', balance: 'off' }).distance).toBe(1);
+});
+
+test('depletion text names the stops either side, or the depot', () => {
+  const dep = { from: B, to: C, from_depot: false, to_depot: false, distance_into_leg_m: 38624, distance_left_m: 35888 };
+  expect(depletionText(dep)).toBe('runs out ~24.0 mi after Brea, 22.3 mi before Cerritos');
+  expect(depletionText({ ...dep, to_depot: true })).toMatch(/before the depot$/);
+  expect(depletionText(null)).toBe('');
 });

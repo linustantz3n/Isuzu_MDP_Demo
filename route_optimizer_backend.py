@@ -925,6 +925,33 @@ def battery_fields(capacity_kwh: float, energy_kwh: float, reserve_pct) -> dict:
     return out
 
 
+def battery_depletion(legs: list, capacity_kwh: float, depart_s: list = None):
+    """Where the battery runs out, or None if it lasts the whole route.
+
+    The model gives one energy total per leg, so the energy is spread evenly
+    along the leg: the point is approximate. depart_s[i] is when leg i starts
+    (seconds after dispatch), for the time it runs out.
+    """
+    used = 0.0
+    for i, leg in enumerate(legs):
+        e = leg['energy_kwh']
+        if e > 0 and used + e > capacity_kwh:
+            frac = max(0.0, min(1.0, (capacity_kwh - used) / e))
+            out = {"leg_index": i, "fraction": round(frac, 4),
+                   "distance_into_leg_m": round(frac * leg['distance_m']),
+                   "distance_left_m": round((1 - frac) * leg['distance_m']),
+                   "from": leg['from'], "to": leg['to'],
+                   "from_depot": i == 0,
+                   "to_depot": bool(leg.get('return_leg')) or leg.get('to_kind') == 'depot',
+                   "capacity_kwh": capacity_kwh,
+                   "route_energy_kwh": round(sum(l['energy_kwh'] for l in legs), 2)}
+            if depart_s is not None and i < len(depart_s):
+                out["at_s"] = round(depart_s[i] + frac * leg['time_s'])
+            return out
+        used += e
+    return None
+
+
 def maps_url(locs: list) -> str:
     if not locs:
         return ''
@@ -964,6 +991,7 @@ def fleet_route_payload(v_idx: int, vcfg: dict, nodes: list, kinds: list, ev: di
         "google_maps_url": maps_url([ctx['locations'][i] for i in nodes]),
         "legs": ev['legs'],
         **battery_fields(num['battery_kwh'], ev['energy_kwh'], reserve_pct),
+        "battery_depletion": battery_depletion(ev['legs'], num['battery_kwh'], ev['depart_s']),
     }
     if status:
         out['status'] = status
@@ -1788,6 +1816,8 @@ def optimize_route():
                 t += leg['time_s'] + (unload_time_min * 60 if i > 0 else 0)
                 eta.append(round(t))
             result['eta_s'] = eta
+            result['battery_depletion'] = battery_depletion(
+                legs, hk_battery_kwh, [eta[i] + (unload_time_min * 60 if i > 0 else 0) for i in range(len(legs))])
         
         # Name the solver whose route the baseline panel is actually showing.
         baseline_key = ('held_karp' if 'held_karp' in algorithms
@@ -2474,6 +2504,17 @@ LIMITS_FIELD_OF_AXIS = {'battery_packs': 'battery_packs', 'vehicle_weight_lbs': 
 ORDINAL_RE = re.compile(r'\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\b'
                         r'|第', re.I)
 RESET_RE = re.compile(r'\breset\b|\bdefaults?\b|back\s+to\s+normal|start\s+over|重置|恢复|默认', re.I)
+# A battery reserve said outright: "keep at least 20% battery in each truck",
+# "a 15% reserve", "never below 10%". A percentage, a keep / reserve word and
+# a battery or truck word.
+RESERVE_PCT_RE = re.compile(r'(?<![\d.])(\d{1,3})\s*(?:%|percent\b|pct\b)', re.I)
+RESERVE_WORD_RE = re.compile(
+    r'\b(?:keep|keeps|leave|leaves|reserve|buffer|at\s+least|minimum|min|left|remaining|spare|'
+    r'(?:never|not)\s+(?:go\s+|drop\s+|fall\s+|run\s+)?below)\b|保留|至少|剩', re.I)
+RESERVE_TOPIC_RE = re.compile(r'\b(?:battery|batteries|charge|reserve|trucks?|vehicles?|vans?)\b|电量|电池|车', re.I)
+# A question, unless it is a request asked politely ("can you keep 20% ...?").
+QUESTION_END_RE = re.compile(r'[?？]\s*$')
+POLITE_ASK_RE = re.compile(r'\s*(?:please\b|(?:can|could|would|will)\s+you\b)|\s*请|\s*能不能|\s*可以', re.I)
 DEPOT_WORD_RE = re.compile(r'depot|warehouse|before\s+(?:its|the|any)\s+first|leav|outset|仓库|刚出|还没', re.I)
 TIME_WORD_RE = re.compile(r'\b(?:min(?:ute)?s?|hours?|hrs?)\b|分钟|小时|钟头', re.I)
 SPARE_RE = re.compile(r'spare|backup|back-up|extra|another\s+(?:truck|van|vehicle)|replacement|备用|替补|再派', re.I)
@@ -2523,6 +2564,20 @@ def _outcome(intent: str, message: str, source: str, **extra) -> dict:
     return out
 
 
+def goal_update_moves(raw) -> bool:
+    """True when a goal update asks for something, rather than how goals work."""
+    return isinstance(raw, dict) and bool(raw.get('reset') or raw.get('battery_reserve_pct') is not None
+                                          or any(raw.get(k) for k in GOAL_KEYS))
+
+
+def reserve_from_words(utterance: str):
+    """{'battery_reserve_pct', 'evidence'} for a reserve said outright, else None."""
+    m = RESERVE_PCT_RE.search(utterance)
+    if not m or not RESERVE_WORD_RE.search(utterance) or not RESERVE_TOPIC_RE.search(utterance):
+        return None
+    return {'battery_reserve_pct': int(m.group(1)), 'evidence': _strip_edges(utterance)}
+
+
 def outcome_goals(raw, utterance: str, form_state: dict, source: str, lang: str = 'en') -> dict:
     """Turn the model's reading of the situation into goal levels. The levels
     are a closed enum, the motivating words must be in the message, and the
@@ -2532,9 +2587,7 @@ def outcome_goals(raw, utterance: str, form_state: dict, source: str, lang: str 
     raw = raw if isinstance(raw, dict) else {}
     info = {'before': before, 'after': before, 'weights_before': goal_weights(before),
             'weights_after': goal_weights(before), 'evidence': None}
-    wants_change = (raw.get('reset') or raw.get('battery_reserve_pct') is not None
-                    or any(raw.get(k) for k in GOAL_KEYS))
-    if not wants_change:
+    if not goal_update_moves(raw):
         return _outcome('goals', _gt('explain', lang, levels=goals_summary(before, lang),
                                      weights=weights_summary(before, lang)), source, goals_info=info)
 
@@ -3461,6 +3514,27 @@ def validate_extraction(raw: dict, utterance: str, form_state: dict = None,
         intent = 'ask'
         question = question or (f"「{ambiguous}」可能指好几个地方——你说的是哪个城市和州？" if lang == 'zh'
                                 else f"\"{ambiguous}\" could be in several places — which city and state do you mean?")
+
+    # A goal request filed as a form change. Deep into a chat, "keep at least
+    # 20% battery in each truck" comes back as "apply" with empty battery-pack
+    # changes next to the goal update that says it, and "we're running late"
+    # with priority stops the operator never named. No form value survived, so
+    # the goal update is the request (outcome_goals still checks its words). A
+    # reserve said outright counts even when the model gave no goal update, gave
+    # one without the reserve or quoting words from earlier in the chat, or
+    # asked a question instead — unless the operator is the one asking.
+    if (intent == 'apply' and not changes) or intent in ('ask', 'out_of_scope', 'goals'):
+        g = dict(goal_update) if intent in ('apply', 'goals') and goal_update_moves(goal_update) else {}
+        said = reserve_from_words(utterance)
+        if said and not g and QUESTION_END_RE.search(utterance) and not POLITE_ASK_RE.match(utterance):
+            said = None                     # "what does a 20% reserve do?" asks; it sets nothing
+        if said and g.get('battery_reserve_pct') is None:
+            g['battery_reserve_pct'] = said['battery_reserve_pct']
+        ev = _strip_edges(g.get('evidence'))
+        if said and (not ev or _norm(ev) not in _norm(utterance)):
+            g['evidence'] = said['evidence']
+        if goal_update_moves(g):
+            intent, goal_update, rejected, question, question_axis = 'goals', g, [], None, None
 
     # Null coupling at the intent level.
     if intent == 'apply' and not changes:

@@ -57,67 +57,67 @@ One file, in sections, top to bottom:
 | [`objective_matrix`](../route_optimizer_backend.py#L759) | **The cost matrix the solvers minimise**: weighted distance / time / energy, priority-stop penalty, balance (span) price |
 | [`precomputed_inputs`](../route_optimizer_backend.py#L817) | Validates matrices and elevations the client sends back, so a re-solve needs no Google calls |
 | [`evaluate_route`](../route_optimizer_backend.py#L852) | Leg-by-leg distance, time, energy (at the weight on board) and arrival times for any route, including pickups |
-| [`vehicle_numbers`](../route_optimizer_backend.py#L901), [`battery_fields`](../route_optimizer_backend.py#L915), [`fleet_route_payload`](../route_optimizer_backend.py#L938), [`fleet_totals`](../route_optimizer_backend.py#L973) | One truck's weights and battery; the battery check; a route and the fleet in the response shape |
-| [`solve_fleet`](../route_optimizer_backend.py#L994) | **The OR-Tools fleet solve under the goals**: stop cap, battery reserve, balance, unserved stops |
-| [`replan_breakdown`](../route_optimizer_backend.py#L1116) | Breakdown re-plan: replay the plan, find each truck, move stranded stops with a pickup first |
-| [`truck_limits`](../route_optimizer_backend.py#L1368) | Battery, payload and range of an N-pack truck; check against today's longest route |
+| [`vehicle_numbers`](../route_optimizer_backend.py#L901), [`battery_fields`](../route_optimizer_backend.py#L915), [`battery_depletion`](../route_optimizer_backend.py#L928), [`fleet_route_payload`](../route_optimizer_backend.py#L965), [`fleet_totals`](../route_optimizer_backend.py#L1001) | One truck's weights and battery; the battery check; where the battery runs out; a route and the fleet in the response shape |
+| [`solve_fleet`](../route_optimizer_backend.py#L1022) | **The OR-Tools fleet solve under the goals**: stop cap, battery reserve, balance, unserved stops |
+| [`replan_breakdown`](../route_optimizer_backend.py#L1144) | Breakdown re-plan: replay the plan, find each truck, move stranded stops with a pickup first |
+| [`truck_limits`](../route_optimizer_backend.py#L1396) | Battery, payload and range of an N-pack truck; check against today's longest route |
 
 ### API endpoints
 | Function | Route |
 |---|---|
-| [`health_check`](../route_optimizer_backend.py#L1434) | `GET /api/health` |
-| [`set_api_key`](../route_optimizer_backend.py#L1443) | `POST /api/set_key` |
-| [`geocode`](../route_optimizer_backend.py#L1452), [`geocode_batch`](../route_optimizer_backend.py#L1465) | `POST /api/geocode`, `/api/geocode_batch` |
-| [**`optimize_route`**](../route_optimizer_backend.py#L1489) | **`POST /api/optimize`, the main pipeline.** Details below |
-| [`get_route_directions`](../route_optimizer_backend.py#L1874) | `POST /api/directions` |
-| [`replan_route`](../route_optimizer_backend.py#L1894) | `POST /api/replan`: simulate a breakdown on a plan |
+| [`health_check`](../route_optimizer_backend.py#L1462) | `GET /api/health` |
+| [`set_api_key`](../route_optimizer_backend.py#L1471) | `POST /api/set_key` |
+| [`geocode`](../route_optimizer_backend.py#L1480), [`geocode_batch`](../route_optimizer_backend.py#L1493) | `POST /api/geocode`, `/api/geocode_batch` |
+| [**`optimize_route`**](../route_optimizer_backend.py#L1517) | **`POST /api/optimize`, the main pipeline.** Details below |
+| [`get_route_directions`](../route_optimizer_backend.py#L1906) | `POST /api/directions` |
+| [`replan_route`](../route_optimizer_backend.py#L1926) | `POST /api/replan`: simulate a breakdown on a plan |
 
 **Inside `optimize_route()`**, in order:
 
 | Step | Line |
 |---|---|
-| Parse the request; cap at 25 locations; choose solvers (`resolve_solver`) | [L1505](../route_optimizer_backend.py#L1505) |
-| Distance/time matrices: from Google, or `precomputed` by the client for the same locations | [L1544](../route_optimizer_backend.py#L1544) |
-| Elevations | [L1545](../route_optimizer_backend.py#L1545) |
-| Energy parameters and defaults | [L1547](../route_optimizer_backend.py#L1547) |
-| Vehicle config, empty-truck weight from packs, cargo weight | [L1557](../route_optimizer_backend.py#L1557) |
-| Goals → the cost matrix the single-truck solvers minimise (`objective_matrix`) | [L1599](../route_optimizer_backend.py#L1599) |
-| Run Held-Karp / nearest neighbor / 2-opt | [L1604](../route_optimizer_backend.py#L1604) |
-| Stand-in when Held-Karp was skipped | [L1622](../route_optimizer_backend.py#L1622) |
-| Per route: totals, legs, weight per leg, **energy per leg** | [L1633](../route_optimizer_backend.py#L1633) |
-| Return leg (empty truck) | [L1717](../route_optimizer_backend.py#L1717) |
-| Unloading time; per-route totals | [L1763](../route_optimizer_backend.py#L1763) |
-| Greedy-vs-optimal comparison | [L1797](../route_optimizer_backend.py#L1797) |
-| Google Maps URLs | [L1820](../route_optimizer_backend.py#L1820) |
-| **OR-Tools fleet** (more than one vehicle): `solve_fleet()` | [L1838](../route_optimizer_backend.py#L1838) |
-| Build the JSON response | [L1845](../route_optimizer_backend.py#L1845) |
+| Parse the request; cap at 25 locations; choose solvers (`resolve_solver`) | [L1533](../route_optimizer_backend.py#L1533) |
+| Distance/time matrices: from Google, or `precomputed` by the client for the same locations | [L1572](../route_optimizer_backend.py#L1572) |
+| Elevations | [L1573](../route_optimizer_backend.py#L1573) |
+| Energy parameters and defaults | [L1575](../route_optimizer_backend.py#L1575) |
+| Vehicle config, empty-truck weight from packs, cargo weight | [L1585](../route_optimizer_backend.py#L1585) |
+| Goals → the cost matrix the single-truck solvers minimise (`objective_matrix`) | [L1627](../route_optimizer_backend.py#L1627) |
+| Run Held-Karp / nearest neighbor / 2-opt | [L1632](../route_optimizer_backend.py#L1632) |
+| Stand-in when Held-Karp was skipped | [L1650](../route_optimizer_backend.py#L1650) |
+| Per route: totals, legs, weight per leg, **energy per leg** | [L1661](../route_optimizer_backend.py#L1661) |
+| Return leg (empty truck) | [L1745](../route_optimizer_backend.py#L1745) |
+| Unloading time; per-route totals | [L1791](../route_optimizer_backend.py#L1791) |
+| Greedy-vs-optimal comparison | [L1829](../route_optimizer_backend.py#L1829) |
+| Google Maps URLs | [L1852](../route_optimizer_backend.py#L1852) |
+| **OR-Tools fleet** (more than one vehicle): `solve_fleet()` | [L1870](../route_optimizer_backend.py#L1870) |
+| Build the JSON response | [L1877](../route_optimizer_backend.py#L1877) |
 
 ### AI chat ([explained here](chat-assistant.md))
 | Name | Does |
 |---|---|
-| [`AXES`](../route_optimizer_backend.py#L1982), [`CAPABILITIES`](../route_optimizer_backend.py#L2030) | The fields the assistant may change, their limits, and what it can do |
-| [`check_value`](../route_optimizer_backend.py#L2165), [`make_change`](../route_optimizer_backend.py#L2216), [`describe_change`](../route_optimizer_backend.py#L2098) | Range checks and labels, shared by every path |
-| [`outcome_apply`](../route_optimizer_backend.py#L2243), [`outcome_ask`](../route_optimizer_backend.py#L2275), [`outcome_out_of_scope`](../route_optimizer_backend.py#L2285), [`outcome_recommend`](../route_optimizer_backend.py#L2309) | Build the reply for each intent |
-| [`LEXICON`](../route_optimizer_backend.py#L2713), [`lexicon_fast_path`](../route_optimizer_backend.py#L2846) | Stage 1: regex fast path, no model call |
-| [`mentions_saved_driver`](../route_optimizer_backend.py#L2832) | Sends a message that names a saved driver to the model |
-| [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3036), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3044), [`call_extraction`](../route_optimizer_backend.py#L3131) | Stage 2: GPT-4o-mini with a strict JSON schema |
-| [`validate_change`](../route_optimizer_backend.py#L3170), [`validate_extraction`](../route_optimizer_backend.py#L3305), [`route_outcome`](../route_optimizer_backend.py#L3457) | Stage 3: deterministic validation and routing |
-| [`outcome_goals`](../route_optimizer_backend.py#L2511), [`outcome_limits`](../route_optimizer_backend.py#L2586), [`outcome_disruption`](../route_optimizer_backend.py#L2624) | Goals from the situation, truck limits, breakdowns: the gates and the computed replies |
-| [`NOT_A_FORM_VALUE_RE`](../route_optimizer_backend.py#L2788), [`RESOLVE_RE`](../route_optimizer_backend.py#L2466) | Keeps goal / limit / breakdown talk away from the lexicon; "re-optimize" |
-| [`run_steps`](../route_optimizer_backend.py#L3561), [`advance_form_state`](../route_optimizer_backend.py#L3510) | Run a multi-step message in order and merge the replies |
-| [`ai_chat`](../route_optimizer_backend.py#L3610) | `POST /api/chat` |
+| [`AXES`](../route_optimizer_backend.py#L2018), [`CAPABILITIES`](../route_optimizer_backend.py#L2066) | The fields the assistant may change, their limits, and what it can do |
+| [`check_value`](../route_optimizer_backend.py#L2203), [`make_change`](../route_optimizer_backend.py#L2257), [`describe_change`](../route_optimizer_backend.py#L2136) | Range checks and labels, shared by every path |
+| [`outcome_apply`](../route_optimizer_backend.py#L2284), [`outcome_ask`](../route_optimizer_backend.py#L2316), [`outcome_out_of_scope`](../route_optimizer_backend.py#L2326), [`outcome_recommend`](../route_optimizer_backend.py#L2350) | Build the reply for each intent |
+| [`LEXICON`](../route_optimizer_backend.py#L2791), [`lexicon_fast_path`](../route_optimizer_backend.py#L2924) | Stage 1: regex fast path, no model call |
+| [`mentions_saved_driver`](../route_optimizer_backend.py#L2910) | Sends a message that names a saved driver to the model |
+| [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3114), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3122), [`call_extraction`](../route_optimizer_backend.py#L3209) | Stage 2: GPT-4o-mini with a strict JSON schema |
+| [`validate_change`](../route_optimizer_backend.py#L3249), [`validate_extraction`](../route_optimizer_backend.py#L3392), [`route_outcome`](../route_optimizer_backend.py#L3573) | Stage 3: deterministic validation and routing |
+| [`outcome_goals`](../route_optimizer_backend.py#L2581), [`outcome_limits`](../route_optimizer_backend.py#L2657), [`outcome_disruption`](../route_optimizer_backend.py#L2695) | Goals from the situation, truck limits, breakdowns: the gates and the computed replies |
+| [`NOT_A_FORM_VALUE_RE`](../route_optimizer_backend.py#L2866), [`RESOLVE_RE`](../route_optimizer_backend.py#L2522) | Keeps goal / limit / breakdown talk away from the lexicon; "re-optimize" |
+| [`run_steps`](../route_optimizer_backend.py#L3677), [`advance_form_state`](../route_optimizer_backend.py#L3626) | Run a multi-step message in order and merge the replies |
+| [`ai_chat`](../route_optimizer_backend.py#L3726) | `POST /api/chat` |
 
 ### Driver memory
 | Name | Does |
 |---|---|
-| [`MEMORY_PATH`](../route_optimizer_backend.py#L3654), [`load_memory`](../route_optimizer_backend.py#L3669), [`save_memory`](../route_optimizer_backend.py#L3682) | The `fleet_memory.json` store |
-| [`validate_profile`](../route_optimizer_backend.py#L3721) | Evidence and range gate for a driver profile |
-| [`do_remember`](../route_optimizer_backend.py#L3798), [`do_recall`](../route_optimizer_backend.py#L3830), [`do_forget`](../route_optimizer_backend.py#L3863) | The memory operations |
-| [`profile_to_vehicle`](../route_optimizer_backend.py#L3694) | Recalled driver → a vehicle entry for the form |
-| [`get_memory`](../route_optimizer_backend.py#L3879), [`clear_memory`](../route_optimizer_backend.py#L3886) | `GET` / `DELETE /api/memory` |
+| [`MEMORY_PATH`](../route_optimizer_backend.py#L3770), [`load_memory`](../route_optimizer_backend.py#L3785), [`save_memory`](../route_optimizer_backend.py#L3798) | The `fleet_memory.json` store |
+| [`validate_profile`](../route_optimizer_backend.py#L3837) | Evidence and range gate for a driver profile |
+| [`do_remember`](../route_optimizer_backend.py#L3914), [`do_recall`](../route_optimizer_backend.py#L3946), [`do_forget`](../route_optimizer_backend.py#L3979) | The memory operations |
+| [`profile_to_vehicle`](../route_optimizer_backend.py#L3810) | Recalled driver → a vehicle entry for the form |
+| [`get_memory`](../route_optimizer_backend.py#L3995), [`clear_memory`](../route_optimizer_backend.py#L4002) | `GET` / `DELETE /api/memory` |
 
 ### Benchmark endpoints
-[`benchmark_scenarios`](../route_optimizer_backend.py#L3903), [`benchmark_algorithms`](../route_optimizer_backend.py#L3909), [`benchmark_run`](../route_optimizer_backend.py#L3915): thin wrappers around `benchmark.run_benchmark`.
+[`benchmark_scenarios`](../route_optimizer_backend.py#L4019), [`benchmark_algorithms`](../route_optimizer_backend.py#L4025), [`benchmark_run`](../route_optimizer_backend.py#L4031): thin wrappers around `benchmark.run_benchmark`.
 
 The server starts at the bottom of the file: `app.run(port=5001)`.
 
@@ -159,9 +159,9 @@ Created with Create React App and styled with Tailwind. The entry chain is `src/
 | [`src/AIChatbot.jsx`](../route-optimizer-frontend/src/AIChatbot.jsx) | Floating chat panel. Sends `{message, history, form_state, pending}` to `/api/chat`, applies the returned changes, hands the turn to the page (`onTurn`) and shows the measured effect. Limits and goal-weight cards, example prompts |
 | [`src/GoalsPanel.jsx`](../route-optimizer-frontend/src/GoalsPanel.jsx) | Sidebar Optimization Goals: a level per goal, the weight mix, battery reserve, priority stops |
 | [`src/PlanComparison.jsx`](../route-optimizer-frontend/src/PlanComparison.jsx) | **What changed**: two plan versions side by side, with settings, metrics and stop orders |
-| [`src/planDiff.js`](../route-optimizer-frontend/src/planDiff.js) | Pure functions behind the comparison: a plan's metrics, moved / added stops, setting changes, the chat's impact text |
+| [`src/planDiff.js`](../route-optimizer-frontend/src/planDiff.js) | Pure functions behind the comparison: a plan's metrics, moved / added stops, setting changes, the chat's impact text, where a battery runs out |
 | [`src/goals.js`](../route-optimizer-frontend/src/goals.js) | Goal levels and weights (mirrors the backend table) |
-| [`src/RouteMap.jsx`](../route-optimizer-frontend/src/RouteMap.jsx) | Google Maps view of the routes (Directions renderer, one colour per vehicle) |
+| [`src/RouteMap.jsx`](../route-optimizer-frontend/src/RouteMap.jsx) | Google Maps view of the routes (Directions renderer, one colour per vehicle). Stops are numbered by delivery order on the truck that serves them, in its colour ([`stopSequence`](../route-optimizer-frontend/src/RouteMap.jsx)); a marker shows where a truck's battery runs out |
 | [`src/FleetCharts.jsx`](../route-optimizer-frontend/src/FleetCharts.jsx) | Bar charts (Recharts) of time and energy: single vehicle vs each fleet vehicle |
 | [`src/BenchmarkPanel.jsx`](../route-optimizer-frontend/src/BenchmarkPanel.jsx) | Benchmark tab: pick a scenario, fleet sizes, algorithms and time limit; run; results table |
 | `src/BenchmarkCharts.jsx`, `BenchmarkRoutes.jsx`, `BenchmarkRouteMap.jsx` | Benchmark charts, per-algorithm route lists and map |

@@ -158,6 +158,8 @@ SUITES = {
 "K. Goals in plain language": [
     ("battery is tight today", "goals"),
     ("Battery is tight today — keep 20% in every truck", "goals"),
+    ("keep at least 20% battery in each truck", "goals"),
+    ("battery is tight, keep 20% in each truck", "goals"),
     ("we're running late, get everyone back sooner", "goals"),
     ("drivers say the routes are unfair", "goals"),
     ("electricity is expensive this month", "goals"),

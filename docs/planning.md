@@ -1,7 +1,7 @@
 # Optimization goals, truck limits and breakdowns
 
 **Code:** the "Optimization goals, truck limits and breakdown re-planning" section of
-[`route_optimizer_backend.py`](../route_optimizer_backend.py#L637) and
+[`route_optimizer_backend.py`](../route_optimizer_backend.py#L622) and
 [`solve_vrp_constrained()`](../solvers.py#L345) in `solvers.py`.
 UI: [`GoalsPanel.jsx`](../route-optimizer-frontend/src/GoalsPanel.jsx),
 [`PlanComparison.jsx`](../route-optimizer-frontend/src/PlanComparison.jsx),
@@ -97,7 +97,7 @@ already on the form.
 
 ## Breakdown re-planning
 
-`POST /api/replan` ([`replan_breakdown()`](../route_optimizer_backend.py#L1116))
+`POST /api/replan` ([`replan_breakdown()`](../route_optimizer_backend.py#L1144))
 takes the current plan and a breakdown: which truck, and either *after its k-th stop* or
 *m minutes after dispatch*. It re-plans the rest of the day:
 
@@ -139,7 +139,7 @@ the day from the start and clears the simulated breakdown.
 
 ## Truck limits
 
-[`truck_limits()`](../route_optimizer_backend.py#L1368) answers "what are the limits
+[`truck_limits()`](../route_optimizer_backend.py#L1396) answers "what are the limits
 of a truck with 3 battery packs?". Every number is computed:
 
 | | 3 packs, 20 °C, HVAC on |
