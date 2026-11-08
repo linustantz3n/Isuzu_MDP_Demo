@@ -33,7 +33,7 @@ def route_subset(problem, stop_ids: list, tsp_fn: Callable) -> list:
     if not stop_ids:
         return None
     nodes = [0] + list(stop_ids)
-    sub = [[problem.dist[a][b] for b in nodes] for a in nodes]
+    sub = [[problem.cost[a][b] for b in nodes] for a in nodes]
     result = tsp_fn(sub, return_to_start=True)
     return [nodes[i] for i in result["order"]] + [0]
 
@@ -47,8 +47,8 @@ def _projected_xy(problem) -> list:
     ]
 
 
-def _route_distance(problem, route: list) -> float:
-    return sum(problem.dist[route[i]][route[i + 1]] for i in range(len(route) - 1))
+def _route_cost(problem, route: list) -> float:
+    return sum(problem.cost[route[i]][route[i + 1]] for i in range(len(route) - 1))
 
 
 def _even_chunks(items: list, k: int) -> list:
@@ -170,7 +170,7 @@ def solve_sweep_2opt(problem) -> list:
     """
     Sort stops by polar angle around the depot, cut into K contiguous sectors
     of balanced size (<= stop cap), 2-opt each sector. Every rotation of the
-    sweep start angle is tried and the lowest total distance is kept.
+    sweep start angle is tried and the lowest total cost is kept.
     """
     xy = _projected_xy(problem)
     dx, dy = xy[0]
@@ -183,7 +183,7 @@ def solve_sweep_2opt(problem) -> list:
         order = by_angle[start:] + by_angle[:start]
         routes = [r for r in (route_subset(problem, chunk, solve_tsp_2opt)
                               for chunk in _even_chunks(order, k)) if r]
-        cost = sum(_route_distance(problem, r) for r in routes)
+        cost = sum(_route_cost(problem, r) for r in routes)
         if cost < best_cost:
             best_routes, best_cost = routes, cost
     return best_routes
@@ -196,14 +196,14 @@ def solve_sweep_2opt(problem) -> list:
 def solve_clarke_wright(problem) -> list:
     """
     Start with one out-and-back route per stop, then merge route endpoints in
-    decreasing order of savings s(i,j) = d(0,i) + d(0,j) - d(i,j) while the
+    decreasing order of savings s(i,j) = c(0,i) + c(0,j) - c(i,j) while the
     merged route stays within the stop cap. Savings use the symmetrized
-    distance; each final route is driven in whichever direction is shorter.
+    cost; each final route is driven in whichever direction is cheaper.
 
     Classic Clarke-Wright does not fix the number of vehicles, so it can end
     with more than K routes. That is reported (and scored infeasible), not hidden.
     """
-    d = problem.dist
+    d = problem.cost
     cap = problem.max_stops_per_vehicle
 
     def sym(a, b):
@@ -241,7 +241,7 @@ def solve_clarke_wright(problem) -> list:
     result = []
     for r in routes.values():
         fwd, rev = [0] + r + [0], [0] + r[::-1] + [0]
-        result.append(fwd if _route_distance(problem, fwd) <= _route_distance(problem, rev) else rev)
+        result.append(fwd if _route_cost(problem, fwd) <= _route_cost(problem, rev) else rev)
     return result
 
 
@@ -253,21 +253,32 @@ def _int_matrix(matrix: list) -> list:
     return [[int(round(v)) for v in row] for row in matrix]
 
 
+def _battery_kwargs(problem) -> dict:
+    if problem.energy_limit_wh is None:
+        return {}
+    return {
+        "energy_matrices": [problem.energy_bound_wh] * problem.num_vehicles,
+        "energy_limits": [problem.energy_limit_wh] * problem.num_vehicles,
+    }
+
+
 def solve_ortools(problem) -> list:
     return solve_vrp_ortools(
-        _int_matrix(problem.dist),
+        _int_matrix(problem.cost),
         problem.num_vehicles,
         time_limit_s=problem.ortools_time_limit_s,
+        **_battery_kwargs(problem),
     )
 
 
 def solve_ortools_cheap(problem) -> list:
     return solve_vrp_ortools(
-        _int_matrix(problem.dist),
+        _int_matrix(problem.cost),
         problem.num_vehicles,
         metaheuristic=None,
         solution_limit=1,
         time_limit_s=problem.ortools_time_limit_s,
+        **_battery_kwargs(problem),
     )
 
 
@@ -306,7 +317,7 @@ class Algorithm:
 
 ALGORITHMS = [
     Algorithm("nn", "Nearest Neighbor", "naive", "single",
-              "Greedy: always drive to the closest unvisited stop.", solve_nn),
+              "Greedy: always drive to the cheapest unvisited stop next.", solve_nn),
     Algorithm("2opt", "2-opt", "tsp_heuristic", "single",
               "Nearest neighbor, then reverse route segments while it helps.", solve_2opt),
     Algorithm("held_karp", "Held-Karp (optimal)", "exact", "single",
@@ -320,7 +331,7 @@ ALGORITHMS = [
     Algorithm("sweep_2opt", "Sweep + 2-opt", "cluster_first", "any",
               "Radial sectors around the depot (Gillett-Miller), then 2-opt per sector.", solve_sweep_2opt),
     Algorithm("clarke_wright", "Clarke-Wright Savings", "vrp_heuristic", "any",
-              "Merge out-and-back routes by largest distance savings, within the stop cap.", solve_clarke_wright),
+              "Merge out-and-back routes by largest cost savings, within the stop cap.", solve_clarke_wright),
     Algorithm("ortools_cheap", "OR-Tools (construction only)", "ortools", "any",
               "PATH_CHEAPEST_ARC first solution, no local search.", solve_ortools_cheap),
     Algorithm("ortools", "OR-Tools (production)", "ortools", "any",

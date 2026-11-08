@@ -25,8 +25,17 @@ from solvers import (
     solve_tsp_nearest_neighbor,
     solve_tsp_2opt,
     solve_vrp_ortools,
+    BatteryLimitError,
 )
-from benchmark import ALGORITHMS as BENCHMARK_ALGORITHMS, list_scenarios, run_benchmark
+from energy import (  # noqa: F401 (used below)
+    calculate_energy_consumption,
+    estimate_average_speed,
+    battery_limit_wh,
+    energy_upper_bound_matrix_wh,
+    DEFAULT_BATTERY_RESERVE_PCT,
+)
+from benchmark import ALGORITHMS as BENCHMARK_ALGORITHMS, list_scenarios, run_benchmark, simulate
+from benchmark.runner import fixed_plan_view
 
 # Load environment variables from .env file
 load_dotenv()
@@ -190,140 +199,6 @@ def get_elevation_data(locations: list) -> list:
 
 
 # =============================================================================
-# Energy Consumption Model — Model E regression
-# =============================================================================
-
-def calculate_energy_consumption(
-    distance_km: float,
-    avg_speed_kmh: float,
-    temperature_c: float,
-    vehicle_weight_tonnes: float,
-    altitude_diff_m: float,
-    altitude_m: float,
-    has_climate_control: bool = True
-) -> dict:
-    """
-    Calculate energy consumption using Model E polynomial regression.
-
-    Model E extends Model D with two air-density interaction terms that capture
-    how aerodynamic drag varies with temperature and absolute altitude:
-      F_aero ∝ ρ(T, alt) · v²   where ρ decreases with higher T and higher alt.
-
-    Formula (returns kWh per leg):
-      grade = alt_diff_m / dist_km   (m/km)
-      e_per_km = b0 + b1*v + b2*T + b3*W + b4*Δh + b5*v²
-               + b6*(W·grade) + b7*(v·grade)
-               + b8*(v²·T)    + b9*(v²·alt_m)
-      total_kwh = e_per_km * dist_km
-
-    Target range: 0.85–1.3 kWh/mile (Isuzu N-Series EV)
-    R²=0.9997, MAPE=3.46%, test RMSE=0.38 kWh
-
-    Args:
-        distance_km:           Leg distance in km
-        avg_speed_kmh:         Average speed in km/h
-        temperature_c:         Ambient temperature in °C
-        vehicle_weight_tonnes: Gross vehicle weight in tonnes
-        altitude_diff_m:       Elevation change over leg in m (+ = uphill)
-        altitude_m:            Absolute elevation at leg start in m (above sea level)
-        has_climate_control:   HVAC active (additive overhead, not in regression)
-
-    Returns:
-        Dict with energy_kwh and breakdown
-    """
-    # Model E fitted coefficients (Isuzu N-Series EV, R²=0.9997, MAPE=3.46%)
-    # Units: dist=km, speed=km/h, temp=°C, weight=tonnes, alt=metres, grade=m/km
-    b0 =  5.7142142481e-01   # intercept
-    b1 = -1.0081493644e-02   # speed (v)
-    b2 =  1.4087882356e-04   # temperature (T)
-    b3 =  1.8176062830e-02   # weight (W)
-    b4 =  1.7585256876e-05   # altitude change (Δh)
-    b5 =  1.2923132040e-04   # speed squared (v²)
-    b6 =  2.8886974460e-03   # weight × road grade (W·Δh/d)
-    b7 = -9.9890433238e-06   # speed × road grade (v·Δh/d)
-    b8 = -2.6120414024e-07   # speed²×temp  (ρ–temperature coupling)
-    b9 = -8.6411314209e-09   # speed²×alt_m (ρ–altitude coupling)
-
-    # Avoid division by zero on zero-length legs
-    if distance_km <= 0:
-        return {"energy_kwh": 0.0, "energy_per_km": 0.0, "energy_per_mile": 0.0,
-                "miles_per_kwh": 0.0, "kwh_per_mile": 0.0, "breakdown": {}}
-
-    dist  = distance_km      # km
-    v     = avg_speed_kmh    # km/h
-    T     = temperature_c
-    W     = vehicle_weight_tonnes
-    dh    = altitude_diff_m
-    h     = altitude_m
-
-    # grade = alt_diff_m / dist_km  →  m/km (as model expects)
-    grade = dh / dist
-
-    energy_per_km = (
-        b0
-        + b1 * v
-        + b2 * T
-        + b3 * W
-        + b4 * dh
-        + b5 * v**2
-        + b6 * (W * grade)
-        + b7 * (v * grade)
-        + b8 * (v**2 * T)
-        + b9 * (v**2 * h)
-    )
-
-    # HVAC additive overhead (0.092 kWh/km)
-    hvac_per_km = 0.092 if has_climate_control else 0.0
-    energy_per_km += hvac_per_km
-
-    total_energy_kwh = energy_per_km * dist
-
-    dist_miles = distance_km * 0.621371
-    energy_per_mile = total_energy_kwh / dist_miles if dist_miles > 0 else 0
-    miles_per_kwh = dist_miles / total_energy_kwh if total_energy_kwh > 0 else 0
-
-    return {
-        "energy_kwh": total_energy_kwh,
-        "energy_per_km": energy_per_km,
-        "energy_per_mile": energy_per_mile,
-        "miles_per_kwh": miles_per_kwh,
-        "kwh_per_mile": 1 / miles_per_kwh if miles_per_kwh > 0 else 0,
-        "breakdown": {
-            "intercept_kwh":       b0             * dist,
-            "speed_kwh":           b1 * v         * dist,
-            "temperature_kwh":     b2 * T         * dist,
-            "weight_kwh":          b3 * W         * dist,
-            "altitude_diff_kwh":   b4 * dh        * dist,
-            "speed_sq_kwh":        b5 * v**2      * dist,
-            "weight_grade_kwh":    b6 * W * grade * dist,
-            "speed_grade_kwh":     b7 * v * grade * dist,
-            "aero_temp_kwh":       b8 * v**2 * T  * dist,
-            "aero_alt_kwh":        b9 * v**2 * h  * dist,
-            "climate_control_kwh": hvac_per_km    * dist,
-        }
-    }
-
-
-def estimate_average_speed(distance_m: float, time_s: float) -> float:
-    """
-    Estimate average speed from distance and time.
-
-    Args:
-        distance_m: Distance in meters
-        time_s: Time in seconds
-
-    Returns:
-        Average speed in km/h
-    """
-    if time_s == 0:
-        return 0.0
-
-    distance_km = distance_m / 1000
-    time_h = time_s / 3600
-    return distance_km / time_h
-
-
-# =============================================================================
 # API Endpoints
 # =============================================================================
 
@@ -431,6 +306,10 @@ def optimize_route():
         total_weight_lbs    = float(energy_params.get('total_weight_lbs', 19500.0))
         base_weight_lbs     = float(energy_params.get('base_weight_lbs', 7000.0))
         unload_time_min     = float(energy_params.get('unload_time_min', 30.0))
+        # Share of the battery each truck must still hold at every point of its route
+        battery_reserve_pct = float(energy_params.get('battery_reserve_pct', DEFAULT_BATTERY_RESERVE_PCT))
+        if not 0 <= battery_reserve_pct < 100:
+            return jsonify({"status": "error", "message": "battery_reserve_pct must be between 0 and 100"}), 400
         has_climate_control = energy_params.get('has_climate_control', True)
 
         base_weight_tonnes  = base_weight_lbs / 2204.62
@@ -447,6 +326,14 @@ def optimize_route():
             """Return the empty-truck weight for this vehicle based on its pack count."""
             packs = int(vcfg.get('battery_packs', DEFAULT_PACKS))
             return BASE_TRUCK_4PACKS + (packs - DEFAULT_PACKS) * PACK_WEIGHT_LBS
+
+        def vehicle_total_weight_lbs(vcfg):
+            """Return the loaded-truck weight; weight_lbs wins over legacy weight_tonnes."""
+            if 'weight_lbs' in vcfg:
+                return float(vcfg['weight_lbs'])
+            if 'weight_tonnes' in vcfg:
+                return float(vcfg['weight_tonnes']) * 2204.62
+            return DEFAULT_WEIGHT_LBS
         if not vehicles_config:
             vehicles_config = [
                 {
@@ -681,8 +568,36 @@ def optimize_route():
 
         # ── OR-Tools fleet routing (only when num_vehicles > 1) ──────────────
         if num_vehicles > 1:
+            fleet_cfgs = [vehicles_config[v] if v < len(vehicles_config) else vehicles_config[-1]
+                          for v in range(num_vehicles)]
+            # Upper-bound energy per arc for each distinct truck build (weight, packs)
+            bound_cache = {}
+            energy_matrices = []
+            for vcfg in fleet_cfgs:
+                weights = (vehicle_total_weight_lbs(vcfg), vehicle_base_weight_lbs(vcfg))
+                if weights not in bound_cache:
+                    bound_cache[weights] = energy_upper_bound_matrix_wh(
+                        matrices['distance'], matrices['time'], elevations,
+                        loaded_weight_lbs=weights[0], base_weight_lbs=weights[1],
+                        temperature_c=temperature_c, has_climate_control=has_climate_control,
+                    )
+                energy_matrices.append(bound_cache[weights])
+            energy_limits = [battery_limit_wh(float(vcfg.get('battery_kwh', DEFAULT_BATTERY_KWH)), battery_reserve_pct)
+                             for vcfg in fleet_cfgs]
+
             start = time.time()
-            vrp_routes = solve_vrp_ortools(matrix, num_vehicles)
+            try:
+                vrp_routes = solve_vrp_ortools(matrix, num_vehicles,
+                                               energy_matrices=energy_matrices, energy_limits=energy_limits,
+                                               keep_empty=True)
+            except BatteryLimitError as e:
+                return jsonify({
+                    "status": "error",
+                    "error_type": "battery_limit",
+                    "message": str(e),
+                    "battery_reserve_pct": battery_reserve_pct,
+                    "unreachable_stops": [locations[i] for i in e.unreachable_stops],
+                }), 422
             solve_ms = (time.time() - start) * 1000
 
             fleet_routes = []
@@ -690,18 +605,15 @@ def optimize_route():
             fleet_total_energy = 0
 
             for v_idx, route in enumerate(vrp_routes):
+                if len(route) <= 2:
+                    continue  # this vehicle got no stops
                 # route = [0, a, b, 0] — depot at both ends
                 v_dist = sum(matrices['distance'][route[i]][route[i+1]] for i in range(len(route)-1))
                 v_time = sum(matrices['time'][route[i]][route[i+1]] for i in range(len(route)-1))
 
                 # Per-vehicle config (weight, battery)
-                vcfg = vehicles_config[v_idx] if v_idx < len(vehicles_config) else vehicles_config[-1]
-                if 'weight_lbs' in vcfg:
-                    v_total_weight_lbs = float(vcfg['weight_lbs'])
-                elif 'weight_tonnes' in vcfg:
-                    v_total_weight_lbs = float(vcfg['weight_tonnes']) * 2204.62
-                else:
-                    v_total_weight_lbs = DEFAULT_WEIGHT_LBS
+                vcfg = fleet_cfgs[v_idx]
+                v_total_weight_lbs = vehicle_total_weight_lbs(vcfg)
                 v_base_weight_lbs = vehicle_base_weight_lbs(vcfg)
                 v_cargo_weight_lbs = max(0.0, v_total_weight_lbs - v_base_weight_lbs)
                 v_weight = vcfg.get('weight_tonnes', v_total_weight_lbs / 2204.62)
@@ -796,6 +708,8 @@ def optimize_route():
                     "battery_remaining_kwh": round(battery_remaining, 2),
                     "battery_remaining_pct": round(battery_pct, 1),
                     "battery_depleted": v_energy > v_battery,
+                    "battery_reserve_pct": battery_reserve_pct,
+                    "below_battery_reserve": battery_pct < battery_reserve_pct,
                     "google_maps_url": v_url,
                     "legs": v_legs
                 })
@@ -816,6 +730,7 @@ def optimize_route():
                 "total_driver_time_s": sum(r["total_time_s"] for r in fleet_routes),
                 "total_energy_kwh": fleet_total_energy,
                 "avg_energy_per_mile": fleet_total_energy / (fleet_total_dist / 1609.34) if fleet_total_dist > 0 else 0,
+                "battery_reserve_pct": battery_reserve_pct,
                 "solve_time_ms": solve_ms
             }
 
@@ -879,17 +794,88 @@ def benchmark_algorithms():
     return jsonify({"status": "ok", "algorithms": [a.to_dict() for a in BENCHMARK_ALGORITHMS]})
 
 
+@app.route('/api/benchmark/fixed_plan', methods=['GET'])
+def benchmark_fixed_plan():
+    """The fixed stop order (which truck visits which stops, in order) for a scenario and fleet size."""
+    scenario_id = request.args.get('scenario_id')
+    if not scenario_id:
+        return jsonify({"status": "error", "message": "scenario_id is required"}), 400
+    try:
+        plan = fixed_plan_view(scenario_id, int(request.args.get('num_vehicles', 1)))
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    return jsonify({"status": "ok", **plan})
+
+
 @app.route('/api/benchmark/run', methods=['POST'])
 def benchmark_run():
     """
-    Run every selected algorithm for K = 1..max_vehicles on a saved scenario.
+    Run every selected algorithm on a saved scenario.
+
+    Fleet size: send "num_vehicles": 5 to run K = 5 only (add
+    "include_smaller_fleets": true to run K = 1..5). The legacy "max_vehicles"
+    runs K = 1..max_vehicles.
 
     Expected JSON:
     {
         "scenario_id": "demo_anaheim",
-        "max_vehicles": 3,
+        "num_vehicles": 5,
+        "include_smaller_fleets": false,
+        "preserve_stop_order": false,            // lock every truck to the fixed plan; all algorithms return it unchanged
         "algorithms": ["nn", "ortools", ...],   // optional, default all
-        "ortools_time_limit_s": 5                // optional, default production
+        "ortools_time_limit_s": 5,               // optional, default production
+        "objective": {                           // optional, default distance
+            "mode": "distance" | "time" | "energy" | "blend",
+            "weights": {"distance": 50, "time": 25, "energy": 25}   // blend only
+        },
+        "energy_params": {"temperature_c": 20, "loaded_weight_lbs": 13000,
+                          "base_weight_lbs": 7000, "has_climate_control": true}   // optional
+    }
+    """
+    data = request.json or {}
+    scenario_id = data.get('scenario_id')
+    if not scenario_id:
+        return jsonify({"status": "error", "message": "scenario_id is required"}), 400
+
+    time_limit = data.get('ortools_time_limit_s')
+    fleet_sizes = None
+    try:
+        if data.get('num_vehicles') is not None:
+            k = int(data['num_vehicles'])
+            fleet_sizes = list(range(1, k + 1)) if data.get('include_smaller_fleets') else [k]
+        result = run_benchmark(
+            scenario_id,
+            max_vehicles=int(data.get('max_vehicles', 3)),
+            fleet_sizes=fleet_sizes,
+            preserve_stop_order=bool(data.get('preserve_stop_order')),
+            algorithm_ids=data.get('algorithms') or None,
+            ortools_time_limit_s=int(time_limit) if time_limit else None,
+            objective=data.get('objective'),
+            energy_params=data.get('energy_params'),
+        )
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({"status": "ok", **result})
+
+
+@app.route('/api/benchmark/simulate', methods=['POST'])
+def benchmark_simulate():
+    """
+    Plan a battery-limited fleet on a saved scenario, then simulate driving it
+    with extra battery drain, replanning (and dropping stops if needed) at
+    every stop. See benchmark/simulate.py.
+
+    Expected JSON:
+    {
+        "scenario_id": "case1_plymouth_mi",
+        "num_vehicles": 4,
+        "energy_params": {"battery_kwh": 110, "battery_reserve_pct": 20, ...},   // battery_kwh required
+        "drain": {"factor": 1.3, "event": {"after_stop": 3, "factor": 1.6}},     // event optional
+        "objective": {...},                     // optional, as in /api/benchmark/run
+        "ortools_time_limit_s": 5               // optional, initial plan only
     }
     """
     data = request.json or {}
@@ -899,13 +885,17 @@ def benchmark_run():
 
     time_limit = data.get('ortools_time_limit_s')
     try:
-        result = run_benchmark(
+        result = simulate(
             scenario_id,
-            max_vehicles=int(data.get('max_vehicles', 3)),
-            algorithm_ids=data.get('algorithms') or None,
+            int(data.get('num_vehicles', 2)),
+            energy_params=data.get('energy_params'),
+            drain=data.get('drain'),
+            objective=data.get('objective'),
             ortools_time_limit_s=int(time_limit) if time_limit else None,
         )
-    except ValueError as e:
+    except BatteryLimitError as e:
+        return jsonify({"status": "error", "error_type": "battery_limit", "message": str(e)}), 422
+    except (ValueError, TypeError) as e:
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -933,6 +923,7 @@ if __name__ == '__main__':
     print("  GET  /api/benchmark/scenarios  - List benchmark scenarios")
     print("  GET  /api/benchmark/algorithms - List benchmark algorithms")
     print("  POST /api/benchmark/run        - Run algorithm comparison")
+    print("  POST /api/benchmark/simulate   - Simulate battery drain + replanning")
     print()
     print("Starting server on http://localhost:5001")
     print("=" * 60)

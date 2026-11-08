@@ -38,7 +38,11 @@ function fetchDirections(route, locations) {
   return directionsCache.get(key);
 }
 
-export default function BenchmarkRouteMap({ routes, locations }) {
+// `slots` gives each route its truck number / color slot (0-based). It defaults to the
+// route's position; the comparison view passes matched slots so the same truck shares a
+// color and number on both maps.
+export default function BenchmarkRouteMap({ routes, locations, slots }) {
+  const slotOf = (idx) => (slots ? slots[idx] : idx);
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -94,7 +98,7 @@ export default function BenchmarkRouteMap({ routes, locations }) {
     <div className="rounded-lg border border-slate-800 overflow-hidden">
       <div className="p-3 border-b border-slate-800 flex flex-wrap items-center gap-2 bg-slate-950/60">
         {routes.map((route, idx) => {
-          const color = truckColor(idx);
+          const color = truckColor(slotOf(idx));
           const active = visible.has(idx);
           return (
             <button
@@ -108,7 +112,7 @@ export default function BenchmarkRouteMap({ routes, locations }) {
               <svg width="16" height="8">
                 <line x1="0" y1="4" x2="16" y2="4" stroke={active ? color : '#475569'} strokeWidth="3" />
               </svg>
-              Truck {idx + 1}
+              Truck {slotOf(idx) + 1}
             </button>
           );
         })}
@@ -143,7 +147,7 @@ export default function BenchmarkRouteMap({ routes, locations }) {
               options={{
                 suppressMarkers: true,
                 suppressFitBounds: true,
-                polylineOptions: { strokeColor: truckColor(idx), strokeOpacity: 0.9, strokeWeight: 5, zIndex: 2 + idx },
+                polylineOptions: { strokeColor: truckColor(slotOf(idx)), strokeOpacity: 0.9, strokeWeight: 5, zIndex: 2 + idx },
               }}
             />
           ))}
@@ -164,7 +168,7 @@ export default function BenchmarkRouteMap({ routes, locations }) {
               position={{ lat: locations[locIdx].lat, lng: locations[locIdx].lng }}
               icon={{
                 path: window.google.maps.SymbolPath.CIRCLE, scale: 9,
-                fillColor: truckColor(truck), fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
+                fillColor: truckColor(slotOf(truck)), fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2,
               }}
               label={{ text: String(pos), color: '#ffffff', fontSize: '11px', fontWeight: 'bold' }}
               zIndex={20}
@@ -181,7 +185,7 @@ export default function BenchmarkRouteMap({ routes, locations }) {
                 <p style={{ fontWeight: 'bold', marginBottom: '4px' }}>
                   {selectedMarker.locIdx === 0
                     ? 'Depot'
-                    : `Truck ${selectedMarker.truck + 1} · Stop ${selectedMarker.pos}`}
+                    : `Truck ${slotOf(selectedMarker.truck) + 1} · Stop ${selectedMarker.pos}`}
                 </p>
                 {selected.name && <p style={{ fontSize: '12px', marginBottom: '2px' }}>{selected.name}</p>}
                 <p style={{ fontSize: '12px', color: '#334155' }}>{selected.formatted_address || selected.address}</p>

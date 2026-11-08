@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3 } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity } from 'lucide-react';
 import RouteMap from './RouteMap';
 import FleetCharts from './FleetCharts';
 import BenchmarkPanel from './BenchmarkPanel';
+import BenchmarkSimulation from './BenchmarkSimulation';
 import { API_BASE } from './api';
 
 const DEMO_ADDRESSES = [
@@ -224,7 +225,8 @@ function RouteOptimizer() {
       const data = await response.json();
 
       if (data.status === 'error') {
-        throw new Error(data.message);
+        const far = (data.unreachable_stops || []).map(l => l.name || l.address).join('; ');
+        throw new Error(far ? `${data.message} Out of range: ${far}` : data.message);
       }
 
       setResults(data.results);
@@ -274,6 +276,7 @@ function RouteOptimizer() {
   const TABS = [
     { id: 'solver', label: 'Solver', icon: Route },
     { id: 'benchmark', label: 'Benchmark', icon: BarChart3 },
+    { id: 'simulate', label: 'Drive Sim', icon: Activity },
   ];
 
   return (
@@ -321,6 +324,11 @@ function RouteOptimizer() {
       {/* ── Benchmark tab (kept mounted so results survive tab switches) ── */}
       <div className={`flex flex-1 min-h-0 ${activeTab === 'benchmark' ? '' : 'hidden'}`}>
         <BenchmarkPanel />
+      </div>
+
+      {/* ── Drive simulation tab ── */}
+      <div className={`flex flex-1 min-h-0 ${activeTab === 'simulate' ? '' : 'hidden'}`}>
+        <BenchmarkSimulation />
       </div>
 
       {/* ── Body ───────────────────────────────────────────── */}
@@ -930,7 +938,7 @@ function RouteOptimizer() {
                                 </span>
                                 <span className={`font-semibold ${
                                   route.battery_depleted ? 'text-red-400' :
-                                  route.battery_remaining_pct < 20 ? 'text-orange-400' :
+                                  route.battery_remaining_pct < (route.battery_reserve_pct ?? 20) ? 'text-orange-400' :
                                   'text-green-400'
                                 }`}>
                                   {route.battery_depleted ? 'DEPLETED' : `${route.battery_remaining_pct}%`}
@@ -940,7 +948,7 @@ function RouteOptimizer() {
                                 <div
                                   className={`h-full rounded-full transition-all ${
                                     route.battery_depleted ? 'bg-red-500' :
-                                    route.battery_remaining_pct < 20 ? 'bg-orange-500' :
+                                    route.battery_remaining_pct < (route.battery_reserve_pct ?? 20) ? 'bg-orange-500' :
                                     'bg-green-500'
                                   }`}
                                   style={{ width: `${Math.min(100, route.battery_remaining_pct || 0)}%` }}

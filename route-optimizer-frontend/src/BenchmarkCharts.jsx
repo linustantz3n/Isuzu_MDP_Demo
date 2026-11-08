@@ -10,6 +10,7 @@ export const FAMILY_COLORS = {
   tsp_heuristic: '#3b82f6',
   cluster_first: '#10b981',
   vrp_heuristic: '#a855f7',
+  baseline: '#f59e0b',
 };
 
 const TOOLTIP_STYLE = {
@@ -60,14 +61,14 @@ function HorizontalBars({ title, subtitle, data, dataKey, unit }) {
 
 export default function BenchmarkCharts({ result, selectedK }) {
   const gapData = result.rows
-    .filter(r => r.num_vehicles === selectedK && r.metrics?.gap_to_best_distance_pct != null)
-    .sort((a, b) => a.metrics.total_distance_m - b.metrics.total_distance_m)
-    .map(r => ({ name: r.label, value: r.metrics.gap_to_best_distance_pct, fill: algoColor(r) }));
+    .filter(r => r.num_vehicles === selectedK && r.metrics?.gap_to_best_objective_pct != null)
+    .sort((a, b) => a.metrics.objective_cost - b.metrics.objective_cost)
+    .map(r => ({ name: r.label, value: r.metrics.gap_to_best_objective_pct, fill: algoColor(r) }));
 
   return (
     <HorizontalBars
-      title="Distance Gap to Best"
-      subtitle="How much farther each algorithm drives than the best feasible result (0% = best)"
+      title="Gap to Best"
+      subtitle={`How much worse each algorithm is on ${result.objective.label} than the best feasible result (0% = best)`}
       data={gapData}
       dataKey="value"
       unit="%"

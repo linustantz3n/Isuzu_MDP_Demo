@@ -11,6 +11,14 @@ from itertools import permutations
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
+
+class BatteryLimitError(Exception):
+    """No route plan keeps every truck above its battery reserve."""
+
+    def __init__(self, message: str, unreachable_stops: list = None):
+        super().__init__(message)
+        self.unreachable_stops = unreachable_stops or []
+
 # =============================================================================
 # TSP Solvers
 # =============================================================================
@@ -260,6 +268,9 @@ def solve_vrp_ortools(
     metaheuristic: str = "GUIDED_LOCAL_SEARCH",
     time_limit_s: int = None,
     solution_limit: int = None,
+    energy_matrices: list = None,
+    energy_limits: list = None,
+    keep_empty: bool = False,
 ) -> list:
     """
     Solve multi-vehicle VRP using Google OR-Tools.
@@ -275,6 +286,15 @@ def solve_vrp_ortools(
     the benchmark compare cheaper configurations: metaheuristic=None skips
     local-search metaheuristics, and solution_limit=1 returns the first
     solution found by the construction heuristic.
+
+    Battery limit: pass energy_matrices (one integer Wh arc matrix per
+    vehicle) and energy_limits (Wh each vehicle may use before its reserve).
+    Energy used so far is tracked at every node, so no truck drops below its
+    reserve at any point of its route. Raises BatteryLimitError if no plan
+    fits.
+
+    keep_empty=True returns one route per vehicle, in vehicle order, with
+    [0, 0] for unused vehicles, so callers can match routes to vehicles.
     """
     n = len(matrix)
     num_stops = n - 1
@@ -309,6 +329,18 @@ def solve_vrp_ortools(
         'StopCount'
     )
 
+    battery_limited = energy_matrices is not None
+    if battery_limited:
+        _check_stops_reachable(energy_matrices, energy_limits)
+        energy_callbacks = [_arc_callback(manager, m) for m in energy_matrices]
+        routing.AddDimensionWithVehicleTransitAndCapacity(
+            [routing.RegisterTransitCallback(cb) for cb in energy_callbacks],
+            0,
+            [int(limit) for limit in energy_limits],
+            True,
+            'Energy'
+        )
+
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = getattr(
         routing_enums_pb2.FirstSolutionStrategy, first_solution_strategy
@@ -324,7 +356,24 @@ def solve_vrp_ortools(
     search_params.time_limit.seconds = time_limit
 
     solution = routing.SolveWithParameters(search_params)
+    if not solution and battery_limited:
+        # A tight energy limit can defeat the default construction heuristic
+        # even when a plan exists; insertion heuristics cope better.
+        for strategy in ("PARALLEL_CHEAPEST_INSERTION", "LOCAL_CHEAPEST_INSERTION"):
+            if strategy == first_solution_strategy:
+                continue
+            search_params.first_solution_strategy = getattr(
+                routing_enums_pb2.FirstSolutionStrategy, strategy
+            )
+            solution = routing.SolveWithParameters(search_params)
+            if solution:
+                break
     if not solution:
+        if battery_limited:
+            raise BatteryLimitError(
+                f"No plan with {num_vehicles} vehicle(s) keeps every truck above its battery "
+                f"reserve. Add vehicles or battery packs, or lower the reserve."
+            )
         raise Exception("OR-Tools could not find a valid solution")
 
     routes = []
@@ -335,8 +384,93 @@ def solve_vrp_ortools(
             route.append(manager.IndexToNode(index))
             index = solution.Value(routing.NextVar(index))
         route.append(manager.IndexToNode(index))  # append end depot
-        if len(route) > 2:
+        if len(route) > 2 or keep_empty:
             routes.append(route)
 
     return routes
 
+
+def _arc_callback(manager, matrix):
+    def callback(from_index, to_index):
+        return matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+    return callback
+
+
+def _check_stops_reachable(energy_matrices: list, energy_limits: list) -> None:
+    """Fail fast, naming the stops no truck can serve even as an out-and-back trip."""
+    n = len(energy_matrices[0])
+    unreachable = [
+        j for j in range(1, n)
+        if all(m[0][j] + m[j][0] > limit for m, limit in zip(energy_matrices, energy_limits))
+    ]
+    if unreachable:
+        raise BatteryLimitError(
+            f"Stop(s) {unreachable} are too far for any truck to reach and return "
+            f"without dropping below its battery reserve.",
+            unreachable_stops=unreachable,
+        )
+
+
+
+def replan_route(
+    cost: list,
+    start: int,
+    end: int,
+    stops: list,
+    energy_matrix: list,
+    energy_limit: int,
+    time_limit_s: int = None,
+) -> dict:
+    """
+    Re-route one truck mid-drive: from `start` through as many of `stops` as
+    its remaining energy allows, ending at `end`.
+
+    cost and energy_matrix are full matrices indexed by node id; energy_limit
+    is the Wh the truck may still use. Every stop may be skipped at a penalty
+    larger than any route's total cost, so the solver drops the fewest stops
+    that make the energy fit, then minimizes cost among those plans.
+
+    Returns {"route": [start, ..., end], "dropped": [...]}. Raises
+    BatteryLimitError if even driving straight from start to end does not fit.
+    """
+    if energy_matrix[start][end] > energy_limit:
+        raise BatteryLimitError(
+            f"Not enough energy to drive from node {start} straight to node {end}."
+        )
+    if not stops:
+        return {"route": [start, end], "dropped": []}
+
+    nodes = [start, *stops, end]
+    m = len(nodes)
+    sub_cost = [[int(round(cost[a][b])) for b in nodes] for a in nodes]
+    sub_energy = [[int(energy_matrix[a][b]) for b in nodes] for a in nodes]
+
+    manager = pywrapcp.RoutingIndexManager(m, 1, [0], [m - 1])
+    routing = pywrapcp.RoutingModel(manager)
+
+    cost_cb = _arc_callback(manager, sub_cost)
+    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cost_cb))
+    energy_cb = _arc_callback(manager, sub_energy)
+    routing.AddDimension(routing.RegisterTransitCallback(energy_cb), 0, int(energy_limit), True, 'Energy')
+
+    penalty = sum(max(0, c) for row in sub_cost for c in row) + 1
+    for k in range(1, m - 1):
+        routing.AddDisjunction([manager.NodeToIndex(k)], penalty)
+
+    search_params = pywrapcp.DefaultRoutingSearchParameters()
+    search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_params.time_limit.seconds = time_limit_s if time_limit_s else 1
+
+    solution = routing.SolveWithParameters(search_params)
+    if not solution:
+        raise BatteryLimitError("OR-Tools could not re-route the remaining stops.")
+
+    route = []
+    index = routing.Start(0)
+    while not routing.IsEnd(index):
+        route.append(nodes[manager.IndexToNode(index)])
+        index = solution.Value(routing.NextVar(index))
+    route.append(nodes[manager.IndexToNode(index)])
+    visited = set(route)
+    return {"route": route, "dropped": [s for s in stops if s not in visited]}

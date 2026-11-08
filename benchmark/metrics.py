@@ -5,7 +5,10 @@ Metrics are always recomputed from the scenario's matrices, never taken from
 what an algorithm reports, so every algorithm is scored identically.
 """
 
+from .energy import resolve_params, route_energy_kwh
+
 METERS_PER_MILE = 1609.344
+BASELINE_FAMILY = "baseline"  # the fixed-stop-order plan, scored like an algorithm but never a reference
 
 
 def _pct_gap(value, reference):
@@ -43,8 +46,13 @@ def check_routes(problem, routes: list) -> list:
 
 
 def score(problem, routes: list, solve_time_ms: float) -> dict:
-    """Metrics for one algorithm on one (scenario, K) problem."""
+    """
+    Metrics for one algorithm on one (scenario, K) problem. Distance, time and
+    energy are always scored, whatever objective the algorithm minimized;
+    objective_cost is the total of problem.cost, the quantity it did minimize.
+    """
     issues = check_routes(problem, routes)
+    energy_params = resolve_params(problem.energy_params)
     per_route = []
     for r in routes:
         per_route.append({
@@ -52,11 +60,24 @@ def score(problem, routes: list, solve_time_ms: float) -> dict:
             "stops": len(r) - 2,
             "distance_m": sum(problem.dist[r[i]][r[i + 1]] for i in range(len(r) - 1)),
             "time_s": sum(problem.time[r[i]][r[i + 1]] for i in range(len(r) - 1)),
+            "energy_kwh": route_energy_kwh(r, problem.dist, problem.time, problem.elevation_m, energy_params),
+            "cost": sum(problem.cost[r[i]][r[i + 1]] for i in range(len(r) - 1)),
         })
 
     total_distance_m = sum(p["distance_m"] for p in per_route)
     total_time_s = sum(p["time_s"] for p in per_route)
+    total_energy_kwh = sum(p["energy_kwh"] for p in per_route)
+    total_cost = sum(p["cost"] for p in per_route)
     makespan_s = max((p["time_s"] for p in per_route), default=0)
+    battery_kwh = energy_params["battery_kwh"]
+    reserve_pct = energy_params["battery_reserve_pct"]
+    for p in per_route:
+        p["battery_remaining_pct"] = (round((1 - p["energy_kwh"] / battery_kwh) * 100, 1)
+                                      if battery_kwh else None)
+    min_battery_pct = min((p["battery_remaining_pct"] for p in per_route
+                           if p["battery_remaining_pct"] is not None), default=None)
+    if min_battery_pct is not None and min_battery_pct < reserve_pct:
+        issues.append(f"a truck ends with {min_battery_pct}% battery (reserve {reserve_pct:g}%)")
     max_stops = max((p["stops"] for p in per_route), default=0)
     vehicles_used = len(routes)
 
@@ -72,11 +93,16 @@ def score(problem, routes: list, solve_time_ms: float) -> dict:
         "total_distance_mi": round(total_distance_m / METERS_PER_MILE, 2),
         "total_drive_time_s": total_time_s,
         "total_drive_time_min": round(total_time_s / 60, 1),
+        "total_energy_kwh": round(total_energy_kwh, 3),
+        "kwh_per_mile": round(total_energy_kwh / (total_distance_m / METERS_PER_MILE), 3) if total_distance_m else None,
+        "objective_cost": total_cost,
         "makespan_s": makespan_s,
         "makespan_min": round(makespan_s / 60, 1),
         "vehicles_used": vehicles_used,
         "max_stops_per_truck": max_stops,
         "stop_cap": problem.max_stops_per_vehicle,
+        "min_battery_remaining_pct": min_battery_pct,
+        "battery_reserve_pct": reserve_pct if battery_kwh else None,
         "solve_time_ms": round(solve_time_ms, 1),
         "valid": not check_routes(problem, routes),
         "feasible": not issues,
@@ -92,33 +118,48 @@ def add_gaps(rows: list) -> None:
       gap_to_best_*     best feasible result
       gap_vs_ortools_*  production OR-Tools
       gap_to_optimal_*  Held-Karp (K = 1 only)
+    The *_distance / *_time / *_energy gaps compare each metric on its own;
+    the *_objective gaps compare the cost the run actually minimized.
+    The fixed-order baseline row is scored against these references but never
+    counts as one, so "best" always means best algorithm.
     """
     for k in sorted({r["num_vehicles"] for r in rows}):
         group = [r for r in rows if r["num_vehicles"] == k and r.get("metrics")]
-        feasible = [r for r in group if r["metrics"]["feasible"]]
+        feasible = [r for r in group if r["metrics"]["feasible"] and r["family"] != BASELINE_FAMILY]
         by_id = {r["algorithm"]: r for r in group}
 
         best_d = min((r["metrics"]["total_distance_m"] for r in feasible), default=None)
         best_t = min((r["metrics"]["total_drive_time_s"] for r in feasible), default=None)
+        best_e = min((r["metrics"]["total_energy_kwh"] for r in feasible), default=None)
+        best_o = min((r["metrics"]["objective_cost"] for r in feasible), default=None)
         ort = by_id.get("ortools")
         hk = by_id.get("held_karp")
 
         for r in group:
             m = r["metrics"]
             d, t = m["total_distance_m"], m["total_drive_time_s"]
+            e, o = m["total_energy_kwh"], m["objective_cost"]
             m["gap_to_best_distance_pct"] = _pct_gap(d, best_d)
             m["gap_to_best_time_pct"] = _pct_gap(t, best_t)
             m["gap_vs_ortools_distance_pct"] = _pct_gap(d, ort and ort["metrics"]["total_distance_m"])
             m["gap_vs_ortools_time_pct"] = _pct_gap(t, ort and ort["metrics"]["total_drive_time_s"])
             m["gap_to_optimal_distance_pct"] = _pct_gap(d, hk and hk["metrics"]["total_distance_m"])
-            m["is_best_distance"] = m["feasible"] and d == best_d
+            m["gap_to_best_energy_pct"] = _pct_gap(e, best_e)
+            m["gap_vs_ortools_energy_pct"] = _pct_gap(e, ort and ort["metrics"]["total_energy_kwh"])
+            m["gap_to_best_objective_pct"] = _pct_gap(o, best_o)
+            m["gap_vs_ortools_objective_pct"] = _pct_gap(o, ort and ort["metrics"]["objective_cost"])
+            m["gap_to_optimal_objective_pct"] = _pct_gap(o, hk and hk["metrics"]["objective_cost"])
+            is_algo = r["family"] != BASELINE_FAMILY
+            m["is_best_distance"] = is_algo and m["feasible"] and d == best_d
+            m["is_best_objective"] = is_algo and m["feasible"] and o == best_o
 
 
 def headline(rows: list) -> list:
     """
-    Per K: how much less distance / drive time production OR-Tools needs
-    compared with the naive baseline (NN for one truck, round-robin + NN for
-    a fleet) and with the best non-OR-Tools heuristic.
+    Per K: how much less distance / drive time / energy production OR-Tools
+    needs compared with the naive baseline (NN for one truck, round-robin + NN
+    for a fleet) and with the best non-OR-Tools heuristic ("best" by the
+    objective the run minimized).
     """
     out = []
     for k in sorted({r["num_vehicles"] for r in rows}):
@@ -130,9 +171,9 @@ def headline(rows: list) -> list:
         naive = group.get(naive_id)
         heuristics = [
             r for r in group.values()
-            if r["family"] not in ("ortools", "exact") and r["metrics"]["feasible"]
+            if r["family"] not in ("ortools", "exact", BASELINE_FAMILY) and r["metrics"]["feasible"]
         ]
-        best_h = min(heuristics, key=lambda r: r["metrics"]["total_distance_m"], default=None)
+        best_h = min(heuristics, key=lambda r: r["metrics"]["objective_cost"], default=None)
 
         def savings(ref):
             if not ref:
@@ -143,8 +184,11 @@ def headline(rows: list) -> list:
                 "label": ref["label"],
                 "distance_saved_pct": _saved_pct(om["total_distance_m"], rm["total_distance_m"]),
                 "time_saved_pct": _saved_pct(om["total_drive_time_s"], rm["total_drive_time_s"]),
+                "energy_saved_pct": _saved_pct(om["total_energy_kwh"], rm["total_energy_kwh"]),
+                "objective_saved_pct": _saved_pct(om["objective_cost"], rm["objective_cost"]),
                 "distance_saved_mi": round(rm["total_distance_mi"] - om["total_distance_mi"], 2),
                 "time_saved_min": round(rm["total_drive_time_min"] - om["total_drive_time_min"], 1),
+                "energy_saved_kwh": round(rm["total_energy_kwh"] - om["total_energy_kwh"], 2),
             }
 
         out.append({
