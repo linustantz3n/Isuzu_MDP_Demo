@@ -21,12 +21,12 @@ plan before and after side by side.
 
 | You want… | Go to |
 |---|---|
-| **The energy model**: formula, coefficients, inputs, weight and battery logic | [docs/energy-model.md](docs/energy-model.md) · code: [`calculate_energy_consumption()`](route_optimizer_backend.py#L198) |
-| **The solvers** and how one gets picked | [docs/solvers.md](docs/solvers.md) · code: [`solvers.py`](solvers.py), [`resolve_solver()`](route_optimizer_backend.py#L574) |
-| **What a solve takes as input and returns** | [docs/api.md](docs/api.md) · code: [`optimize_route()`](route_optimizer_backend.py#L1517) |
+| **The energy model**: formula, coefficients, inputs, weight and battery logic | [docs/energy-model.md](docs/energy-model.md) · code: [`calculate_energy_consumption()`](route_optimizer_backend.py#L218) |
+| **The solvers** and how one gets picked | [docs/solvers.md](docs/solvers.md) · code: [`solvers.py`](solvers.py), [`resolve_solver()`](route_optimizer_backend.py#L605) |
+| **What a solve takes as input and returns** | [docs/api.md](docs/api.md) · code: [`optimize_route()`](route_optimizer_backend.py#L1934) |
 | **What every file and function does** | [docs/code-map.md](docs/code-map.md) |
 | The chat assistant and driver memory | [docs/chat-assistant.md](docs/chat-assistant.md) |
-| **Optimization goals (weights), battery reserve, priority stops, breakdown re-planning, truck limits** | [docs/planning.md](docs/planning.md) · code: [`objective_matrix()`](route_optimizer_backend.py#L759), [`solve_fleet()`](route_optimizer_backend.py#L1022), [`replan_breakdown()`](route_optimizer_backend.py#L1144) |
+| **Optimization goals (weights), battery reserve, priority stops, breakdown re-planning, truck limits** | [docs/planning.md](docs/planning.md) · code: [`objective_matrix()`](route_optimizer_backend.py#L907), [`solve_fleet()`](route_optimizer_backend.py#L1175), [`replan_breakdown()`](route_optimizer_backend.py#L1298) |
 | The before / after comparison | [`PlanComparison.jsx`](route-optimizer-frontend/src/PlanComparison.jsx), [`planDiff.js`](route-optimizer-frontend/src/planDiff.js) |
 | The algorithm benchmark | [docs/solvers.md#benchmark](docs/solvers.md#benchmark) · code: [`benchmark/`](benchmark/) |
 | The web UI | [`route-optimizer-frontend/src/RouteOptimizer.jsx`](route-optimizer-frontend/src/RouteOptimizer.jsx) |
@@ -67,6 +67,7 @@ tests/                       pytest suite for the solvers and benchmark
 route-optimizer-frontend/    React app: src/RouteOptimizer.jsx is the main page
 docs/                        Energy model, solvers, planning (goals, breakdowns), API, code map, chat assistant
 prompt_test.py, prompt_demo.py   Chat-assistant regression scripts (need a running server)
+r4_test.py                   R4 test set: 50 bilingual weight / traffic / style requests
 route_optimizer.jsx          Legacy prototype from the first commit; not used
 ```
 
@@ -114,9 +115,12 @@ python -m benchmark.cli demo_anaheim --max-vehicles 3 --csv results.csv
 | Stop order for one truck: exact (Held-Karp, up to ~17 stops by default) or heuristic | Charging stops, state-of-charge curves |
 | Splitting stops across 2+ trucks (OR-Tools, balanced stop counts) | Time windows, driver-hours limits |
 | What to optimize: distance, time, Model E energy and fleet balance, weighted by goals | Payload capacity in normal planning (only in breakdown re-plans) |
-| Energy per leg from speed, temperature, weight, elevation, HVAC | Live traffic (Google's typical travel times are used) |
+| Energy per leg from speed, temperature, weight, elevation, HVAC | Traffic replays of past days; road closures |
 | Cargo weight dropping stop by stop; the truck returns empty | More than one breakdown at a time |
 | Battery per truck (packs × 20 kWh): checked always, enforced for fleets with a reserve | More than 25 locations per request |
 | Priority stops, served first on their truck | |
+| Suggestions after each solve: a problem found in the plan, and a fix tested by re-solving | |
 | A truck breaking down mid-route: stranded stops re-assigned, cargo collected, optional spare truck | |
 | Unloading time per stop | |
+| Live traffic for a departure time (Google's traffic prediction) | |
+| Driving style eco / normal / aggressive (assumed speed and energy factors) | |

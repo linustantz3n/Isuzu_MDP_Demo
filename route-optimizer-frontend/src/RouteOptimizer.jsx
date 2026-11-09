@@ -6,7 +6,7 @@ import AIChatbot from './AIChatbot';
 import BenchmarkPanel from './BenchmarkPanel';
 import GoalsPanel from './GoalsPanel';
 import PlanComparison from './PlanComparison';
-import { DEFAULT_GOALS, goalsSummary } from './goals';
+import { DEFAULT_GOALS, goalsSummary, trafficLabel } from './goals';
 import { planOf, metricRows, impactText, shortPlace, formatClock, depletionText } from './planDiff';
 import { API_BASE } from './api';
 
@@ -15,7 +15,7 @@ const MAX_VERSIONS = 12;
 
 // Which sidebar section a chat change lands in, so it can flash.
 const AXIS_SECTION = {
-  goals: 'goals', priority_stops: 'goals', depot: 'stops', addresses: 'stops',
+  goals: 'goals', priority_stops: 'goals', traffic: 'goals', driving_style: 'goals', depot: 'stops', addresses: 'stops',
   vehicle_count: 'vehicles', battery_packs: 'vehicles', vehicle_weight_lbs: 'vehicles', fleet: 'vehicles',
   temperature_c: 'conditions', unload_time_min: 'conditions', has_climate_control: 'conditions',
 };
@@ -56,8 +56,11 @@ function RouteOptimizer() {
     total_weight_lbs: 19500,
     base_weight_lbs: 7000,
     unload_time_min: 30,
-    has_climate_control: true
+    has_climate_control: true,
+    driving_style: 'normal',
   });
+  // Traffic: null = Google's typical times, 'now' or 'HH:MM' = traffic for that departure.
+  const [traffic, setTraffic] = useState(null);
   // What the solver optimizes for. The assistant picks these from plain language.
   const [goals, setGoals] = useState(DEFAULT_GOALS);
   const [goalsSetBy, setGoalsSetBy] = useState(null);
@@ -210,6 +213,7 @@ function RouteOptimizer() {
     priorityStops: [...priorityStops],
     vehicles: vehicles.map(v => ({ ...v })),
     energyParams: { ...energyParams },
+    traffic,
     solver,
     depot,
     stops: addresses.filter(a => a.trim()),
@@ -234,8 +238,14 @@ function RouteOptimizer() {
       solver,
       goals,
       priority_stops: priorityIndices(),
+      traffic: traffic ? { departure: traffic } : null,
     };
-    if (previous?.inputs && locationsKey(previous.locations) === locationsKey(locations)) {
+    // Kept with the version (without the matrices), so the suggestion check can
+    // re-solve the same request with a fix.
+    const request = { ...body };
+    // Matrices fetched for other traffic settings are not reused.
+    if (previous?.inputs && locationsKey(previous.locations) === locationsKey(locations)
+        && (previous.inputs.traffic?.departure ?? null) === traffic) {
       body.precomputed = previous.inputs;
     }
     const response = await fetch(`${API_BASE}/optimize`, {
@@ -247,16 +257,19 @@ function RouteOptimizer() {
     if (data.status === 'error') throw new Error(data.message);
     return {
       // `solver` rides along on results so the panel and the data stay in sync.
-      results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [] },
-      inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations },
+      results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [],
+                 traffic: data.traffic || null, driving_style: data.energy_params?.driving_style || 'normal' },
+      inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations,
+                traffic: data.traffic || null },
+      request,
     };
   };
 
-  const commitVersion = ({ results: r, locations, inputs, label, source, trigger, settings, baseId }) => {
+  const commitVersion = ({ results: r, locations, inputs, request, label, source, trigger, settings, baseId }) => {
     const prev = versions[versions.length - 1];
     const v = {
       id: (prev?.id || 0) + 1, label, source, trigger: trigger || null,
-      results: r, locations, inputs, settings: settings || snapshotSettings(),
+      results: r, locations, inputs, request: request || null, settings: settings || snapshotSettings(),
     };
     setVersions(list => [...list, v].slice(-MAX_VERSIONS));
     setCompareBase(baseId ?? prev?.id ?? null);
@@ -306,12 +319,42 @@ function RouteOptimizer() {
   // The chatbot applies its changes, then hands the turn here. The re-solve
   // runs in an effect so it sees the state those changes produced.
   const handleChatTurn = (turn) => new Promise(resolve => {
+    if (turn.lang) chatLang.current = turn.lang;
     const wantsRun = turn.action?.type === 'resolve';
     if (!results && !wantsRun && turn.action?.type !== 'breakdown') return resolve(null);
     const id = Date.now() + Math.random();
     resolveWaiters.current[id] = resolve;
     setResolveRequest({ id, ...turn });
   });
+
+  // After each solve, ask whether the plan has a problem worth fixing. The
+  // backend tests candidate fixes by re-solving with the same matrices, and the
+  // chat offers one that works as a yes / no question. A suggestion already
+  // made for these same settings (taken or turned down) is not made again.
+  const [proactive, setProactive] = useState(null);
+  const suggested = useRef(new Set());
+  const chatLang = useRef('en');
+  useEffect(() => {
+    const v = versions[versions.length - 1];
+    if (!v?.request || v.source === 'breakdown' || v.results?.ortools_fleet?.disruption) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/suggest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...v.request, precomputed: v.inputs, results: v.results, lang: chatLang.current }),
+        });
+        const s = (await res.json()).suggestion;
+        if (cancelled || !s) return;
+        const key = `${s.kind}|${s.fix?.label || '-'}|${JSON.stringify(v.settings)}`;
+        if (suggested.current.has(key)) return;
+        suggested.current.add(key);
+        setProactive({ id: `v${v.id}-${s.kind}`, ...s });
+      } catch { /* a suggestion is optional */ }
+    })();
+    return () => { cancelled = true; };
+  }, [versions]);
 
   const runBreakdown = async (req) => {
     const base = cleanVersion;
@@ -507,6 +550,12 @@ function RouteOptimizer() {
       case 'solver':
         setSolver(value);
         break;
+      case 'driving_style':
+        setEnergyParams(prev => ({ ...prev, driving_style: value }));
+        break;
+      case 'traffic':
+        setTraffic(value?.departure || null);
+        break;
       case 'fleet':
         // A memory recall: one vehicle per recalled driver. A driver profile may
         // carry its truck's packs and weight; whatever it leaves out, that
@@ -547,6 +596,8 @@ function RouteOptimizer() {
     temperature_c: energyParams.temperature_c,
     unload_time_min: energyParams.unload_time_min,
     has_climate_control: energyParams.has_climate_control,
+    driving_style: energyParams.driving_style,
+    traffic: { departure: traffic },
     solver,
     goals,
     priority_stops: priorityStops,
@@ -650,6 +701,11 @@ function RouteOptimizer() {
               setBy={goalsSetBy}
               hot={flash.goals}
               vehicleCount={vehicles.length}
+              traffic={traffic}
+              onTrafficChange={(t) => { setTraffic(t); if (results) setStale('Traffic changed — click Optimize Routes to re-solve.'); }}
+              drivingStyle={energyParams.driving_style}
+              onStyleChange={(st) => { setEnergyParams(p => ({ ...p, driving_style: st }));
+                                       if (results) setStale('Driving style changed — click Optimize Routes to re-solve.'); }}
             />
 
             <div className="border-t border-slate-800" />
@@ -1006,6 +1062,13 @@ function RouteOptimizer() {
                     {fleet && fleet.num_vehicles_requested !== fleet.num_vehicles_used && ` (${fleet.num_vehicles_requested} requested)`}
                     {results.solver && ` · solver: ${results.solver.requested === 'auto' ? 'auto' : results.solver.baseline_label}`}
                     {results.goals && ` · goals: ${goalsSummary(results.goals)}`}
+                    {results.driving_style && results.driving_style !== 'normal' && ` · ${results.driving_style} driving`}
+                  </p>
+                  <p className="text-xs mt-0.5 text-slate-500">
+                    {results.traffic
+                      ? <>Traffic: <span className="text-sky-300">{trafficLabel(results.traffic.departure)}</span>
+                          {' '}· departs {results.traffic.departure_local} ({results.traffic.time_zone})</>
+                      : 'Traffic: off — Google\'s typical travel times'}
                   </p>
                   {results.solver?.note && (
                     <p className="text-[11px] text-amber-400/80 mt-1 flex items-center gap-1.5">
@@ -1428,7 +1491,7 @@ function RouteOptimizer() {
           )}
         </main>
       </div>
-      <AIChatbot formState={chatFormState} onApplyChange={applyChatChange} onTurn={handleChatTurn}
+      <AIChatbot formState={chatFormState} onApplyChange={applyChatChange} onTurn={handleChatTurn} proactive={proactive}
                  onDockChange={setChatDocked} />
     </div>
   );

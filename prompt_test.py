@@ -63,6 +63,23 @@ WITH_PLAN = {
         {"number": 2, "vehicle_index": 1, "name": "Vehicle 2", "driver": "", "stops": 2, "energy_kwh": 19.2}]},
 }
 
+# Late in a conversation: the demo so far, as the page sends it. Some misreadings
+# only show up with history (the model once filed "keep at least 20% battery in
+# each truck" as an empty battery-pack change after a breakdown).
+LATE = {"history": [
+    {"role": "user", "content": "What are the limits of a truck with 3 battery packs?"},
+    {"role": "assistant", "content": "A 3-pack truck carries 60 kWh. Empty it weighs 6,559 lbs, so it can take up to 12,941 lbs of cargo before the 19,500 lbs limit. Today's longest route (Vehicle 1) needs 114.6 kWh. It needs at least 6 packs, or a shorter route."},
+    {"role": "user", "content": "Use 2 trucks"},
+    {"role": "assistant", "content": "Applied: Vehicles → 2."},
+    {"role": "user", "content": "Give every truck 9 battery packs"},
+    {"role": "assistant", "content": "Applied: Battery packs → 9 packs."},
+    {"role": "assistant", "content": "Re-solved (v3). Distance 113.2 mi → 113.2 mi; energy 120.9 kWh → 124.2 kWh (+2.7%)."},
+    {"role": "user", "content": "Truck 2 broke down after its first stop"},
+    {"role": "assistant", "content": "Vehicle 2 broke down after stop 1 (0:46 after dispatch). 1 stranded stop: 2114 N Tustin St → Vehicle 1. Last truck back +4:50 (was +3:35)."},
+]}
+TRAFFIC_PENDING = {"pending": {"axis": "traffic", "queued": [],
+                               "question": 'When do the trucks leave? Say "now" for live traffic, or a time like 7:30.'}}
+
 SUITES = {
 "A. Solver recommendation — English": [
     ("which solver should I use?", "recommend"),
@@ -177,6 +194,34 @@ SUITES = {
     ("can 4 packs handle today's routes?", "limits"),
     ("3 块电池的车能跑多远？", "limits"),
 ],
+"N. Traffic and driving style (R4)": [
+    ("we leave at 7:30", "apply"),
+    ("use live traffic", "apply"),
+    ("trucks roll out at 6am, use real traffic", "apply"),
+    ("ignore traffic", "apply"),
+    ("drive in eco mode", "apply"),
+    ("the drivers should take it easy to save the battery", "apply"),
+    ("aggressive driving today", "apply"),
+    ("早上7点半出发", "apply"),
+    ("用实时路况", "apply"),
+    ("开得激进一点", "apply"),
+    ("plan with traffic", "ask"),                        # no departure time: asks when
+    ("drive in ludicrous mode", "ask"),                  # not a style: rejected with the rule
+    ("leave at 25:00 with live traffic", "ask"),         # impossible time
+    ("考虑路况", "ask"),
+    ("what's the traffic like on the 405?", "out_of_scope"),
+],
+"O. Late in a conversation (multi-turn)": [
+    ("keep at least 20% battery in each truck", "goals", WITH_PLAN, LATE),
+    ("We're running late, get everyone back sooner", "goals", WITH_PLAN, LATE),
+    ("use live traffic", "apply", WITH_PLAN, LATE),
+    ("drive in eco mode", "apply", WITH_PLAN, LATE),
+    ("how do the weights work?", "goals", WITH_PLAN, LATE),
+    ("what are the limits of a truck with 6 packs?", "limits", WITH_PLAN, LATE),
+    ("truck 1 broke down after its first stop", "disruption", WITH_PLAN, LATE),
+    ("7:30", "apply", None, TRAFFIC_PENDING),
+    ("now", "apply", None, TRAFFIC_PENDING),
+],
 "M. Breakdowns": [
     ("truck 2 broke down after its first stop", "disruption", WITH_PLAN),
     ("Wang's truck crashed an hour in, send a spare", "disruption", WITH_PLAN),
@@ -190,7 +235,11 @@ SUITES = {
 
 def run_suite(name, cases):
     with ThreadPoolExecutor(max_workers=2) as ex:
-        results = list(ex.map(lambda c: (c[0], ask(c[0], c[2] if len(c) > 2 else None), c[1]), cases))
+        # A case is (message, expected intent[, form state[, {"history", "pending"}]]).
+        results = list(ex.map(lambda c: (c[0], ask(c[0], c[2] if len(c) > 2 else None,
+                                                   pending=(c[3] if len(c) > 3 else {}).get("pending"),
+                                                   history=(c[3] if len(c) > 3 else {}).get("history")), c[1]),
+                              cases))
     out = [f"\n{'='*100}\n{name}\n{'='*100}"]
     bad = 0
     for msg, d, expect in results:

@@ -1,10 +1,10 @@
 # Energy model
 
-**Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L198) in `route_optimizer_backend.py`.
+**Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L218) in `route_optimizer_backend.py`.
 It is called once per route leg (one stop to the next) from `optimize_route()`:
 
-- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L1689), [return leg](../route_optimizer_backend.py#L1745)
-- fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L852)
+- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L2125), [return leg](../route_optimizer_backend.py#L2182)
+- fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L1004)
 
 The model is called **Model E**. It is a polynomial regression for energy per kilometre of an
 Isuzu N-Series EV. The fit statistics quoted in the code are R² = 0.9997, MAPE = 3.46% and test
@@ -39,10 +39,10 @@ depot, because the UI always sends closed routes.
 | Symbol | Meaning | Unit | Where the value comes from |
 |---|---|---|---|
 | d | Driving distance of the leg | km | Google Distance Matrix ([`get_distance_matrix`](../route_optimizer_backend.py#L72)), metres ÷ 1000 |
-| v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L309)). No live traffic |
+| v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L340)). No live traffic |
 | T | Ambient temperature | °C | UI slider, `energy_params.temperature_c` (default 20). Same value for every leg |
 | W | Gross vehicle weight on this leg | tonnes | Vehicle `weight_lbs` ÷ 2204.62, reduced as cargo is delivered (see [Weight model](#weight-model)) |
-| Δh | Elevation change, end minus start (+ = uphill) | m | Google Elevation API at the two stop coordinates ([`get_elevation_data`](../route_optimizer_backend.py#L166)) |
+| Δh | Elevation change, end minus start (+ = uphill) | m | Google Elevation API at the two stop coordinates ([`get_elevation_data`](../route_optimizer_backend.py#L186)) |
 | h | Elevation at the start of the leg | m above sea level | Same call |
 | HVAC | Climate-control overhead | kWh/km | 0.092 when `has_climate_control` is true. Added on top of the regression, not fitted |
 
@@ -105,7 +105,7 @@ HVAC on, not measurements:
 
 ## Weight model
 
-**Code:** [vehicle config](../route_optimizer_backend.py#L1585) and [leg weights](../route_optimizer_backend.py#L1689) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L901) for fleet routes.
+**Code:** [vehicle config](../route_optimizer_backend.py#L2021) and [leg weights](../route_optimizer_backend.py#L2125) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L1054) for fleet routes.
 
 - Each vehicle's `weight_lbs` is its **gross weight leaving the depot**: truck, batteries and cargo
   together. The form's range is 10,000–19,500 lbs.
@@ -126,10 +126,10 @@ HVAC on, not measurements:
 - Every route reports `battery_remaining_kwh` (capacity − route energy, floored at 0),
   `battery_remaining_pct`, and `battery_depleted` (true when energy > capacity). The
   single-vehicle routes check against vehicle 1's battery
-  ([`battery_fields()`](../route_optimizer_backend.py#L915)). The UI shows the fleet bar
+  ([`battery_fields()`](../route_optimizer_backend.py#L1068)). The UI shows the fleet bar
   orange below 20% and red when depleted.
 - When a route needs more than the battery holds, `battery_depletion` says where it runs out
-  ([`battery_depletion()`](../route_optimizer_backend.py#L928)): the leg, and how far into it.
+  ([`battery_depletion()`](../route_optimizer_backend.py#L1081)): the leg, and how far into it.
   The model gives one energy total per leg, so the energy is spread evenly along the leg and
   the point is approximate. The map marks it with a red **0%** marker on the drawn road (click
   it for the distances, the time after dispatch and the energy needed), and the route's card
@@ -147,8 +147,37 @@ HVAC on, not measurements:
 | `temperature_c` | 20 °C | Energy (T terms) |
 | `has_climate_control` | on | Energy (+0.092 kWh/km) |
 | `unload_time_min` | 30 min per stop | Route **time** only. Energy is not affected, and HVAC while parked is not counted |
+| `driving_style` | normal | Cruising speed on fast legs, and energy on every leg (below) |
+| `traffic` | off | Travel times, and through them every leg's average speed and energy (below) |
 | `energy_params.total_weight_lbs` | 19,500 | **Unused.** Weight always comes from the `vehicles` array, or 13,000 lbs when none is sent |
 | `energy_params.base_weight_lbs` | 7,000 | Only the *displayed* weight on the single-vehicle return leg. The energy on that leg uses the pack-based empty weight |
+
+## Driving style and traffic
+
+**Driving style** ([`DRIVING_STYLES`](../route_optimizer_backend.py#L702), [`styled_matrices`](../route_optimizer_backend.py#L712)) is assumed, not fitted:
+
+| Style | Cruising legs (average over 50 km/h) | Every leg's energy |
+|---|---|---|
+| eco | speed × 0.90 (time ÷ 0.90) | × 0.95: gentle acceleration |
+| normal | unchanged | unchanged |
+| aggressive | speed × 1.10 | × 1.10: hard acceleration |
+
+The cruise factor applies only above 50 km/h because Model E only sees a leg's average speed, and
+its energy per km is lowest near 40 km/h. At 5.9 t, 20 °C, HVAC on, 10% slower changes energy by
++1.6% at 30 km/h, −1.4% at 50, −9.2% at 80 and −13.4% at 100 km/h. So slowing a city leg down would
+*raise* its energy, which is not what eco driving does. City savings come from gentler acceleration,
+which the average speed does not capture, hence the separate energy factor. With both, eco is below
+normal and aggressive above it on every leg. The factor applies only to a leg that uses energy, so
+regen on a steep downhill is left alone. The style is applied to the time matrix once per solve, so
+the solvers, ETAs, battery checks and the truck-limits answer all see the same speeds.
+
+**Traffic** ([`get_distance_matrix`](../route_optimizer_backend.py#L72), [`departure_info`](../route_optimizer_backend.py#L785)): with a departure time, the
+travel times are Google's `duration_in_traffic` for that moment (`traffic_model=best_guess`).
+A clock time means the next time the depot's clock reads it, in the depot's time zone from the
+Google Time Zone API. Traffic changes each leg's average speed, so it changes energy too. On the
+Anaheim demo, a 7:30 departure made the day 32% longer and used 14% less energy than typical times,
+because the trucks crawl through the morning rush. Without a departure time the times are Google's
+typical ones.
 
 ---
 
@@ -161,7 +190,7 @@ climbs early while fully loaded can be short but costly.
 
 **With the Energy goal on** ([planning.md](planning.md#optimization-goals)), the solvers
 minimise an energy-weighted cost.
-[`energy_matrix_kwh()`](../route_optimizer_backend.py#L730) makes one
+[`energy_matrix_kwh()`](../route_optimizer_backend.py#L878) makes one
 `calculate_energy_consumption` call per ordered pair of stops. It uses one representative
 weight, halfway between loaded and empty, because a fixed matrix cannot know where in the
 route a leg will fall. Negative (downhill) energy is floored at 0 in the cost, so regen is

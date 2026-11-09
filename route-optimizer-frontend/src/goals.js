@@ -39,3 +39,19 @@ export function reserveLabel(r) {
   if (r == null) return 'not enforced';
   return r === 0 ? 'never run flat' : `keep ${r}%`;
 }
+
+// How the drivers drive. Mirrors STYLE_CRUISE_FACTOR / STYLE_ENERGY_FACTOR in the
+// backend: assumed factors, not fitted.
+export const DRIVING_STYLES = ['eco', 'normal', 'aggressive'];
+export const STYLE_META = {
+  eco: { label: 'Eco', hint: 'Cruises 10% slower on legs over 50 km/h, accelerates gently (−5% energy). Assumed.' },
+  normal: { label: 'Normal', hint: 'As the energy model was fitted.' },
+  aggressive: { label: 'Aggressive', hint: 'Cruises 10% faster on legs over 50 km/h, accelerates hard (+10% energy). Assumed.' },
+};
+
+// Traffic: null = Google's typical times, 'now' = live traffic leaving now,
+// 'HH:MM' = Google's traffic prediction for that departure at the depot.
+export function trafficLabel(departure) {
+  if (!departure) return 'off';
+  return departure === 'now' ? 'live, leaving now' : `leaving at ${departure}`;
+}

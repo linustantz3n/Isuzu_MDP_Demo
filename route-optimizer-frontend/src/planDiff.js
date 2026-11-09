@@ -1,7 +1,7 @@
 // Before / after comparison of two plan versions. Pure functions: the
 // comparison panel and the chat's "what this changed" message both read them.
 
-import { GOAL_KEYS, GOAL_META, goalWeights, reserveLabel } from './goals';
+import { GOAL_KEYS, GOAL_META, goalWeights, reserveLabel, trafficLabel } from './goals';
 
 const locKey = (loc) => `${(+loc.lat).toFixed(5)},${(+loc.lng).toFixed(5)}`;
 
@@ -163,6 +163,12 @@ export function settingChanges(before, after) {
   if (eb.temperature_c !== ea.temperature_c) out.push(`Temperature ${eb.temperature_c} → ${ea.temperature_c} °C`);
   if (eb.unload_time_min !== ea.unload_time_min) out.push(`Unload ${eb.unload_time_min} → ${ea.unload_time_min} min`);
   if (eb.has_climate_control !== ea.has_climate_control) out.push(`HVAC ${ea.has_climate_control ? 'on' : 'off'}`);
+  if ((eb.driving_style || 'normal') !== (ea.driving_style || 'normal')) {
+    out.push(`Driving ${eb.driving_style || 'normal'} → ${ea.driving_style || 'normal'}`);
+  }
+  if ((before.traffic ?? null) !== (after.traffic ?? null)) {
+    out.push(`Traffic: ${trafficLabel(before.traffic)} → ${trafficLabel(after.traffic)}`);
+  }
   if (before.solver !== after.solver) out.push(`Solver ${before.solver} → ${after.solver}`);
   const pb = before.priorityStops.join('|'), pa = after.priorityStops.join('|');
   if (pb !== pa) out.push(`Priority stops: ${after.priorityStops.map(s => s.split(',')[1]?.trim() || s).join(', ') || 'none'}`);

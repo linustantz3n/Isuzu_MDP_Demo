@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageSquare, X, Send, Loader2, Bot, Sparkles, Zap, Cpu, History, HelpCircle, Ban, Check, Cog, User, Maximize2, Minimize2, Target, Gauge, AlertTriangle, ArrowLeftRight } from 'lucide-react';
+import { MessageSquare, X, Send, Loader2, Bot, Sparkles, Zap, Cpu, History, HelpCircle, Ban, Check, Cog, User, Maximize2, Minimize2, Target, Gauge, AlertTriangle, ArrowLeftRight, Lightbulb } from 'lucide-react';
 
 import { API_BASE } from './api';
 import { GOAL_KEYS, GOAL_META } from './goals';
@@ -9,6 +9,7 @@ const SOURCE_BADGE = {
   lexicon: { icon: Zap, label: 'lexicon', title: 'Matched a known phrasing — no model call' },
   model: { icon: Cpu, label: 'model', title: 'Extracted by GPT-4o-mini, then validated' },
   session: { icon: History, label: 'session', title: 'Resolved from an earlier question in this session' },
+  suggestion: { icon: Lightbulb, label: 'suggestion', title: 'Found by checking the plan; every fix listed was tested by re-solving' },
 };
 
 const INTENT_STYLE = {
@@ -20,6 +21,7 @@ const INTENT_STYLE = {
   limits: 'bg-sky-950/50 text-sky-50 border-sky-800/70',
   disruption: 'bg-red-950/50 text-red-50 border-red-800/70',
   impact: 'bg-slate-900 text-slate-100 border-emerald-500/50',
+  suggestion: 'bg-violet-950/50 text-violet-50 border-violet-700/70',
   out_of_scope: 'bg-rose-950/50 text-rose-100 border-rose-800/70',
 };
 
@@ -30,6 +32,8 @@ const SUGGESTIONS = [
   'What are the limits of a truck with 3 battery packs?',
   'Truck 2 broke down after its first stop',
   'Cerritos is urgent — deliver there first',
+  'Use live traffic — we leave at 7:30',
+  'Drive in eco mode',
   'How do the weights work?',
 ];
 
@@ -166,8 +170,11 @@ function AdviceTable({ advice }) {
   );
 }
 
-export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChange }) {
+export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChange, proactive }) {
   const [open, setOpen] = useState(false);
+  // A suggestion arrived while the panel was closed.
+  const [unread, setUnread] = useState(false);
+  const shownSuggestion = useRef(null);
   // Full screen: the panel fills the window instead of floating in the corner.
   const [expanded, setExpanded] = useState(false);
   const [input, setInput] = useState('');
@@ -205,6 +212,21 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
   }, [input, open, expanded]);
+
+  // A problem the page found in the plan, with a fix it tested. Shown once the
+  // chat is idle, and never over a question the operator still has to answer.
+  useEffect(() => {
+    if (!proactive || shownSuggestion.current === proactive.id || loading || resolving || pending) return;
+    shownSuggestion.current = proactive.id;
+    setMessages(prev => [...prev, {
+      role: 'assistant', content: proactive.message,
+      meta: { intent: 'suggestion', source: 'suggestion', tried: proactive.tried, suggestion: proactive.id },
+    }]);
+    if (proactive.pending) setPending({ ...proactive.pending, suggestion: proactive.id });
+    if (!open) setUnread(true);
+  }, [proactive, loading, resolving, pending, open]);
+
+  useEffect(() => { if (open) setUnread(false); }, [open]);
 
   // While the panel is open beside the page, the page makes room for it.
   useEffect(() => { onDockChange?.(open && !expanded); }, [open, expanded, onDockChange]);
@@ -270,7 +292,11 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
         // and the measured effect comes back as a message.
         const d = deferred.current;
         d.changes.push(...(data.changes || []));
-        if (data.changes?.length || data.action) d.texts.push(userMsg.content);
+        // A "yes" to a suggestion is credited to the problem it fixed, not to the word "yes".
+        if (data.changes?.length || data.action) {
+          d.texts.push(pending?.suggestion && data.changes?.length
+            ? `yes to the suggestion: ${data.changes[0].evidence}` : userMsg.content);
+        }
         const waiting = data.pending?.queued?.length > 0;
         if (onTurn && !waiting && (d.changes.length || data.action)) {
           const turn = {
@@ -321,16 +347,23 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
     const badge = SOURCE_BADGE[meta.source];
     return (
       <div className="mt-1.5 space-y-1">
+        {/* Every applied change shows the operator's words it was taken from,
+            and every rejection the rule that stopped it, in full. */}
         {meta.changes?.map((c, i) => (
-          <div key={i} className="flex items-center gap-1 text-xs text-emerald-300" title={`evidence: "${c.evidence}"`}>
-            <Check className="w-3.5 h-3.5 flex-shrink-0" />
-            <span className="truncate">{c.label}</span>
+          <div key={i} className="text-xs">
+            <div className="flex items-center gap-1 text-emerald-300">
+              <Check className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>{c.label}</span>
+            </div>
+            {c.evidence && (
+              <p className="ml-[1.125rem] text-[11px] text-slate-500 italic leading-snug">from “{c.evidence}”</p>
+            )}
           </div>
         ))}
         {meta.rejected?.map((r, i) => (
-          <div key={i} className="flex items-center gap-1 text-xs text-slate-500">
-            <Ban className="w-3.5 h-3.5 flex-shrink-0" />
-            <span className="truncate">{r}</span>
+          <div key={i} className="flex items-start gap-1 text-xs text-slate-500">
+            <Ban className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+            <span className="leading-snug">Skipped: {r}</span>
           </div>
         ))}
         {meta.profiles?.length > 0 && <ProfileCards profiles={meta.profiles} />}
@@ -338,6 +371,28 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
         {meta.goals_info && <GoalShift info={meta.goals_info} />}
         {meta.limits && <LimitsCard limits={meta.limits} />}
         {meta.impact && <ImpactChips impact={meta.impact} />}
+        {meta.tried?.length > 0 && (
+          <div className="mt-1 space-y-0.5">
+            {meta.tried.map((t, i) => (
+              <div key={i} className={`flex items-start gap-1 text-xs ${t.ok ? 'text-emerald-300' : 'text-slate-400'}`}>
+                {t.ok ? <Check className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" /> : <X className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />}
+                <span className="leading-snug">tried {t.label}: {t.result}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {meta.suggestion && pending?.suggestion === meta.suggestion && (
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => send('yes')} disabled={loading || resolving}
+                    className="px-3 py-1 rounded-md bg-violet-500 hover:bg-violet-400 text-slate-950 text-xs font-semibold disabled:opacity-40">
+              Yes, apply it
+            </button>
+            <button onClick={() => send('no')} disabled={loading || resolving}
+                    className="px-3 py-1 rounded-md border border-slate-600 text-slate-300 hover:text-white text-xs disabled:opacity-40">
+              No
+            </button>
+          </div>
+        )}
         {meta.suggestions && (
           <div className="mt-2 flex flex-col gap-1">
             {SUGGESTIONS.map(s => (
@@ -380,9 +435,16 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
           title="AI Assistant – tune the optimizer in plain language"
         >
           <MessageSquare className="w-6 h-6" />
-          <span className="absolute -top-1 -right-1 w-5 h-5 bg-yellow-400 rounded-full flex items-center justify-center">
-            <Sparkles className="w-3 h-3 text-yellow-900" />
-          </span>
+          {unread ? (
+            <span className="absolute -top-1 -right-1 w-5 h-5 bg-violet-400 rounded-full flex items-center justify-center animate-pulse"
+                  title="The assistant has a suggestion for this plan">
+              <Lightbulb className="w-3 h-3 text-violet-950" />
+            </span>
+          ) : (
+            <span className="absolute -top-1 -right-1 w-5 h-5 bg-yellow-400 rounded-full flex items-center justify-center">
+              <Sparkles className="w-3 h-3 text-yellow-900" />
+            </span>
+          )}
         </button>
       )}
 

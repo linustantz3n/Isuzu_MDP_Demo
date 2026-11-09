@@ -60,14 +60,14 @@ Time windows and driver hours are never modelled.
 
 ## How `/api/optimize` decides what to run
 
-**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L574), called from [`optimize_route()`](../route_optimizer_backend.py#L1517).
+**Code:** [`resolve_solver(requested, num_stops, num_vehicles)`](../route_optimizer_backend.py#L605), called from [`optimize_route()`](../route_optimizer_backend.py#L1934).
 
 The request's `solver` field is one of `auto` (default), `held_karp`, `2opt`, `nearest_neighbor` or `ortools_vrp`.
 
 1. **Nearest neighbor and 2-opt always run.** They are cheap and they feed the comparison in the UI.
 2. **Held-Karp runs depending on the setting:**
    - `auto` or `ortools_vrp`: only if the *predicted* runtime is ≤ 2 s. The prediction is
-     [`estimate_held_karp_ms(n)`](../route_optimizer_backend.py#L382) = n²·2ⁿ × 17 ns, measured on
+     [`estimate_held_karp_ms(n)`](../route_optimizer_backend.py#L413) = n²·2ⁿ × 17 ns, measured on
      one machine. With a depot this means **up to 17 stops**.
    - `held_karp` (forced): up to **21 stops** (`HK_HARD_LIMIT_N = 22` locations). Beyond that the
      request is refused and 2-opt is shown instead.
@@ -81,7 +81,7 @@ The request's `solver` field is one of `auto` (default), `held_karp`, `2opt`, `n
 
 An explicit `algorithms` list in the request (`["held_karp", "nearest_neighbor", "2opt"]`) skips
 this logic. Tuning constants are at the top of the solver section:
-[`HK_SEC_PER_UNIT`, `HK_TIME_BUDGET_MS`, `HK_HARD_LIMIT_N`](../route_optimizer_backend.py#L340).
+[`HK_SEC_PER_UNIT`, `HK_TIME_BUDGET_MS`, `HK_HARD_LIMIT_N`](../route_optimizer_backend.py#L371).
 
 | Stops | Held-Karp estimate | `auto` runs it? | Forced `held_karp` runs it? |
 |---|---|---|---|
@@ -98,7 +98,7 @@ this logic. Tuning constants are at the top of the solver section:
 
 `/api/optimize` accepts at most 25 locations (depot + 24 stops).
 
-[`recommend_solver()`](../route_optimizer_backend.py#L500) and [`solver_table()`](../route_optimizer_backend.py#L545)
+[`recommend_solver()`](../route_optimizer_backend.py#L531) and [`solver_table()`](../route_optimizer_backend.py#L576)
 build the same reasoning as text and tables for the chat assistant. They do not change what
 `/api/optimize` runs; `resolve_solver` only uses `recommend_solver` for the `auto` decision.
 

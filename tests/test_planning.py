@@ -391,3 +391,199 @@ def test_a_question_about_a_reserve_sets_nothing():
     assert out['intent'] == 'goals' and not out['changes']
     out = run_turn({'intent': 'out_of_scope', 'changes': []}, 'could you keep 20% battery in each truck?')
     assert out['changes'][0]['value']['battery_reserve_pct'] == 20
+
+
+# ---- traffic and driving style (R4) -------------------------------------------
+
+@pytest.mark.parametrize('text, want', [
+    ('we leave at 7:30', '07:30'), ('trucks go out at 6pm', '18:00'), ('leave at 7', '07:00'),
+    ('depart 5 a.m.', '05:00'), ('早上7点半出发', '07:30'), ('下午3点出发', '15:00'),
+    ('use live traffic', 'now'), ('live traffic, we leave at 8:15', '08:15'), ('at noon', '12:00'),
+    ('use 2 trucks', None), ('unload 20 min', None), ('set temperature to 35 degrees', None),
+    ('keep 20% battery', None), ('at 25:00', None), ('leave at 25:00 with live traffic', None), ('25点出发', None)])
+def test_departure_is_read_from_the_words(text, want):
+    assert be.departure_in(text) == want
+
+
+def test_departure_is_the_next_time_the_depot_clock_reads_it(monkeypatch):
+    monkeypatch.setattr(be, 'get_utc_offset', lambda lat, lng, ts: (-8 * 3600, 'America/Los_Angeles'))
+    now = 1_762_000_000                                  # 12:26:40 UTC = 04:26:40 at UTC-8
+    soon = be.departure_info('07:30', {'lat': 0, 'lng': 0}, now)
+    assert soon['departure_ts'] - now == 3 * 3600 + 3 * 60 + 20 and soon['time_zone'] == 'America/Los_Angeles'
+    gone = be.departure_info('04:00', {'lat': 0, 'lng': 0}, now)  # passed: tomorrow
+    assert 0 < gone['departure_ts'] - now < 24 * 3600 and gone['departure_ts'] - now > 23 * 3600
+    assert be.departure_info('now', {'lat': 0, 'lng': 0}, now)['departure_ts'] == now
+
+
+def test_traffic_asks_google_for_the_departure_and_uses_the_traffic_time(monkeypatch):
+    seen = {}
+
+    class Resp:
+        def json(self):
+            el = {'status': 'OK', 'distance': {'value': 1000}, 'duration': {'value': 100},
+                  'duration_in_traffic': {'value': 160}}
+            return {'status': 'OK', 'rows': [{'elements': [el, el]}, {'elements': [el, el]}]}
+    monkeypatch.setattr(be.requests, 'get', lambda url, params=None, **kw: seen.update(params) or Resp())
+    out = be.get_distance_matrix([{'lat': 0, 'lng': 0}, {'lat': 1, 'lng': 1}], departure_ts=1_800_000_000)
+    assert seen['departure_time'] == 1_800_000_000 and out['time'][0][1] == 160
+
+
+def test_driving_style_slows_only_cruising_legs_and_orders_the_energy():
+    m = {'distance': [[0, 10000, 2000], [10000, 0, 1], [2000, 1, 0]],
+         'time': [[0, 400, 400], [400, 0, 1], [400, 1, 0]]}       # 90 km/h, and an 18 km/h city leg
+    eco = be.styled_matrices(m, 'eco')
+    assert eco['time'][0][1] == round(400 / 0.9) and eco['time'][0][2] == 400
+    assert be.styled_matrices(m, 'normal') is m
+    for v in (25, 90):
+        e = {st: be.calculate_energy_consumption(10, v * (be.STYLE_CRUISE_FACTOR[st] if v > be.CRUISE_KMH else 1),
+                                                 20, 5.9, 0, 50, True, st)['energy_kwh'] for st in be.DRIVING_STYLES}
+        assert e['eco'] < e['normal'] < e['aggressive']
+    r = {st: be.truck_limits(4, driving_style=st)['rows'][1]['range_empty_mi'] for st in be.DRIVING_STYLES}
+    assert r['eco'] > r['normal'] > r['aggressive']
+
+
+def test_optimize_with_traffic_fetches_for_the_departure_and_styles_the_solve(monkeypatch, ctx):
+    calls = []
+    monkeypatch.setattr(be, 'get_distance_matrix', lambda locs, departure_ts=None: calls.append(departure_ts) or ctx['matrices'])
+    monkeypatch.setattr(be, 'get_elevation_data', lambda locs: [0.0] * len(locs))
+    monkeypatch.setattr(be, 'departure_info', lambda dep, depot, now=None: {
+        'departure': dep, 'departure_ts': 1_800_000_000, 'departure_local': 'Mon 07:30', 'time_zone': 'X'})
+    locs = [{'address': a, 'lat': 0, 'lng': 0} for a in ctx['locations']]
+    client = be.app.test_client()
+
+    def solve(style, traffic=None, pre=None):
+        body = {'locations': locs, 'return_to_start': True, 'vehicles': [truck(0)], 'solver': 'held_karp',
+                'energy_params': {'driving_style': style}, 'traffic': traffic, 'precomputed': pre}
+        return client.post('/api/optimize', json=body).get_json()
+
+    first = solve('normal', {'departure': '07:30'})
+    assert calls == [1_800_000_000] and first['traffic']['departure'] == '07:30'
+    pre = {**first['matrices'], 'elevations': first['elevations'], 'traffic': first['traffic']}
+    again = solve('eco', {'departure': '07:30'}, pre)
+    assert calls == [1_800_000_000]                                  # same traffic: no new Google call
+    assert again['matrices']['time'] == first['matrices']['time']    # Google's times, not eco's
+    assert again['results']['optimal']['total_energy_kwh'] < first['results']['optimal']['total_energy_kwh']
+    solve('normal', None, pre)
+    assert calls == [1_800_000_000, None]                            # traffic turned off: refetch
+
+
+@pytest.mark.parametrize('value, utterance, want', [
+    ('now', 'use live traffic', {'departure': 'now'}),
+    ('07:30', 'we leave at 7:30', {'departure': '07:30'}),
+    ('08:00', 'use live traffic', {'departure': 'now'}),            # code reads the words, not the model
+    ('off', 'ignore traffic', {'departure': None})])
+def test_traffic_change_takes_its_departure_from_the_message(value, utterance, want):
+    raw = {'axis': 'traffic', 'op': 'set', 'value_text': value, 'value_number': None, 'value_bool': None,
+           'value_list': None, 'evidence': utterance}
+    change, reason = be.validate_change(raw, utterance, FORM)
+    assert reason is None and change['value'] == want
+
+
+def test_traffic_without_a_time_asks_when_the_trucks_leave():
+    u = 'plan with traffic'
+    raw = {'intent': 'apply', 'changes': [{'axis': 'traffic', 'op': 'set', 'value_text': 'on', 'value_number': None,
+                                           'value_bool': None, 'value_list': None, 'evidence': u}]}
+    out = run_turn(raw, u)
+    assert out['intent'] == 'ask' and out['pending']['axis'] == 'traffic' and 'When do the trucks leave' in out['message']
+    answer = be.lexicon_fast_path('7:30', out['pending'], FORM)
+    assert answer['changes'][0]['value'] == {'departure': '07:30'}
+
+
+@pytest.mark.parametrize('value, evidence, want', [
+    ('eco', 'take it easy', 'eco'), ('aggressive', 'sporty mode', 'aggressive'), ('eco', '节能驾驶', 'eco'),
+    ('aggressive', 'ludicrous mode', None), ('race', 'race mode', None)])
+def test_a_driving_style_must_be_named_by_its_own_words(value, evidence, want):
+    raw = {'axis': 'driving_style', 'op': 'set', 'value_text': value, 'value_number': None, 'value_bool': None,
+           'value_list': None, 'evidence': evidence}
+    change, reason = be.validate_change(raw, evidence, FORM)
+    if want:
+        assert change['value'] == want
+    else:
+        assert change is None and 'eco, normal, aggressive' in reason
+
+
+@pytest.mark.parametrize('utterance, axis, want', [
+    ('use live traffic', 'traffic', {'departure': 'now'}), ('ignore traffic', 'traffic', {'departure': None}),
+    ('live traffic at 7:30', 'traffic', {'departure': '07:30'}), ('eco driving', 'driving_style', 'eco'),
+    ('drive aggressively', 'driving_style', 'aggressive'), ('实时路况', 'traffic', {'departure': 'now'})])
+def test_lexicon_sets_traffic_and_style(utterance, axis, want):
+    out = be.lexicon_fast_path(utterance, None, FORM)
+    assert out['source'] == 'lexicon' and out['changes'][0]['axis'] == axis and out['changes'][0]['value'] == want
+
+
+def test_a_departure_time_next_to_another_value_goes_to_the_model():
+    assert be.lexicon_fast_path('leave at 8:00 and drive aggressively', None, FORM) is None
+    assert be.lexicon_fast_path('drive aggressively', None, FORM)['changes'][0]['value'] == 'aggressive'
+
+
+def test_traffic_on_from_the_model_reads_the_departure_from_the_words():
+    for value, u, want in (('on', 'use live traffic and eco driving', 'now'), ('on', 'we go at 6pm', '18:00')):
+        raw = {'axis': 'traffic', 'op': 'set', 'value_text': value, 'value_number': None, 'value_bool': None,
+               'value_list': None, 'evidence': u.split(' and ')[0]}
+        change, reason = be.validate_change(raw, u, FORM)
+        assert reason is None and change['value'] == {'departure': want}
+
+
+# ---- proactive suggestions ----------------------------------------------------
+
+def facts(**kw):
+    route = {'vehicle_name': 'Vehicle 1', 'num_delivery_stops': 2, 'battery_depleted': False,
+             'battery_remaining_pct': 50.0, 'total_energy_kwh': 40.0, 'battery_capacity_kwh': 80.0,
+             'total_time_s': 3600, 'total_distance_mi': 30.0}
+    routes = kw.pop('routes', [dict(route)])
+    f = {'routes': routes, 'unserved': [], 'fleet': len(routes) > 1, 'min_left_pct': min(r['battery_remaining_pct'] for r in routes),
+         'back_s': max(r['total_time_s'] for r in routes), 'mi': 0, 'kwh': 0,
+         'short': [r for r in routes if r['battery_depleted']]}
+    f.update(kw)
+    return f, route
+
+
+def test_the_most_pressing_problem_is_named():
+    f, r = facts()
+    assert be.plan_problem(f, be.DEFAULT_GOALS) is None
+    dead = dict(r, battery_depleted=True, battery_remaining_pct=0.0, total_energy_kwh=103.0)
+    f, _ = facts(routes=[dead])
+    kind, text = be.plan_problem(f, be.DEFAULT_GOALS)
+    assert kind == 'battery' and 'needs 103 of 80 kWh' in text
+    f, _ = facts(routes=[dict(r, battery_remaining_pct=9.0)])
+    assert be.plan_problem(f, be.DEFAULT_GOALS)[0] == 'thin'
+    f, _ = facts(routes=[dict(r, total_time_s=2 * 3600), dict(r, vehicle_name='Vehicle 2', total_time_s=4 * 3600)])
+    kind, text = be.plan_problem(f, be.DEFAULT_GOALS)
+    assert kind == 'imbalance' and text.startswith('Vehicle 2 gets back 2h 00m after Vehicle 1')
+
+
+def test_fixes_are_tried_weights_first_then_packs_then_a_truck():
+    dead = {'total_energy_kwh': 103.0}
+    f = {'short': [dead], 'routes': [dead]}
+    data = {'vehicles': [truck(0), truck(1)], 'locations': [{}] * 6}
+    cands = be.fix_candidates('battery', data, f, be.DEFAULT_GOALS)
+    assert [a for a, _ in cands] == ['goals', 'battery_packs', 'battery_packs', 'vehicle_count']
+    assert cands[0][1]['energy'] == 'high' and cands[0][1]['distance'] == 'low'
+    assert [cands[1][1], cands[2][1]] == [7, 8]  # 103 kWh with a 15% margin: 103 / 17 → 7, and one up
+    assert be.fix_candidates('imbalance', data, f, be.DEFAULT_GOALS) == [('goals', dict(be.DEFAULT_GOALS, balance='high'))]
+
+
+def test_a_fix_counts_only_if_it_solves_the_problem():
+    before, _ = facts(short=[{}], min_left_pct=0.0)
+    fixed, _ = facts(short=[], min_left_pct=20.0)
+    assert be.fixes_problem('battery', before, fixed) == ''
+    assert be.fixes_problem('battery', before, dict(fixed, min_left_pct=14.0)) == 'still'   # too thin to count
+    assert be.fixes_problem('battery', before, dict(fixed, unserved=[{}])) == 'more_unserved'
+    late, _ = facts(back_s=4 * 3600)
+    assert be.fixes_problem('imbalance', late, dict(late, back_s=4 * 3600 - 600)) == 'no_better'
+
+
+def test_suggestion_on_the_demo_offers_a_tested_fix_as_a_yes_no_question(ctx):
+    locs = [dict(loc, lat=0.0, lng=0.0) if isinstance(loc, dict) else {'address': loc, 'lat': 0.0, 'lng': 0.0}
+            for loc in ctx['locations']]
+    data = {'locations': locs, 'return_to_start': True, 'vehicles': [truck(0), truck(1)], 'solver': 'auto',
+            'energy_params': {'temperature_c': 20}, 'goals': dict(be.DEFAULT_GOALS),
+            'precomputed': {**ctx['matrices'], 'elevations': ctx['elevations']}}
+    data['results'] = be.optimize_payload(dict(data, fleet_time_limit_s=2))['results']
+    sug = be.suggest_fix(data)
+    assert sug['kind'] == 'battery' and sug['fix']['axis'] == 'battery_packs'
+    change = sug['pending']['queued'][0]
+    assert change['axis'] == 'battery_packs' and change['evidence'] == sug['problem']
+    assert sug['message'].endswith('Apply it? (yes / no)')
+    # Nothing is suggested without the plan's matrices: no Google calls for a suggestion.
+    assert be.suggest_fix(dict(data, precomputed=None)) is None

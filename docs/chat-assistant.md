@@ -1,7 +1,7 @@
 # Chat assistant
 
-**Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L1982)
-(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L3726)), and the UI in
+**Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L2443)
+(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L4305)), and the UI in
 [`AIChatbot.jsx`](../route-optimizer-frontend/src/AIChatbot.jsx).
 
 The assistant tunes the optimizer in plain language. The operator describes the day ("battery
@@ -35,13 +35,13 @@ operator utterance
 
 | Stage | Code |
 |---|---|
-| Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L2018) |
-| What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L2066) |
-| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L2791), [`lexicon_fast_path()`](../route_optimizer_backend.py#L2924) |
-| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3114), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3122), [`call_extraction()`](../route_optimizer_backend.py#L3209) |
-| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L3249), [`validate_extraction()`](../route_optimizer_backend.py#L3392), [`route_outcome()`](../route_optimizer_backend.py#L3573) |
-| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L3677) |
-| Goals, limits, breakdowns | [`outcome_goals()`](../route_optimizer_backend.py#L2581), [`outcome_limits()`](../route_optimizer_backend.py#L2657), [`outcome_disruption()`](../route_optimizer_backend.py#L2695) |
+| Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L2479) |
+| What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L2534) |
+| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L3316), [`lexicon_fast_path()`](../route_optimizer_backend.py#L3460) |
+| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3666), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3674), [`call_extraction()`](../route_optimizer_backend.py#L3763) |
+| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L3803), [`validate_extraction()`](../route_optimizer_backend.py#L3965), [`route_outcome()`](../route_optimizer_backend.py#L4152) |
+| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L4256) |
+| Goals, limits, breakdowns | [`outcome_goals()`](../route_optimizer_backend.py#L3105), [`outcome_limits()`](../route_optimizer_backend.py#L3181), [`outcome_disruption()`](../route_optimizer_backend.py#L3220) |
 | Building the reply | `outcome_apply / outcome_ask / outcome_recommend / outcome_memory / outcome_out_of_scope` |
 | Re-solving after a turn | `handleChatTurn` → `runChatResolve` / `runBreakdown` in `RouteOptimizer.jsx`; `onTurn` in `AIChatbot.jsx` |
 | Applying a change in the UI | [`applyChatChange`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L440) in `RouteOptimizer.jsx` |
@@ -78,7 +78,7 @@ of steps, and the server runs them in that order:
 
 - **A later step sees what an earlier one did.** The list runs after the deletion. "Use 3
   trucks, then tell me which solver to use" gets advice for 3 trucks
-  ([`advance_form_state()`](../route_optimizer_backend.py#L3626) carries the form forward between steps).
+  ([`advance_form_state()`](../route_optimizer_backend.py#L4205) carries the form forward between steps).
 - **Most messages are still one step.** Several values in one sentence ("2 trucks with 6 packs")
   form one step with several changes, and deleting several drivers is one step.
 - **One form change per message still holds.** If a second step would change the form again, it
@@ -107,9 +107,13 @@ The operator talks about the day; the assistant decides which settings move.
 | "truck 2 broke down after its first stop" | a breakdown re-plan: the stranded stops move to the other trucks |
 | "Wang's truck crashed an hour in, send a spare" | the same, 60 minutes after dispatch, with a spare truck allowed |
 | "re-optimize" | runs the optimizer (geocoding first if the stops changed) |
+| "we leave at 7:30" / "use live traffic" / "早上7点半出发" | traffic for that departure (07:30, or now); the plan is re-priced with Google's traffic prediction |
+| "plan with traffic" | asks when the trucks leave ("now" or a time) |
+| "drive in eco mode" / "take it easy" / "开得激进一点" | driving style eco / aggressive |
+| "drive in ludicrous mode" | rejected with the rule: driving style must be eco, normal or aggressive |
 
 The model picks a **level** per goal (off / low / medium / high, or raise / lower), from a
-closed enum. [`goal_weights()`](../route_optimizer_backend.py#L714) turns levels
+closed enum. [`goal_weights()`](../route_optimizer_backend.py#L862) turns levels
 into weights, and the reply names each changed goal, what it does to the routes, and the new
 weights. The same gates as every other change apply, plus a few of their own:
 
@@ -120,7 +124,7 @@ weights. The same gates as every other change apply, plus a few of their own:
   and "we're running late" as priority stops nobody named, both answered with "I couldn't
   verify that". When no form value survives, the model's goal update is used instead. A
   reserve written out in the message (a percentage, a keep / reserve word, and a battery or
-  truck word, see [`reserve_from_words()`](../route_optimizer_backend.py#L2573)) is applied even
+  truck word, see [`reserve_from_words()`](../route_optimizer_backend.py#L3097)) is applied even
   if the model left it out, or quoted words from earlier in the chat. A question about a
   reserve ("what does a 20% reserve do?") only gets an explanation.
 - **A situation is never a solver switch.** "Get everyone back sooner" once came back as
@@ -134,9 +138,58 @@ weights. The same gates as every other change apply, plus a few of their own:
   cannot turn into stop 0. A spare truck needs the word spare, backup or extra.
 - **Limits questions describe a hypothetical truck.** If the model returns "5 packs" as a
   form change, it is folded back into the question and the form is left alone.
+- **Traffic takes its departure from the operator's words, not the model's.**
+  [`departure_in`](../route_optimizer_backend.py#L735) reads "7:30", "6pm", "leave at 7", "早上7点半", "now" or "live" from the
+  message. Whatever the model put in the slot ("on", a time), the change carries the time the
+  message says. A bare hour only counts after a word like "at" or "leave", so "2 trucks" and
+  "20 min" are not times. An impossible time ("25:00") is rejected rather than read as "now".
+  Traffic with no time asks "When do the trucks leave?", and the answer ("7:30", "now", "7") is
+  applied without a model call.
+- **A driving style must be named by its own words.** The evidence must contain a word for that
+  style ([`STYLE_WORD_RE`](../route_optimizer_backend.py#L2579): "eco", "gentle", "take it easy", "节能" → eco; "sporty", "hard",
+  "激进" → aggressive). "Ludicrous mode" is rejected with the rule "Driving style must be one of:
+  eco, normal, aggressive".
+- **Every reply shows where its values came from.** Each applied change shows the words it was
+  taken from ("from “we leave at 7:30”"), and each rejection shows its rule in full ("Skipped:
+  Driving style must be one of: eco, normal, aggressive"). The goals reply quotes them too.
 - **Talk of goals, limits or breakdowns skips the lexicon.** Otherwise "truck 2 broke down
   after 2 stops" would set the fleet to 2 trucks, and "leave the battery at 20%" would ask
   for 20 battery packs.
+
+## Suggestions after each solve
+
+After every solve the page asks [`POST /api/suggest`](api.md#post-apisuggest) whether the plan has a
+problem worth fixing ([`suggest_fix`](../route_optimizer_backend.py#L1832)). The assistant then offers a fix it has already tested,
+without being asked:
+
+```
+plan solved ─► most pressing problem? ─► try fixes in order, re-solving each with the same matrices
+                                            1. a goal weight   (Energy high, or Balance high)
+                                            2. battery packs   (enough for a 15% margin, and one more)
+                                            3. one more truck
+                                         ─► first fix that solves it ─► "… Apply it? (yes / no)"
+```
+
+| Problem ([`plan_problem`](../route_optimizer_backend.py#L1694)) | When | Fixes tried |
+|---|---|---|
+| A truck runs out of battery, or misses its reserve | any route | Energy high → packs → +1 truck; fixed only if every truck keeps 15% |
+| Stops can't be served | a reserve leaves stops unserved | Energy high → +2 packs → 9 packs → +1 truck |
+| A thin battery | a truck finishes under 15%, no reserve set | Energy high → packs → +1 truck |
+| Uneven finish times | 2+ trucks back ≥ 1 h apart, and ≥ 25% of the longest day | Balance high; fixed only if the last truck is back ≥ 15 min sooner |
+
+- **Every fix is measured, not guessed.** Each candidate is a full re-solve
+  ([`optimize_payload`](../route_optimizer_backend.py#L1944)) with the plan's own matrices, so a suggestion makes no Google calls.
+  The message lists what was tried and the measured effect: "I tried Distance low · Energy high:
+  still short; 7 battery packs per truck: still short. 8 battery packs per truck fixes it: lowest
+  battery left 0% → 24% …". If nothing works, it says so and asks nothing.
+- **"Yes" applies it like any confirmed change.** The fix is the pending question's queued change.
+  Its evidence is the problem the plan showed, so the reply reads "from “The truck runs out of
+  battery about 23 mi after Marina Del Rey …”". The plan is then re-solved and compared as usual.
+- **It waits its turn.** A suggestion appears only when the chat is idle, never over a question the
+  operator still has to answer. While the panel is closed, a lightbulb marks the chat button. Each
+  suggestion is made once for a given set of settings, whether it was taken or turned down. It is
+  skipped after a simulated breakdown.
+- Replies from this path are labelled **suggestion**.
 
 ## After every change: re-solve and compare
 
@@ -230,8 +283,8 @@ saved. If the model recognises a save request but returns no name, the reply ask
   Linus with 6 packs" would set the form's packs to 6. Names are matched as whole words, so a
   driver called "Li" does not capture "climate".
 
-Code: [`do_remember()`](../route_optimizer_backend.py#L3914), [`do_recall()`](../route_optimizer_backend.py#L3946),
-[`do_forget()`](../route_optimizer_backend.py#L3979), [`validate_profile()`](../route_optimizer_backend.py#L3837).
+Code: [`do_remember()`](../route_optimizer_backend.py#L4493), [`do_recall()`](../route_optimizer_backend.py#L4525),
+[`do_forget()`](../route_optimizer_backend.py#L4558), [`validate_profile()`](../route_optimizer_backend.py#L4416).
 
 The memory is stored in one JSON file, `fleet_memory.json`, next to the server. It is gitignored
 because it is runtime state. Its shape is
@@ -289,5 +342,16 @@ this fix was shown as "Loaded" but never applied.
 
 These run against a live server on :5001 and need a chat model key (`OPENAI_API_KEY` or `LLM_API_KEY`):
 
-- [`prompt_test.py`](../prompt_test.py): the prompt battery. Results are in `prompt_test_results.txt`.
+- [`prompt_test.py`](../prompt_test.py): the prompt battery, 121 cases in 14 suites (26 in Chinese).
+  Suite N covers traffic and driving style. Suite O runs cases late in a conversation, with the
+  demo's history or a pending question, where some misreadings only show up. A case is
+  `(message, expected intent[, form state[, {"history", "pending"}]])`. Results are in
+  `prompt_test_results.txt`.
+- [`r4_test.py`](../r4_test.py): the R4 test set. 50 requests for objective weights, traffic and
+  driving style (25 English, 25 Chinese, 10 adversarial). For each case it records the intent, the
+  parameters extracted, whether every value is traceable to the message, and whether the route
+  metrics move the requested way. The metrics are solved on the saved Piedmont SC scenario: energy
+  weighted → fewer kWh, eco → fewer kWh than normal, a reserve kept on every route, and so on.
+  `--live` also prices each traffic departure with Google on the Anaheim demo. Results are in
+  `r4_test_results.txt` and `r4_test_results_live.txt`.
 - [`prompt_demo.py`](../prompt_demo.py): ten representative prompts, each with the full reply. Results are in `prompt_demo_results.txt`.

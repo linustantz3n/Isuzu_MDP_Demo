@@ -53,6 +53,15 @@ test('setting changes read as chips', () => {
   ]);
 });
 
+test('traffic and driving style changes read as chips; old versions count as off / normal', () => {
+  const s = { goals: DEFAULT_GOALS, priorityStops: [], vehicles: [{ name: 'V1', battery_packs: 4, weight_lbs: 13000 }],
+              energyParams: { temperature_c: 20, unload_time_min: 30, has_climate_control: true }, solver: 'auto',
+              depot: 'x', stops: ['a', 'b'] };
+  const t = { ...s, energyParams: { ...s.energyParams, driving_style: 'eco' }, traffic: '07:30' };
+  expect(settingChanges(s, t)).toEqual(['Driving normal → eco', 'Traffic: off → leaving at 07:30']);
+  expect(settingChanges(t, { ...t, traffic: 'now' })).toEqual(['Traffic: leaving at 07:30 → live, leaving now']);
+});
+
 test('weights mirror the backend table', () => {
   expect(goalWeights({ ...DEFAULT_GOALS, distance: 'low', energy: 'high' })).toEqual(
     { distance: 0.2, time: 0, energy: 0.8, balance: 0 });

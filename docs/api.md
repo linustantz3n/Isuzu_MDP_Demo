@@ -26,7 +26,7 @@ Every endpoint returns `"status": "ok"` on success, or `"status": "error"` with 
 
 ## `POST /api/optimize`
 
-**Code:** [`optimize_route()`](../route_optimizer_backend.py#L1517).
+**Code:** [`optimize_route()`](../route_optimizer_backend.py#L1934).
 
 The steps:
 
@@ -56,8 +56,10 @@ The steps:
   "energy_params": {
     "temperature_c": 20,
     "unload_time_min": 30,
-    "has_climate_control": true
+    "has_climate_control": true,
+    "driving_style": "eco"
   },
+  "traffic": {"departure": "07:30"},
   "goals": {"distance": "low", "time": "off", "energy": "high", "balance": "off", "battery_reserve_pct": 20},
   "priority_stops": [3],
   "precomputed": {"distance": [[...]], "time": [[...]], "elevations": [...]}
@@ -75,16 +77,24 @@ The steps:
 | `energy_params.temperature_c` | 20 | Ambient °C, used for every leg |
 | `energy_params.unload_time_min` | 30 | Minutes per delivery stop. Adds to time, not energy |
 | `energy_params.has_climate_control` | `true` | Adds 0.092 kWh/km |
+| `energy_params.driving_style` | `"normal"` | `eco` / `normal` / `aggressive`: assumed speed and energy factors (see [energy-model.md](energy-model.md#driving-style-and-traffic)) |
+| `traffic` | `null` | `{"departure": "now"}` or `{"departure": "HH:MM"}`: travel times are Google's traffic prediction for that departure at the depot (the next time its clock reads `HH:MM`). `null`: Google's typical times |
 | `energy_params.total_weight_lbs`, `base_weight_lbs` | 19,500 / 7,000 | Effectively unused (see [energy-model.md](energy-model.md#other-inputs-and-what-they-affect)) |
 | `algorithms` | (from `solver`) | Explicit list to run (`held_karp` / `optimal`, `nearest_neighbor` / `greedy`, `2opt`). Overrides `solver` |
 | `goals` | distance only | Levels `off` / `low` / `medium` / `high` for `distance`, `time`, `energy`, `balance`, plus `battery_reserve_pct` (`null` = report only, 0–50 = enforce on fleets). What the solvers minimise; see [planning.md](planning.md#optimization-goals). Without `goals`, `mode: "time"` still means "minimise time" |
 | `priority_stops` | `[]` | Location indices (1 … n−1) to serve before the other stops on their truck |
-| `precomputed` | — | `{distance, time, elevations}` as returned by an earlier solve of the **same** locations. Skips every Google call. Ignored if the shapes do not match `locations` |
+| `precomputed` | — | `{distance, time, elevations, traffic}` as returned by an earlier solve of the **same** locations. Skips every Google call. Ignored if the shapes do not match `locations`, or if its `traffic` departure differs from the request's |
 
 What the vehicle defaults mean: 13,000 lbs, 4 packs and 80 kWh. One pack is 20 kWh and 200 kg.
 The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md](energy-model.md#weight-model).
 
 ### Response
+
+Besides the results, the response carries `matrices` (Google's distance and time matrices,
+**before** the driving style is applied, so a re-solve that sends them back does not apply it
+twice), `elevations`, `goals`, `priority_stops`, `energy_params.driving_style`, and `traffic`:
+`null`, or `{departure, departure_ts, departure_local, time_zone}`, the departure the travel times
+were priced for (`time_zone` is the depot's, from the Google Time Zone API, or "server local time").
 
 ```
 {
@@ -209,10 +219,31 @@ earlier, in the UI's "Validate Addresses" step.
 
 ---
 
+## `POST /api/suggest`
+
+Checks a solved plan for a problem and tests fixes for it ([`suggest_fix`](../route_optimizer_backend.py#L1832)). The page calls
+it after every solve; see [chat-assistant.md](chat-assistant.md#suggestions-after-each-solve).
+
+**Request:** the `/api/optimize` request that produced the plan, plus `precomputed` (its matrices
+and elevations, as the optimize response returned them), `results` (the optimize response's
+`results`) and `lang` (`en` / `zh`). Without `precomputed` nothing is checked, so the endpoint
+never makes Google calls.
+
+**Response:** `{"status": "ok", "suggestion": null}` when the plan has no problem, else
+
+| Field | Meaning |
+|---|---|
+| `kind` | `battery`, `unserved`, `thin` or `imbalance` |
+| `problem` | The problem in words, with its numbers |
+| `tried` | `[{axis, label, ok, result}]`: each fix tried, in order, and whether it solved the problem |
+| `fix` | `{axis, value, label, effect}` for the first fix that worked, or `null` |
+| `message` | The chat message: problem, what was tried, the fix and its measured effect, "Apply it? (yes / no)" |
+| `pending` | `{question, axis, queued: [change]}` to echo to `/api/chat`, so "yes" applies the fix; `null` without a fix |
+
 ## `POST /api/replan`
 
-**Code:** [`replan_route()`](../route_optimizer_backend.py#L1926) →
-[`replan_breakdown()`](../route_optimizer_backend.py#L1144). The model behind it is
+**Code:** [`replan_route()`](../route_optimizer_backend.py#L2365) →
+[`replan_breakdown()`](../route_optimizer_backend.py#L1298). The model behind it is
 explained in [planning.md](planning.md#breakdown-re-planning).
 
 Simulates one truck breaking down part-way through a plan, and re-plans the rest of the day.

@@ -1,0 +1,108 @@
+OK     [en] 'battery is tight today'
+      goals/model: Goals → Energy high · Distance medium · Time low  [OK direction: kwh 137.16→133.68]
+OK     [en] "we're running late, get everyone back sooner"
+      goals/model: Goals → Time high · Distance medium · Energy low  [OK direction: drive_h 3.91→3.82]
+OK     [en] 'save as much electricity as possible'
+      goals/model: Goals → Energy high · Distance medium · Time low  [OK direction: kwh 137.16→133.68]
+!!     [en] 'fewest miles please, tyres are expensive'
+      ask/model: I couldn't tie that goal change to your words — what matters most toda
+OK     [en] 'make the routes fair for the drivers'
+      goals/model: Goals → Balance high  [OK direction: back_h 6.40→5.71]
+OK     [en] 'time matters more than distance today'
+      goals/model: Goals → Time high · Distance low · Energy low  [OK direction: drive_h 3.91→3.82]
+OK     [en] 'keep 20% battery in every truck'
+      goals/model: Goals → Energy high · Distance medium · Time low · reserve 20%  [OK direction: reserve kept on every route (1 unserved)]
+OK     [en] 'customers are waiting, finish the day sooner'
+      goals/model: Goals → Time high · Distance medium · Balance medium · Energy low  [OK direction: drive_h 3.91→3.82]
+OK     [en] 'we leave at 7:30'
+      apply/model: Traffic → leaving at 07:30  [OK direction: traffic: run with --live to price it]
+OK     [en] 'use live traffic'
+      apply/lexicon: Traffic → live, leaving now  [OK direction: traffic: run with --live to price it]
+OK     [en] 'trucks go out at 6pm, plan with traffic'
+      apply/model: Traffic → leaving at 18:00  [OK direction: traffic: run with --live to price it]
+OK     [en] 'plan for a 5 am departure with traffic'
+      apply/model: Traffic → leaving at 05:00  [OK direction: traffic: run with --live to price it]
+OK     [en] 'ignore traffic'
+      apply/lexicon: Traffic → off  [OK direction: traffic: run with --live to price it]
+OK     [en] 'drive in eco mode'
+      apply/lexicon: Driving style → eco  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [en] 'the drivers should take it easy'
+      apply/model: Driving style → eco  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [en] 'aggressive driving today'
+      apply/lexicon: Driving style → aggressive  [OK direction: kWh normal 137.2 → aggressive 161.0]
+OK     [en] 'back to normal driving'
+      apply/lexicon: Driving style → normal  [OK direction: kWh normal 137.2 → normal 137.2]
+OK     [en] 'drive gently'
+      apply/lexicon: Driving style → eco  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [en] 'use live traffic and eco driving'
+      apply/model: Traffic → live, leaving now; Driving style → eco  [OK direction: kWh normal 137.2 → eco 123.1; traffic: run with --live to price it]
+OK     [en] 'leave at 8:00 and drive aggressively'
+      apply/model: Traffic → leaving at 08:00; Driving style → aggressive  [OK direction: kWh normal 137.2 → aggressive 161.0; traffic: run with --live to price it]
+OK     [zh] '今天电量紧张'
+      goals/model: 优化目标 → 电量 高 · 距离 中 · 时间 低  [OK direction: kwh 137.16→133.68]
+OK     [zh] '我们赶时间，让大家早点回来'
+      goals/model: 优化目标 → 时间 高 · 距离 中 · 均衡 中 · 电量 低  [OK direction: drive_h 3.91→3.82]
+OK     [zh] '尽量省电'
+      goals/model: 优化目标 → 电量 高 · 距离 中 · 时间 低  [OK direction: kwh 137.16→133.68]
+OK     [zh] '路程越短越好'
+      goals/model: 优化目标 → 距离 高 · 时间 低 · 电量 低  [OK direction: mi 133.62→133.62]
+OK     [zh] '让司机的工作量平均一点'
+      goals/model: 优化目标 → 均衡 高 · 距离 中 · 时间 低 · 电量 低  [OK direction: back_h 6.40→5.75]
+OK     [zh] '今天时间比距离重要'
+      goals/model: 优化目标 → 时间 高 · 距离 低 · 电量 低  [OK direction: drive_h 3.91→3.82]
+OK     [zh] '每辆车留20%电量'
+      goals/model: 优化目标 → 电量 高 · 距离 中 · 时间 低 · 保留 20% 电量  [OK direction: reserve kept on every route (1 unserved)]
+OK     [zh] '客户在等，早点送完'
+      goals/model: 优化目标 → 时间 高 · 距离 中 · 均衡 中 · 电量 低  [OK direction: drive_h 3.91→3.82]
+OK     [zh] '早上7点半出发'
+      apply/model: 实时路况 → 07:30 出发  [OK direction: traffic: run with --live to price it]
+OK     [zh] '用实时路况'
+      apply/lexicon: 实时路况 → 现在出发  [OK direction: traffic: run with --live to price it]
+OK     [zh] '下午6点出发，考虑路况'
+      apply/model: 实时路况 → 18:00 出发  [OK direction: traffic: run with --live to price it]
+OK     [zh] '凌晨5点出发'
+      apply/model: 实时路况 → 05:00 出发  [OK direction: traffic: run with --live to price it]
+OK     [zh] '不考虑路况'
+      apply/lexicon: 实时路况 → 关  [OK direction: traffic: run with --live to price it]
+OK     [zh] '节能驾驶'
+      apply/lexicon: 驾驶风格 → 节能  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [zh] '开得温和一点'
+      apply/model: 驾驶风格 → 节能  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [zh] '激进驾驶'
+      apply/lexicon: 驾驶风格 → 激进  [OK direction: kWh normal 137.2 → aggressive 161.0]
+OK     [zh] '正常驾驶'
+      apply/lexicon: 驾驶风格 → 正常  [OK direction: kWh normal 137.2 → normal 137.2]
+OK     [zh] '开慢一点'
+      apply/model: 驾驶风格 → 节能  [OK direction: kWh normal 137.2 → eco 123.1]
+OK     [zh] '用实时路况，节能驾驶'
+      apply/model: 实时路况 → 现在出发; 驾驶风格 → 节能  [OK direction: kWh normal 137.2 → eco 123.1; traffic: run with --live to price it]
+OK     [zh] '8点出发，开得激进一点'
+      apply/model: 实时路况 → 08:00 出发; 驾驶风格 → 激进  [OK direction: kWh normal 137.2 → aggressive 161.0; traffic: run with --live to price it]
+OK ADV [en] 'plan with traffic'
+      ask/model: When do the trucks leave? Say "now" for live traffic, or a time like 7
+OK ADV [en] 'drive in ludicrous mode'
+      ask/model: I couldn't verify that in your message. (Driving style must be one of:
+OK ADV [en] 'leave at 25:00 with live traffic'
+      ask/lexicon: When do the trucks leave? Say "now" for live traffic, or a time like 7
+OK ADV [en] 'make it the shortest, the fastest and the most energy-efficient route'
+      goals/model: Goals → Distance high · Time high · Energy high
+OK ADV [en] "use last Tuesday's traffic"
+      ask/model: I couldn't verify that in your message. (Traffic: not found in your me
+OK ADV [zh] '考虑路况'
+      ask/model: 请问你希望在什么时间考虑路况？
+OK ADV [zh] '用赛车模式开'
+      ask/model: 这条我没法从你的话里核实。（驾驶风格必须是以下之一：eco, normal, aggressive）能再说一遍具体的值吗？
+OK ADV [zh] '25点出发'
+      ask/model: 车几点出发？说“现在”用实时路况，或给个时间，比如 7:30。
+OK ADV [zh] '又要最短又要最快还要最省电'
+      goals/model: 优化目标 → 距离 高 · 时间 高 · 电量 高
+OK ADV [zh] '用上周二的路况'
+      ask/model: 这条我没法从你的话里核实。（实时路况：在你的话里找不到依据）能再说一遍具体的值吗？
+
+==========================================================================================
+Cases: 50 (25 English, 25 Chinese, 10 adversarial)
+Intent match:           49/50 (98%)
+Correct (intent + parameters + traceable): 49/50 (98%)
+Untraceable values:     0
+Metric direction:       29/29 correct  (traffic cases need --live)
+R4 pass criteria met:   YES

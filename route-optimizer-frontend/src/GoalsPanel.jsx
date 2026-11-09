@@ -1,12 +1,13 @@
 import React from 'react';
-import { Sparkles, Star, X, Target } from 'lucide-react';
-import { GOAL_KEYS, GOAL_LEVELS, GOAL_META, RESERVE_CHOICES, goalWeights, reserveLabel } from './goals';
+import { Sparkles, Star, X, Target, Car, Gauge } from 'lucide-react';
+import { GOAL_KEYS, GOAL_LEVELS, GOAL_META, RESERVE_CHOICES, DRIVING_STYLES, STYLE_META, goalWeights, reserveLabel } from './goals';
 
 const LEVEL_SHORT = { off: 'Off', low: 'Low', medium: 'Med', high: 'High' };
 
 // What the solver optimizes for. The assistant sets these from plain language
 // ("battery is tight today"); the operator can also set them by hand.
-export default function GoalsPanel({ goals, onChange, priorityStops, onRemovePriority, setBy, hot, vehicleCount }) {
+export default function GoalsPanel({ goals, onChange, priorityStops, onRemovePriority, setBy, hot, vehicleCount,
+                                    traffic, onTrafficChange, drivingStyle, onStyleChange }) {
   const w = goalWeights(goals);
   const set = (k, v) => onChange({ ...goals, [k]: v });
 
@@ -80,6 +81,53 @@ export default function GoalsPanel({ goals, onChange, priorityStops, onRemovePri
             <option key={String(r)} value={r ?? ''}>{reserveLabel(r)}</option>
           ))}
         </select>
+      </div>
+
+      {/* Traffic: Google's prediction for a departure time, or typical times */}
+      <div className="flex items-center justify-between gap-2 mt-3">
+        <label className="text-xs text-slate-400 flex items-center gap-1.5"><Car className="w-3 h-3" /> Traffic</label>
+        <div className="flex items-center gap-1">
+          <select
+            value={!traffic ? 'off' : traffic === 'now' ? 'now' : 'time'}
+            onChange={e => onTrafficChange(e.target.value === 'off' ? null : e.target.value === 'now' ? 'now' : '08:00')}
+            className="px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-white focus:ring-1 focus:ring-[#C8002F]"
+            title="Without traffic, travel times are Google's typical ones"
+          >
+            <option value="off">off (typical times)</option>
+            <option value="now">live, leave now</option>
+            <option value="time">leave at…</option>
+          </select>
+          {traffic && traffic !== 'now' && (
+            <input
+              type="time"
+              value={traffic}
+              onChange={e => e.target.value && onTrafficChange(e.target.value)}
+              className="px-1.5 py-0.5 bg-slate-800 border border-slate-700 rounded text-xs text-white w-[5.5rem]"
+              title="Departure at the depot, local time: the next time the clock reads this"
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Driving style: assumed speed and energy factors */}
+      <div className="flex items-center gap-2 mt-2">
+        <label className="text-xs text-slate-400 flex items-center gap-1.5 w-[5.5rem] flex-shrink-0"><Gauge className="w-3 h-3" /> Driving</label>
+        <div className="flex flex-1 bg-slate-800 border border-slate-700 rounded-md p-0.5">
+          {DRIVING_STYLES.map(st => (
+            <button
+              key={st}
+              onClick={() => onStyleChange(st)}
+              title={STYLE_META[st].hint}
+              className={`flex-1 text-[10px] py-0.5 rounded transition-colors ${
+                (drivingStyle || 'normal') === st
+                  ? (st === 'normal' ? 'bg-slate-600 text-white' : st === 'eco' ? 'bg-emerald-500 text-slate-900 font-semibold' : 'bg-orange-500 text-slate-900 font-semibold')
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+            >
+              {STYLE_META[st].label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="mt-3">
