@@ -21,3 +21,8 @@ __pycache__/
 # Frontend build (deploy separately)
 route-optimizer-frontend/build/
 route-optimizer-frontend/node_modules/
+
+# Traffic data package: licensed for this project only, never commit
+poc_route_planning_v1/
+poc_route_planning_v1.zip
+*:Zone.Identifier

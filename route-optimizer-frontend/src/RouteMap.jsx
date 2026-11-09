@@ -8,6 +8,12 @@ const VEHICLE_COLORS = [
 const SINGLE_COLOR = '#facc15';
 const BLOCKED_COLOR = '#ef4444';
 const REROUTE_COLOR = '#22c55e';
+const CRASH_COLOR = '#fb923c';
+// Warning triangle for crash hotspots, so they don't look like the round stop markers
+const HOTSPOT_PATH = 'M 0,-1.15 L 1.1,0.75 L -1.1,0.75 Z';
+const CHARGE_COLOR = '#22d3ee';
+const CHARGER_FILL = '#facc15';
+const BOLT_PATH = 'M 1,-10 L -6,2 L -1,2 L -2,10 L 6,-2 L 1,-2 Z';
 
 const MAP_CONTAINER_STYLE = { width: '100%', height: '500px' };
 
@@ -29,7 +35,10 @@ const MAP_STYLES = [
   { featureType: 'landscape', elementType: 'geometry', stylers: [{ color: '#1e293b' }] },
 ];
 
-export default function RouteMap({ results, locations, replan }) {
+// replan: /api/replan_incidents response; activeAccidents: ids switched on;
+// activeLegs: the legs rerouted for that combination of accidents
+// chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
+export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [] }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -148,11 +157,12 @@ export default function RouteMap({ results, locations, replan }) {
     });
   }, [isLoaded, results, locations]);
 
-  // Zoom to the replanned leg so the accident and detour are visible
+  // Zoom to the hotspots and the legs they can block (once, not on every toggle)
   useEffect(() => {
     if (!isLoaded || !replan || !mapRef.current) return;
     const bounds = new window.google.maps.LatLngBounds();
-    [...replan.original.path, ...replan.rerouted.path].forEach(pt => bounds.extend(pt));
+    Object.values(replan.scenarios).flat().forEach(leg => leg.original.path.forEach(pt => bounds.extend(pt)));
+    replan.accidents.forEach(a => bounds.extend(a));
     mapRef.current.fitBounds(bounds, 48);
   }, [isLoaded, replan]);
 
@@ -166,6 +176,14 @@ export default function RouteMap({ results, locations, replan }) {
 
   const fleetRoutes = results.ortools_fleet?.routes || [];
   const center = { lat: locations[0].lat, lng: locations[0].lng };
+
+  // Single vehicle: number stops in Held-Karp visit order, matching the stop list and
+  // replanning card. Fleet mode keeps input order, since each vehicle visits its own subset.
+  const visitNumber = {};
+  if (!results.ortools_fleet) {
+    (results.optimal?.order || []).forEach((locIdx, k) => { visitNumber[locIdx] = k; });
+  }
+  const stopNumber = (idx) => visitNumber[idx] ?? idx;
 
   return (
     <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
@@ -225,6 +243,41 @@ export default function RouteMap({ results, locations, replan }) {
               </svg>
               Reroute
             </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-red-400">
+              <svg width="14" height="12">
+                <path d="M 7,1 L 13,11 L 1,11 Z" fill="none" stroke={BLOCKED_COLOR} strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+              Crash hotspot
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-orange-400">
+              <svg width="10" height="10">
+                <circle cx="5" cy="5" r="4" fill={CRASH_COLOR} />
+              </svg>
+              Past fatal crash
+            </span>
+          </>
+        )}
+        {/* Charging legend */}
+        {chargingPlans.some(p => p.needed) && (
+          <>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-cyan-300">
+              <svg width="12" height="14" viewBox="-7 -11 14 22">
+                <path d={BOLT_PATH} fill={CHARGER_FILL} stroke="#0f172a" strokeWidth="1.5" />
+              </svg>
+              Charging stop
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-cyan-300">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={CHARGE_COLOR} strokeWidth="3" />
+              </svg>
+              Via charger
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-orange-400">
+              <svg width="10" height="10">
+                <circle cx="5" cy="5" r="4" fill="#f97316" stroke="#ffffff" strokeWidth="1" />
+              </svg>
+              Battery hits 20%
+            </span>
           </>
         )}
         {fetchingRoutes && (
@@ -256,41 +309,101 @@ export default function RouteMap({ results, locations, replan }) {
             />
           ))}
 
-          {/* Replanned leg: blocked original (dashed), reroute, accident marker */}
+          {/* Replanned legs: blocked originals (dashed), reroutes, accident markers, past crashes */}
           {replan && (
             <>
-              <PolylineF
-                path={replan.original.path}
-                options={{
-                  strokeOpacity: 0,
-                  zIndex: 10,
-                  icons: [{
-                    icon: { path: 'M 0,-1 0,1', strokeColor: BLOCKED_COLOR, strokeOpacity: 1, scale: 3 },
-                    offset: '0',
-                    repeat: '12px',
-                  }],
-                }}
-              />
-              <PolylineF
-                path={replan.rerouted.path}
-                options={{ strokeColor: REROUTE_COLOR, strokeOpacity: 0.95, strokeWeight: 5, zIndex: 11 }}
-              />
-              <MarkerF
-                position={replan.accident}
-                icon={{
-                  path: window.google.maps.SymbolPath.CIRCLE,
-                  scale: 12,
-                  fillColor: BLOCKED_COLOR,
-                  fillOpacity: 1,
-                  strokeColor: '#ffffff',
-                  strokeWeight: 2,
-                }}
-                label={{ text: '!', color: '#ffffff', fontSize: '14px', fontWeight: 'bold' }}
-                title="Accident"
-                zIndex={30}
-              />
+              {activeLegs.map(leg => (
+                <React.Fragment key={leg.leg_index}>
+                  <PolylineF
+                    path={leg.original.path}
+                    options={{
+                      strokeOpacity: 0,
+                      zIndex: 10,
+                      icons: [{
+                        icon: { path: 'M 0,-1 0,1', strokeColor: BLOCKED_COLOR, strokeOpacity: 1, scale: 3 },
+                        offset: '0',
+                        repeat: '12px',
+                      }],
+                    }}
+                  />
+                  <PolylineF
+                    path={leg.rerouted.path}
+                    options={{ strokeColor: REROUTE_COLOR, strokeOpacity: 0.95, strokeWeight: 5, zIndex: 11 }}
+                  />
+                </React.Fragment>
+              ))}
+              {replan.accidents.filter(a => activeAccidents.includes(a.id)).flatMap(a => a.crashes.map((crash, i) => (
+                <MarkerF
+                  key={`crash-${a.id}-${i}`}
+                  position={crash}
+                  icon={{
+                    path: window.google.maps.SymbolPath.CIRCLE,
+                    scale: 4,
+                    fillColor: CRASH_COLOR,
+                    fillOpacity: 0.85,
+                    strokeColor: '#0f172a',
+                    strokeWeight: 1,
+                  }}
+                  title={`Fatal crash, ${crash.year}`}
+                  zIndex={25}
+                />
+              )))}
+              {replan.accidents.map(a => {
+                const active = activeAccidents.includes(a.id);
+                return (
+                  <MarkerF
+                    key={`accident-${a.id}-${active}`}
+                    position={{ lat: a.lat, lng: a.lng }}
+                    icon={{
+                      path: HOTSPOT_PATH,
+                      scale: 13,
+                      fillColor: active ? BLOCKED_COLOR : '#0f172a',
+                      fillOpacity: active ? 1 : 0.9,
+                      strokeColor: active ? '#ffffff' : BLOCKED_COLOR,
+                      strokeWeight: 2,
+                      labelOrigin: new window.google.maps.Point(0, 0.3),
+                    }}
+                    label={{ text: String(a.id), color: active ? '#ffffff' : BLOCKED_COLOR, fontSize: '12px', fontWeight: 'bold' }}
+                    title={`${active ? 'Accident' : 'Hotspot (off)'} ${a.id}: ${a.road || 'unnamed road'} (${a.crash_count} past fatal crashes)`}
+                    zIndex={active ? 30 : 26}
+                  />
+                );
+              })}
             </>
           )}
+
+          {/* Charging stops: road via the charger, charger, other chargers, where the battery would hit the reserve */}
+          {chargingPlans.filter(p => p.stop).map(p => (
+            <React.Fragment key={`charge-${p.vehicle_id}`}>
+              {[p.stop.to_charger_path, p.stop.from_charger_path].map((path, i) => (
+                <PolylineF key={i} path={path} options={{ strokeColor: CHARGE_COLOR, strokeOpacity: 0.95, strokeWeight: 4, zIndex: 12 }} />
+              ))}
+              <MarkerF
+                position={{ lat: p.stop.charger.lat, lng: p.stop.charger.lng }}
+                icon={{ path: BOLT_PATH, scale: 1.4, fillColor: CHARGER_FILL, fillOpacity: 1, strokeColor: '#0f172a', strokeWeight: 1.5 }}
+                title={`Vehicle ${p.vehicle_id} charging stop: ${p.stop.charger.name}${p.stop.charger.max_kw ? ` (${p.stop.charger.max_kw} kW)` : ''}`}
+                zIndex={31}
+              />
+            </React.Fragment>
+          ))}
+          {chargingPlans.flatMap(p => (p.alternatives || []).map((c, i) => (
+            <MarkerF
+              key={`charger-alt-${p.vehicle_id}-${i}`}
+              position={{ lat: c.lat, lng: c.lng }}
+              icon={{ path: BOLT_PATH, scale: 0.9, fillColor: '#64748b', fillOpacity: 0.9, strokeColor: '#0f172a', strokeWeight: 1 }}
+              title={`Other charger for vehicle ${p.vehicle_id}: ${c.name}${c.max_kw ? ` (${c.max_kw} kW)` : ''}`}
+              zIndex={22}
+            />
+          )))}
+          {chargingPlans.filter(p => p.needed).map(p => (
+            <MarkerF
+              key={`reserve-${p.vehicle_id}`}
+              position={{ lat: p.reserve_point.lat, lng: p.reserve_point.lng }}
+              icon={{ path: window.google.maps.SymbolPath.CIRCLE, scale: 5, fillColor: '#f97316', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 1.5 }}
+              title={`Vehicle ${p.vehicle_id}: battery would hit the 20% reserve here without charging`}
+              zIndex={24}
+            />
+          ))}
 
           {/* Stop markers */}
           {locations.map((loc, idx) => (
@@ -306,7 +419,7 @@ export default function RouteMap({ results, locations, replan }) {
                 strokeWeight: 2,
               }}
               label={{
-                text: idx === 0 ? 'D' : String(idx),
+                text: idx === 0 ? 'D' : String(stopNumber(idx)),
                 color: '#ffffff',
                 fontSize: '11px',
                 fontWeight: 'bold',
@@ -324,7 +437,7 @@ export default function RouteMap({ results, locations, replan }) {
             >
               <div style={{ color: '#0f172a', minWidth: '180px', padding: '2px' }}>
                 <p style={{ fontWeight: 'bold', marginBottom: '4px' }}>
-                  {selectedMarker === 0 ? 'Depot' : `Stop ${selectedMarker}`}
+                  {selectedMarker === 0 ? 'Depot' : `Stop ${stopNumber(selectedMarker)}`}
                 </p>
                 <p style={{ fontSize: '12px', color: '#334155' }}>
                   {locations[selectedMarker].formatted_address || locations[selectedMarker].address}

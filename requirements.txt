@@ -4,3 +4,5 @@ flask-cors>=4.0.0
 python-dotenv>=1.0.0
 ortools>=9.8
 gunicorn>=21.2.0
+pandas>=2.0
+pyarrow>=14.0
