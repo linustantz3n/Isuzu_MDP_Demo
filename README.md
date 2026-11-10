@@ -121,6 +121,17 @@ python route_optimizer_backend.py
 | `/api/geocode_batch` | POST | Geocode multiple addresses |
 | `/api/optimize` | POST | **Main endpoint** - optimize route |
 | `/api/directions` | POST | Get turn-by-turn directions |
+| `/api/replan_incidents` | POST | Find historical crash hotspots on the route and reroute around every on/off combination of them (demo) |
+| `/api/plan_charging` | POST | Find a charging stop for fleet vehicles that would end below the 20% SoC reserve |
+
+**Incident replanning demo.** Accidents are placed where fatal crashes actually
+happened along the route, using NHTSA FARS data (2019–2023, all US fatal crashes,
+public domain) in `data/crash_history.csv.gz`. Crashes within 150 m of each leg's
+road are grouped into 1 km stretches; the stretches with the most crashes become
+the accidents (default 3, spread over different legs, none next to a stop). Every
+leg that passes an accident is rerouted via a Google alternative route or a forced
+detour. To refresh the data, download newer `FARS<YEAR>NationalCSV.zip` files and
+run `python scripts/build_crash_history.py FARS*.zip`.
 
 **Example - Optimize Route:**
 ```bash
@@ -178,6 +189,41 @@ Local search that improves an initial solution by reversing segments.
 - Starts from nearest neighbor solution
 - Iteratively improves by swapping edges
 - Usually gets within 2-5% of optimal
+
+---
+
+## Traffic Data (optional)
+
+`/api/optimize` can take travel times from a traffic data package instead of Google: four days of 5-minute speeds (measured and 2-hour forecasts) on the major roads of a 15 x 14 km area around Cerritos and Stanton. `traffic_data.py` follows the package's travel-time rules (corridor speed in the interval the edge is entered, plus intersection length and traffic-light delays) and reproduces its `example.py` result.
+
+- **Setup:** unzip the package to `poc_route_planning_v1/` in the repo root (or set `POC_TRAFFIC_DIR`). The data is licensed for this project only and is git-ignored, so never commit it.
+- **Request:** add `"traffic_source": "forecast" | "historical" | "ground_truth"` and `"departure_time": "2025-11-12T07:30"` (days: 2025-11-12, 11-18, 11-22, 11-23). `historical` uses the ground truth of a comparable other day (Wed↔Tue, Sat↔Sun) at the same times.
+- **Plan vs reality:** the Held-Karp result gets `traffic.actual_travel_time_s`, which is the planned route driven on the measured speeds with the clock running (unload time at each stop).
+- **Dashboard:** choose the source under *Travel Times* and load the *Demo 0* stops (all stops must be inside the area).
+- **Simplifications:** every pair in the matrix is timed as if it started at the departure time; freeway speeds are capped at 88 km/h (the data has car speeds); stops snap to the nearest non-freeway road, so the short stretch from the address to that road is not counted.
+
+---
+
+## Incident Replanning (demo)
+
+Routes are planned ahead and trucks are loaded for that plan. On the day, the plan is rerun against live conditions (here: simulated accidents at historical crash hotspots), but because the trucks are already loaded, the stop order is kept.
+
+**How the plan is preserved.** `/api/replan_incidents` takes the planned legs (Held-Karp order, or with several vehicles every OR-Tools route's legs tagged with `vehicle_id`) and only replaces the road between the two stops an accident sits on (stop i → stop i+1). With a fleet, hotspots are spread over the vehicles first, and the time shown is the makespan (last vehicle back). Stops are never added, removed or reordered. The dashboard shows the unchanged stop sequence and the whole-route distance, time and energy before and after. `tests/test_replanning.py` checks this offline (no API key needed):
+
+```bash
+python -m unittest discover tests
+```
+
+**Two replanning cases.**
+
+| Case | Example | Can the stop order change? | Status |
+|------|---------|----------------------------|--------|
+| Interchangeable loads | Every stop gets the same product (e.g. only Coke syrup) | Yes: the solver may resequence stops after an incident | Not implemented |
+| Fixed loads | Each stop has its own goods (e.g. Ulta, then Costco), loaded in delivery order | No: only the roads between stops may change | Implemented (single vehicle and fleet) |
+
+**Charging stops (20% SoC reserve).** Each vehicle must stay above 20% of its battery and be back at the depot with at least 20%. Fleet vehicles that would end below that are flagged, and **Find Charging Stops** calls `/api/plan_charging`: it locates where the battery would hit 20% (energy spread evenly over each leg), searches DC fast chargers (CCS1, 50 kW+) along the legs up to that point with Google Places Text Search (search along route), and inserts the charger that adds the least time (detour + charging) into its leg. The vehicle charges just enough to finish with the reserve; stops are not reordered. Charging time assumes the truck accepts at most 50 kW (`VEHICLE_MAX_CHARGE_KW`, to be confirmed against the Isuzu spec) and a flat charging curve. Routes that need more than one stop are reported, not planned. The solver itself does not enforce the reserve yet. Needs the Places API (New) enabled for the Google key; `tests/test_charging.py` checks the SoC rules offline.
+
+**Energy in replanning: deferred.** Energy is calculated for the original and rerouted legs and shown for comparison, but it does not decide which detour is taken: the reroute is the fastest route that avoids the accident. Making replanning energy-aware is future work. The open design question is whether energy should be part of the objective (e.g. minimize time + λ·kWh, which needs an agreed trade-off λ) or a constraint (reject detours that would drain the battery below a reserve, which needs the battery state at that point of the route).
 
 ---
 
@@ -297,6 +343,8 @@ To benchmark a new algorithm (e.g. a BEV-aware router), write `solve(problem) ->
 ├── route_optimizer_backend.py  # Flask API server
 ├── route_optimizer.jsx         # React dashboard component
 ├── google_maps_api_guide.md    # API reference guide
+├── data/crash_history.csv.gz   # Historical fatal crashes (NHTSA FARS) for incident replanning
+├── scripts/build_crash_history.py  # Builds the crash data from FARS downloads
 └── README.md                   # This file
 ```
 
@@ -307,8 +355,8 @@ To benchmark a new algorithm (e.g. a BEV-aware router), write `solve(problem) ->
 - Python 3.8+
 - Google Maps API key with:
   - Geocoding API
-  - Distance Matrix API
-  - Directions API
+  - Routes API (replaces the legacy Distance Matrix and Directions APIs)
+  - Elevation API (used by the energy model)
 - Python packages: `requests`, `flask`, `flask-cors`
 
 ---

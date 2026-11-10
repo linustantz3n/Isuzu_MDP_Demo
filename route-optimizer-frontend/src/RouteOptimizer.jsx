@@ -1,10 +1,24 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, TriangleAlert, RotateCcw } from 'lucide-react';
 import RouteMap from './RouteMap';
 import FleetCharts from './FleetCharts';
 import BenchmarkPanel from './BenchmarkPanel';
 import BenchmarkSimulation from './BenchmarkSimulation';
 import { API_BASE } from './api';
+
+// Demo replanning: this many historical crash hotspots on the route, each toggled on/off as an accident
+const NUM_ACCIDENTS = 3;
+
+// Key of /api/replan_incidents scenarios: active accident ids, sorted and comma-joined
+const scenarioKey = (ids) => [...ids].sort((a, b) => a - b).join(',');
+
+// Legs searched for crash hotspots: Held-Karp's, or with a fleet every vehicle's legs together,
+// each tagged with its vehicle and the input index of both ends (fleet stops keep input numbering)
+const incidentLegs = (results) => (results.ortools_fleet
+  ? results.ortools_fleet.routes.flatMap(route => route.legs.map((leg, k) => ({
+    ...leg, vehicle_id: route.vehicle_id, from_idx: route.order[k], to_idx: route.order[k + 1],
+  })))
+  : results.optimal.legs);
 
 const DEMO_ADDRESSES = [
   'Detroit, MI',
@@ -18,6 +32,22 @@ const DEMO_ADDRESSES = [
   'Dearborn, MI',
   'Livonia, MI'
 ];
+
+// Where travel times come from: Google, or the traffic data package
+// (4 days, Cerritos–Stanton area only; see traffic_data.py)
+const TRAFFIC_SOURCES = [
+  ['google', 'Google (typical, no traffic)'],
+  ['forecast', 'Traffic forecast at departure'],
+  ['historical', 'Historical traffic (same time, other day)'],
+  ['ground_truth', 'Measured traffic (hindsight)'],
+];
+const TRAFFIC_DAYS = [
+  ['2025-11-12', 'Wed Nov 12'],
+  ['2025-11-18', 'Tue Nov 18'],
+  ['2025-11-22', 'Sat Nov 22'],
+  ['2025-11-23', 'Sun Nov 23'],
+];
+const label = (options, value) => options.find(([v]) => v === value)?.[1] ?? value;
 
 function RouteOptimizer() {
   const [activeTab, setActiveTab] = useState('solver');
@@ -34,6 +64,14 @@ function RouteOptimizer() {
     { id: 1, name: 'Vehicle 1', weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 }
   ]);
   const [lastLocations, setLastLocations] = useState([]);
+  const [replan, setReplan] = useState(null);
+  const [replanning, setReplanning] = useState(false);
+  const [replanError, setReplanError] = useState(null);
+  const [activeAccidents, setActiveAccidents] = useState([]);
+  const [chargingPlans, setChargingPlans] = useState(null);  // /api/plan_charging plans by vehicle_id
+  const [planningCharging, setPlanningCharging] = useState(false);
+  const [chargingError, setChargingError] = useState(null);
+  const [traffic, setTraffic] = useState({ source: 'google', day: '2025-11-12', time: '07:30' });
   const [energyParams, setEnergyParams] = useState({
     temperature_c: 20,
     total_weight_lbs: 19500,
@@ -41,6 +79,11 @@ function RouteOptimizer() {
     unload_time_min: 30,
     has_climate_control: true
   });
+
+  const updateTraffic = (field, value) => {
+    setTraffic({ ...traffic, [field]: value });
+    setResults(null);
+  };
 
   const addVehicle = () => {
     const nextId = vehicles.length > 0 ? Math.max(...vehicles.map(v => v.id)) + 1 : 1;
@@ -73,9 +116,10 @@ function RouteOptimizer() {
     setResults(null);
   };
 
-  const loadDemoAddresses = async () => {
+  // Load a sample input from public/: first line is the depot, the rest are stops
+  const loadDemoAddresses = async (file = '/demo_stops.txt') => {
     try {
-      const res = await fetch('/demo_stops.txt');
+      const res = await fetch(file);
       const text = await res.text();
       const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
       const [depotLine, ...stopLines] = lines;
@@ -214,7 +258,10 @@ function RouteOptimizer() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           locations: locationsToOptimize,
-          mode: 'distance',
+          // With traffic data, optimize for time so traffic can change the stop order
+          mode: traffic.source === 'google' ? 'distance' : 'time',
+          traffic_source: traffic.source,
+          departure_time: traffic.source === 'google' ? undefined : `${traffic.day}T${traffic.time}`,
           return_to_start: useDepot,
           num_vehicles: vehicles.length,
           vehicles: vehicles,
@@ -231,12 +278,83 @@ function RouteOptimizer() {
 
       setResults(data.results);
       setLastLocations(locationsToOptimize);
+      setReplan(null);
+      setReplanError(null);
+      setChargingPlans(null);
+      setChargingError(null);
     } catch (err) {
       setError(err.message || 'Failed to optimize route');
     } finally {
       setLoading(false);
     }
   };
+
+  // Find historical crash hotspots on the route; reroutes for every on/off combination come back at once
+  const findHotspots = async () => {
+    setReplanning(true);
+    setReplanError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/replan_incidents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          legs: incidentLegs(results),
+          num_accidents: NUM_ACCIDENTS,
+          energy_params: energyParams
+        })
+      });
+
+      const data = await response.json();
+
+      if (data.status === 'error') {
+        throw new Error(data.message);
+      }
+
+      setReplan(data);
+      setActiveAccidents([]);
+    } catch (err) {
+      setReplanError(err.message || 'Failed to replan route');
+    } finally {
+      setReplanning(false);
+    }
+  };
+
+  // Find a charging stop for every fleet vehicle that would end below the SoC reserve
+  const findChargingStops = async () => {
+    setPlanningCharging(true);
+    setChargingError(null);
+
+    try {
+      const lowRoutes = results.ortools_fleet.routes.filter(r => r.battery_below_reserve);
+      const response = await fetch(`${API_BASE}/plan_charging`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vehicles: lowRoutes.map(r => ({ vehicle_id: r.vehicle_id, battery_kwh: r.battery_capacity_kwh, legs: r.legs })),
+          energy_params: energyParams
+        })
+      });
+
+      const data = await response.json();
+
+      if (data.status === 'error') {
+        throw new Error(data.message);
+      }
+
+      setChargingPlans(Object.fromEntries(data.plans.map(p => [p.vehicle_id, p])));
+    } catch (err) {
+      setChargingError(err.message || 'Failed to find charging stops');
+    } finally {
+      setPlanningCharging(false);
+    }
+  };
+
+  const toggleAccident = (id) => {
+    setActiveAccidents(ids => (ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]));
+  };
+
+  const activeLegs = (replan && activeAccidents.length > 0 && replan.scenarios[scenarioKey(activeAccidents)]) || [];
 
   const formatDistance = (meters) => {
     const miles = meters / 1609.34;
@@ -485,16 +603,62 @@ function RouteOptimizer() {
 
             <div className="border-t border-slate-800" />
 
+            {/* Travel Times */}
+            <section>
+              <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest mb-3">Travel Times</h3>
+              <select
+                value={traffic.source}
+                onChange={(e) => updateTraffic('source', e.target.value)}
+                className="w-full px-2 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
+              >
+                {TRAFFIC_SOURCES.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
+              </select>
+              {traffic.source !== 'google' && (
+                <>
+                  <div className="grid grid-cols-2 gap-2 mt-2">
+                    <select
+                      value={traffic.day}
+                      onChange={(e) => updateTraffic('day', e.target.value)}
+                      className="w-full px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-white focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
+                    >
+                      {TRAFFIC_DAYS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
+                    </select>
+                    <input
+                      type="time" step="300"
+                      value={traffic.time}
+                      onChange={(e) => updateTraffic('time', e.target.value)}
+                      className="w-full px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
+                    />
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-2 leading-relaxed">
+                    Traffic data covers only the Cerritos–Stanton area (load Demo 0). Routes are optimized for time, then driven on the measured speeds.
+                  </p>
+                </>
+              )}
+            </section>
+
+            <div className="border-t border-slate-800" />
+
             {/* Delivery Stops */}
             <section>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Delivery Stops</h3>
-                <button
-                  onClick={loadDemoAddresses}
-                  className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
-                >
-                  <Download className="w-3 h-3" /> Demo
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => loadDemoAddresses('/demo_stops_traffic_area.txt')}
+                    title="Stops inside the traffic data area (Cerritos – Stanton)"
+                    className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+                  >
+                    <Download className="w-3 h-3" /> Demo 0
+                  </button>
+                  <button
+                    onClick={() => loadDemoAddresses('/demo_stops.txt')}
+                    title="Anaheim depot with stops across LA / Orange County"
+                    className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+                  >
+                    <Download className="w-3 h-3" /> Demo 1
+                  </button>
+                </div>
               </div>
 
               <div className="space-y-1.5">
@@ -617,6 +781,16 @@ function RouteOptimizer() {
                     {fleet && ` · ${fleet.num_vehicles_used} vehicle${fleet.num_vehicles_used !== 1 ? 's' : ''} dispatched`}
                     {fleet && fleet.num_vehicles_requested !== fleet.num_vehicles_used && ` (${fleet.num_vehicles_requested} requested)`}
                   </p>
+                  {hk.traffic && (
+                    <p className="text-xs text-slate-500 mt-1">
+                      Travel times: {label(TRAFFIC_SOURCES, hk.traffic.source)} · departing {label(TRAFFIC_DAYS, hk.traffic.departure_time.slice(0, 10))} {hk.traffic.departure_time.slice(11, 16)}
+                      {' · '}driven on ground truth:{' '}
+                      <span className={`font-semibold ${hk.traffic.actual_travel_time_s > hk.traffic.planned_travel_time_s ? 'text-red-400' : 'text-green-400'}`}>
+                        {Math.round(hk.traffic.actual_travel_time_s / 60)} min
+                      </span>
+                      {' '}of driving (planned {Math.round(hk.traffic.planned_travel_time_s / 60)} min)
+                    </p>
+                  )}
                 </div>
                 {fleet && (
                   <div className="text-right">
@@ -873,8 +1047,158 @@ function RouteOptimizer() {
                 </div>
               </div>
 
+              {/* Incident replanning — on the fleet's routes when there is one, else Held-Karp's */}
+              {hk.legs.length > 0 && (() => {
+                const n = hk.ordered_locations.length;
+                const legs = incidentLegs(results);
+                const stopLabel = (i) => (i === 0 || i === n ? 'Depot' : `Stop ${i}`);
+                const stopName = (idx) => (idx === 0 ? 'Depot' : `Stop ${idx}`);
+                const legLabel = (i) => (fleet
+                  ? `V${legs[i].vehicle_id} · ${stopName(legs[i].from_idx)} → ${stopName(legs[i].to_idx)}`
+                  : `${stopLabel(i)} → ${stopLabel(i + 1)}`);
+                const diffClass = (d) => (d > 0 ? 'text-red-400' : 'text-green-400');
+                const sign = (d) => (d > 0 ? '+' : '−');
+                // After replanning = planned total + change on the rerouted legs
+                const change = (field, legsOf = activeLegs) => legsOf.reduce((sum, leg) => sum + leg.rerouted[field] - leg.original[field], 0);
+                const visitOrder = fleet
+                  ? fleet.routes.map(r => `V${r.vehicle_id}: ${r.order.map(i => (i === 0 ? 'D' : i)).join(' → ')}`).join('  ·  ')
+                  : [...Array(n).keys(), ...(hk.return_to_start ? [n] : [])]
+                    .map(i => (i === 0 || i === n ? 'D' : i)).join(' → ');
+                // Fleet time is the makespan: the last vehicle back, each delayed by its own reroutes
+                const planned = fleet
+                  ? { distance: fleet.total_distance_m, time: fleet.makespan_s, energy: fleet.total_energy_kwh, scope: 'all vehicles', timeScope: 'makespan' }
+                  : { distance: hk.total_distance_m, time: hk.total_time_s, energy: hk.total_energy_kwh, scope: 'whole route', timeScope: 'whole route' };
+                const timeAfter = fleet
+                  ? Math.max(...fleet.routes.map(r => r.total_time_s + change('time_s', activeLegs.filter(l => l.vehicle_id === r.vehicle_id))))
+                  : planned.time + change('time_s');
+                const years = replan && [
+                  Math.min(...replan.accidents.map(a => a.years[0])),
+                  Math.max(...replan.accidents.map(a => a.years[1])),
+                ];
+                return (
+                  <div className="bg-slate-900 border border-red-500/25 rounded-xl p-4">
+                    <div className="flex items-center gap-2">
+                      <TriangleAlert className="w-4 h-4 text-red-400" />
+                      <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Incident Replanning</span>
+                      <span className="text-[10px] text-slate-600">historical crash hotspots · delivery order fixed</span>
+                      <div className="ml-auto flex gap-2">
+                        {replan && (
+                          <button
+                            onClick={() => { setReplan(null); setActiveAccidents([]); }}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
+                          >
+                            <RotateCcw className="w-3 h-3" /> Reset
+                          </button>
+                        )}
+                        <button
+                          onClick={findHotspots}
+                          disabled={replanning || replan !== null}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-red-500/30 text-red-400 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          {replanning
+                            ? <><Loader2 className="w-3 h-3 animate-spin" /> Finding hotspots...</>
+                            : <><TriangleAlert className="w-3 h-3" /> Find Crash Hotspots</>
+                          }
+                        </button>
+                      </div>
+                    </div>
+
+                    {replanError && (
+                      <p className="mt-3 text-xs text-red-400">{replanError}</p>
+                    )}
+
+                    {replan && (
+                      <div className="mt-4 space-y-3">
+                        <p className="text-xs text-slate-400">
+                          {fleet ? "The fleet routes'" : "The route's"} {replan.accidents.length} worst fatal-crash hotspot{replan.accidents.length === 1 ? '' : 's'} ({replan.data_source}, {years[0]}–{years[1]})
+                          {replan.accidents.length < replan.num_requested && (
+                            <span className="text-slate-600"> — only {replan.accidents.length} avoidable hotspot{replan.accidents.length === 1 ? '' : 's'} on this route</span>
+                          )}.
+                          {' '}Switch one on to simulate an accident there.
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          Stop order preserved (trucks are already loaded):{' '}
+                          <span className="text-slate-300 font-mono">{visitOrder}</span>
+                          {' '}— only the roads between affected stops change.
+                        </p>
+
+                        {/* Accident list */}
+                        <div className="space-y-1.5">
+                          {replan.accidents.map(a => (
+                            <div key={a.id} className="flex items-center gap-2.5 text-xs">
+                              <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                                <input
+                                  type="checkbox"
+                                  checked={activeAccidents.includes(a.id)}
+                                  onChange={() => toggleAccident(a.id)}
+                                  className="sr-only peer"
+                                />
+                                <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-500"></div>
+                              </label>
+                              <span className={`flex-shrink-0 w-5 h-5 rounded-full text-white text-[11px] font-bold flex items-center justify-center ${activeAccidents.includes(a.id) ? 'bg-red-500' : 'bg-slate-600'}`}>{a.id}</span>
+                              <span className="text-white font-medium">{a.road || 'Unnamed road'}</span>
+                              <span className="text-slate-500">on {legLabel(a.leg_index)}</span>
+                              <span className="ml-auto text-slate-400">
+                                {a.crash_count} fatal crash{a.crash_count === 1 ? '' : 'es'} within 1 km
+                                <span className="text-slate-600"> ({a.years[0] === a.years[1] ? a.years[0] : `${a.years[0]}–${a.years[1]}`})</span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Rerouted legs */}
+                        <div className="space-y-1 border-t border-slate-800 pt-3">
+                          {activeLegs.length === 0 && (
+                            <p className="text-xs text-slate-600">No active accidents — route unchanged.</p>
+                          )}
+                          {activeLegs.map(leg => {
+                            const d = leg.rerouted.time_s - leg.original.time_s;
+                            return (
+                              <div key={leg.leg_index} className="flex items-center gap-2 text-xs">
+                                <span className="text-slate-300">{legLabel(leg.leg_index)}</span>
+                                <span className="text-slate-600">avoids #{leg.accident_ids.join(', #')} via {leg.method === 'alternative' ? 'Google alternative route' : 'forced detour'}</span>
+                                <span className={`ml-auto font-semibold ${diffClass(d)}`}>{sign(d)}{Math.round(Math.abs(d) / 60)} min</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* Whole-route (or whole-fleet) before/after */}
+                        {activeLegs.length > 0 && <div className="grid grid-cols-3 gap-3">
+                          {[
+                            ['Distance', planned.scope, MapPin, planned.distance, planned.distance + change('distance_m'), formatDistance,
+                              (d) => `${sign(d)}${formatDistance(Math.abs(d))}`],
+                            // Round (not floor like formatTime) so before/after match the diff
+                            ['Time', planned.timeScope, Clock, planned.time, timeAfter,
+                              (s) => { const m = Math.round(s / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m} min`; },
+                              (d) => `${sign(d)}${Math.round(Math.abs(d) / 60)} min`],
+                            ['Energy', planned.scope, Zap, planned.energy, planned.energy + change('energy_kwh'), (e) => `${e.toFixed(1)} kWh`,
+                              (d) => `${sign(d)}${Math.abs(d).toFixed(1)} kWh`],
+                          ].filter(([, , , before]) => before != null).map(([label, scope, Icon, before, after, fmt, fmtDiff]) => (
+                            <div key={label} className="bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2.5">
+                              <p className="text-[10px] text-slate-500 flex items-center gap-1.5 mb-1"><Icon className="w-3 h-3" />{label} · {scope}</p>
+                              <p className="text-sm text-white font-semibold">
+                                <span className="text-slate-500 line-through font-normal">{fmt(before)}</span> → {fmt(after)}
+                              </p>
+                              <p className={`text-[11px] font-semibold mt-0.5 ${diffClass(after - before)}`}>{fmtDiff(after - before)}</p>
+                            </div>
+                          ))}
+                        </div>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Map */}
-              <RouteMap results={results} locations={lastLocations} />
+              <RouteMap
+                results={results}
+                locations={lastLocations}
+                replan={replan}
+                activeAccidents={activeAccidents}
+                activeLegs={activeLegs}
+                chargingPlans={chargingPlans ? Object.values(chargingPlans) : []}
+              />
 
               {/* Charts */}
               <FleetCharts results={results} />
@@ -915,7 +1239,22 @@ function RouteOptimizer() {
                     <div className="px-4 py-3 border-b border-slate-800 flex items-center gap-2">
                       <Truck className="w-3.5 h-3.5 text-purple-400" />
                       <span className="text-sm font-medium text-slate-300">Fleet Stop Assignments</span>
+                      {results.ortools_fleet.routes.some(r => r.battery_below_reserve) && (
+                        <button
+                          onClick={findChargingStops}
+                          disabled={planningCharging || chargingPlans !== null}
+                          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-cyan-500/30 text-cyan-300 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          {planningCharging
+                            ? <><Loader2 className="w-3 h-3 animate-spin" /> Finding chargers...</>
+                            : <><Zap className="w-3 h-3" /> Find Charging Stops</>
+                          }
+                        </button>
+                      )}
                     </div>
+                    {chargingError && (
+                      <p className="px-4 pt-3 text-xs text-red-400">{chargingError}</p>
+                    )}
                     <div className="p-4 space-y-5">
                       {results.ortools_fleet.routes.map((route) => (
                         <div key={route.vehicle_id}>
@@ -938,13 +1277,17 @@ function RouteOptimizer() {
                                 </span>
                                 <span className={`font-semibold ${
                                   route.battery_depleted ? 'text-red-400' :
-                                  route.battery_remaining_pct < (route.battery_reserve_pct ?? 20) ? 'text-orange-400' :
+                                  route.battery_below_reserve ? 'text-orange-400' :
                                   'text-green-400'
                                 }`}>
-                                  {route.battery_depleted ? 'DEPLETED' : `${route.battery_remaining_pct}%`}
+                                  {route.battery_depleted ? 'DEPLETED'
+                                    : route.battery_below_reserve ? `${route.battery_remaining_pct}% · BELOW ${route.battery_reserve_pct}% RESERVE`
+                                    : `${route.battery_remaining_pct}%`}
                                 </span>
                               </div>
-                              <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                              <div className="relative h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                                {/* Reserve the vehicle must be back at the depot with */}
+                                <div className="absolute inset-y-0 w-px bg-slate-400 z-10" style={{ left: `${route.battery_reserve_pct}%` }} />
                                 <div
                                   className={`h-full rounded-full transition-all ${
                                     route.battery_depleted ? 'bg-red-500' :
@@ -954,17 +1297,55 @@ function RouteOptimizer() {
                                   style={{ width: `${Math.min(100, route.battery_remaining_pct || 0)}%` }}
                                 />
                               </div>
+                              {chargingPlans?.[route.vehicle_id] && (() => {
+                                const { stop } = chargingPlans[route.vehicle_id];
+                                const pct = (kwh) => `${Math.round(kwh / route.battery_capacity_kwh * 100)}%`;
+                                return stop ? (
+                                  <p className="mt-1.5 text-[10px] text-cyan-300">
+                                    With charging stop: back at depot with {pct(stop.final_soc_kwh)} ·{' '}
+                                    <span className="text-slate-400">
+                                      +{Math.round(stop.added_time_s / 60)} min ({Math.max(0, Math.round(stop.detour_time_s / 60))} min detour + {Math.round(stop.charge_time_s / 60)} min charging)
+                                    </span>
+                                  </p>
+                                ) : (
+                                  <p className="mt-1.5 text-[10px] text-red-400">
+                                    No charger along this route keeps the {route.battery_reserve_pct}% reserve with a single stop.
+                                  </p>
+                                );
+                              })()}
                             </div>
                           )}
                           <div className="space-y-1.5 pl-1">
-                            {route.ordered_locations.map((loc, i) => (
-                              <div key={i} className="flex items-start gap-2">
-                                <div className="w-5 h-5 flex-shrink-0 bg-slate-800 rounded flex items-center justify-center text-[10px] text-slate-500 font-bold">
-                                  {i === 0 || i === route.ordered_locations.length - 1 ? 'D' : i}
-                                </div>
-                                <p className="text-slate-400 text-xs truncate leading-5">{loc.formatted_address}</p>
-                              </div>
-                            ))}
+                            {route.ordered_locations.map((loc, i) => {
+                              const stop = chargingPlans?.[route.vehicle_id]?.stop;
+                              const pct = (kwh) => `${Math.round(kwh / route.battery_capacity_kwh * 100)}%`;
+                              return (
+                                <React.Fragment key={i}>
+                                  <div className="flex items-start gap-2">
+                                    <div className="w-5 h-5 flex-shrink-0 bg-slate-800 rounded flex items-center justify-center text-[10px] text-slate-500 font-bold">
+                                      {i === 0 || i === route.ordered_locations.length - 1 ? 'D' : i}
+                                    </div>
+                                    <p className="text-slate-400 text-xs truncate leading-5">{loc.formatted_address}</p>
+                                  </div>
+                                  {stop && stop.leg_index === i && (
+                                    <div className="flex items-start gap-2">
+                                      <div className="w-5 h-5 flex-shrink-0 bg-cyan-500/20 rounded flex items-center justify-center">
+                                        <Zap className="w-3 h-3 text-cyan-300" />
+                                      </div>
+                                      <div className="min-w-0">
+                                        <p className="text-cyan-300 text-xs truncate leading-5">
+                                          {stop.charger.name}{stop.charger.max_kw ? ` · ${stop.charger.max_kw} kW` : ''}
+                                          <span className="text-slate-500"> — {stop.charger.address}</span>
+                                        </p>
+                                        <p className="text-[10px] text-slate-500">
+                                          arrive {pct(stop.arrival_soc_kwh)} → charge {stop.charge_kwh.toFixed(1)} kWh at {stop.charge_kw} kW ({Math.round(stop.charge_time_s / 60)} min) → leave {pct(stop.depart_soc_kwh)}
+                                        </p>
+                                      </div>
+                                    </div>
+                                  )}
+                                </React.Fragment>
+                              );
+                            })}
                           </div>
                         </div>
                       ))}
