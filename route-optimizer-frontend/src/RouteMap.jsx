@@ -94,7 +94,8 @@ function pointAlongLeg(result, legIndex, fraction) {
 // replan: /api/replan_incidents response; activeAccidents: ids switched on;
 // activeLegs: the legs rerouted for that combination of accidents
 // chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
-// drive: {runId, speed} while the drive simulation runs (Held-Karp route, measured traffic), else null
+// drive: {runId, speed} while the drive simulation runs (measured traffic), else null. It drives
+//   the fleet's trucks when there is a fleet, otherwise the Held-Karp route.
 export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
@@ -108,30 +109,58 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
   const [visibleRoutes, setVisibleRoutes] = useState(new Set());
   const [overlay, setOverlay] = useState(null);  // DOM node over the map for the drive simulation
 
-  // Drive simulation legs: Google's road path for each Held-Karp leg (or, where an accident
-  // is on, the path it was found on), timed by the measured traffic
-  const hkDirections = routeDirections.find(r => r.label === 'Held-Karp');
-  const driveLegs = useMemo(() => {
+  // Drive simulation trucks: Google's road path for each leg of the route (or, where an
+  // accident is on, the path it was found on), timed by the measured traffic. One truck for
+  // the Held-Karp route; with a fleet, every truck's route. Accidents use the leg numbering
+  // of /api/replan_incidents: with a fleet, all trucks' legs in route order.
+  const driveTrucks = useMemo(() => {
+    const roadLegs = (directions, route, offset) => {
+      const actual = route?.traffic?.actual_leg_times_s;
+      const dirLegs = directions?.result.routes?.[0]?.legs;
+      if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
+      const stops = route.ordered_locations;
+      const atDepot = (k) => k + 1 >= stops.length || (k + 1 === stops.length - 1 && route.order?.[k + 1] === 0);
+      return dirLegs.map((leg, k) => ({
+        path: activeLegs.find(l => l.leg_index === offset + k)?.original.path
+          || leg.steps.flatMap(step => step.path.map(p => ({ lat: p.lat(), lng: p.lng() }))),
+        durationS: actual[k],
+        plannedS: route.legs[k]?.time_s ?? actual[k],
+        to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
+        toLabel: atDepot(k) ? 'Depot' : `Stop ${k + 1}`,
+      }));
+    };
+    const accidentsOn = (offset, n) => (replan ? replan.accidents : [])
+      .filter(a => activeAccidents.includes(a.id) && a.leg_index >= offset && a.leg_index < offset + n)
+      .map(a => ({ ...a, leg_index: a.leg_index - offset }));
+    const unloadOf = (route, stops) => (route.unload_time_s || 0) / Math.max(stops, 1);
+
+    const fleet = results?.ortools_fleet?.routes;
+    if (fleet?.length) {
+      const trucks = [];
+      let offset = 0;
+      for (const [idx, route] of fleet.entries()) {
+        const legs = roadLegs(routeDirections.find(r => r.label === `Vehicle ${route.vehicle_id}`), route, offset);
+        if (!legs) return null;  // every truck needs its road and measured times
+        trucks.push({
+          id: route.vehicle_id,
+          label: route.vehicle_name || `Vehicle ${route.vehicle_id}`,
+          color: VEHICLE_COLORS[idx % VEHICLE_COLORS.length],
+          legs,
+          accidents: accidentsOn(offset, route.legs.length),
+          unloadS: unloadOf(route, route.num_delivery_stops),
+        });
+        offset += route.legs.length;
+      }
+      return trucks;
+    }
     const hk = results?.optimal;
-    const actual = hk?.traffic?.actual_leg_times_s;
-    const dirLegs = hkDirections?.result.routes?.[0]?.legs;
-    if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
-    const stops = hk.ordered_locations;
-    return dirLegs.map((leg, k) => ({
-      path: activeLegs.find(l => l.leg_index === k)?.original.path
-        || leg.steps.flatMap(step => step.path.map(p => ({ lat: p.lat(), lng: p.lng() }))),
-      durationS: actual[k],
-      plannedS: hk.legs[k]?.time_s ?? actual[k],
-      to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
-      toLabel: k + 1 === stops.length ? 'Depot' : `Stop ${k + 1}`,
-    }));
-  }, [results, hkDirections, activeLegs]);
-  const driveAccidents = useMemo(
-    () => (replan ? replan.accidents.filter(a => activeAccidents.includes(a.id)) : []),
-    [replan, activeAccidents]);
-  const driveUnloadS = results?.optimal
-    ? (results.optimal.unload_time_s || 0) / Math.max(results.optimal.ordered_locations.length - 1, 1)
-    : 0;
+    const legs = roadLegs(routeDirections.find(r => r.label === 'Held-Karp'), hk, 0);
+    if (!legs) return null;
+    return [{ id: 'hk', label: 'The truck', color: SINGLE_COLOR, legs,
+              accidents: accidentsOn(0, legs.length), unloadS: unloadOf(hk, hk.ordered_locations.length - 1) }];
+  }, [results, routeDirections, activeLegs, replan, activeAccidents]);
+  const driveDeparture = results?.ortools_fleet?.routes?.[0]?.traffic?.departure_time
+    || results?.optimal?.traffic?.departure_time;
 
   const fitToRoutes = useCallback((visibleSet, directions) => {
     if (!mapRef.current || !window.google) return;
@@ -559,13 +588,11 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
           ))}
 
           {/* Drive simulation: the truck, reroutes it takes; clock and prompt go in the overlay */}
-          {drive && driveLegs && (
+          {drive && driveTrucks && (
             <DriveSimulation
               key={drive.runId}
-              legs={driveLegs}
-              accidents={driveAccidents}
-              departureTime={results.optimal.traffic.departure_time}
-              unloadS={driveUnloadS}
+              trucks={driveTrucks}
+              departureTime={driveDeparture}
               speed={drive.speed}
               overlay={overlay}
               onEnd={onDriveEnd}

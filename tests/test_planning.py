@@ -600,3 +600,28 @@ def test_suggestion_on_the_demo_offers_a_tested_fix_as_a_yes_no_question(ctx):
     assert sug['message'].endswith('Apply it? (yes / no)')
     # Nothing is suggested without the plan's matrices: no Google calls for a suggestion.
     assert be.suggest_fix(dict(data, precomputed=None)) is None
+
+
+def test_traffic_data_times_every_fleet_truck_for_the_drive_simulation(monkeypatch, ctx):
+    n = len(ctx['locations'])
+    locs = [dict(loc, lat=0.0, lng=0.0) for loc in ctx['locations']]
+    driven = []
+
+    def drive(paths, order, departure_time, unload_s, closes_itself):
+        driven.append((list(order), closes_itself))
+        return [60] * (len(order) - (0 if closes_itself else 1))
+    monkeypatch.setattr(be.traffic_data, 'travel_matrices',
+                        lambda locations, source, dep: {**ctx['matrices'], 'paths': {}})
+    monkeypatch.setattr(be.traffic_data, 'drive_on_ground_truth', drive)
+    monkeypatch.setattr(be, 'get_elevation_data', lambda locations: [0.0] * n)
+    out = be.optimize_payload({'locations': locs, 'vehicles': [truck(0), truck(1)], 'return_to_start': True,
+                               'goals': NO_RESERVE, 'traffic_source': 'forecast',
+                               'departure_time': '2025-11-12T07:30', 'fleet_time_limit_s': 1})
+    routes = out['results']['ortools_fleet']['routes']
+    assert len(routes) == 2
+    for r in routes:
+        t = r['traffic']
+        assert len(t['actual_leg_times_s']) == len(r['legs']) == len(r['order']) - 1
+        assert t['departure_time'] == '2025-11-12T07:30' and t['planned_travel_time_s'] == r['travel_time_s']
+        assert (r['order'], False) in driven      # fleet orders already end at the depot
+    assert out['results']['optimal']['traffic']['actual_leg_times_s']

@@ -90,7 +90,8 @@ function RouteOptimizer() {
   const [replanning, setReplanning] = useState(false);
   const [replanError, setReplanError] = useState(null);
   const [activeAccidents, setActiveAccidents] = useState([]);
-  // Drive simulation of the Held-Karp route on measured traffic: {runId, speed}, or null when off
+  // Drive simulation on measured traffic (the fleet's trucks, or the Held-Karp route without a fleet):
+  // {runId, speed}, or null when off
   const [drive, setDrive] = useState(null);
   const [chargingPlans, setChargingPlans] = useState(null);  // /api/plan_charging plans by vehicle_id
   const [planningCharging, setPlanningCharging] = useState(false);
@@ -1576,8 +1577,8 @@ function RouteOptimizer() {
                       <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Incident Replanning</span>
                       <span className="text-[10px] text-slate-600">historical crash hotspots · delivery order fixed</span>
                       <div className="ml-auto flex gap-2">
-                        {/* Drive simulation: single route with traffic data (measured leg times) */}
-                        {!fleet && hk.traffic && (drive ? (
+                        {/* Drive simulation: needs traffic data (measured leg times) for every route it drives */}
+                        {(fleet ? fleet.routes.length > 0 && fleet.routes.every(r => r.traffic) : hk.traffic) && (drive ? (
                           <>
                             <select
                               value={drive.speed}
@@ -1597,7 +1598,7 @@ function RouteOptimizer() {
                         ) : (
                           <button
                             onClick={() => setDrive({ runId: Date.now(), speed: SIM_SPEEDS[1] })}
-                            title="Drive the route on the measured traffic; you'll be asked to reroute at active accidents"
+                            title={`Drive ${fleet ? 'every truck\'s route' : 'the route'} on the measured traffic; you'll be asked to reroute at active accidents`}
                             className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg text-xs font-medium transition-colors"
                           >
                             <Play className="w-3 h-3" /> Simulate Drive

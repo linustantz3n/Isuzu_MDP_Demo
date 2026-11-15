@@ -2798,18 +2798,22 @@ def optimize_payload(data: dict) -> dict:
         result['battery_depletion'] = battery_depletion(
             legs, hk_battery_kwh, [eta[i] + (unload_time_min * 60 if i > 0 else 0) for i in range(len(legs))])
     
-    # Plan vs reality: drive the Held-Karp route on the measured speeds
-    if use_traffic_data and 'optimal' in results:
-        hk = results['optimal']
+    # Plan vs reality: drive a route on the measured speeds. The leg times also
+    # drive the map's drive simulation.
+    def ground_truth_traffic(order, closes_itself, planned_s):
         actual = traffic_data.drive_on_ground_truth(
-            raw_matrices['paths'], hk['order'], departure_time, unload_time_min * 60, return_to_start)
-        hk['traffic'] = {
+            raw_matrices['paths'], order, departure_time, unload_time_min * 60, closes_itself)
+        return {
             "source": traffic_source,
             "departure_time": departure_time,
-            "planned_travel_time_s": hk['travel_time_s'],
+            "planned_travel_time_s": planned_s,
             "actual_travel_time_s": sum(actual),
             "actual_leg_times_s": actual,
         }
+
+    if use_traffic_data and 'optimal' in results:
+        hk = results['optimal']
+        hk['traffic'] = ground_truth_traffic(hk['order'], return_to_start, hk['travel_time_s'])
 
     # Name the solver whose route the baseline panel is actually showing.
     baseline_key = ('held_karp' if 'held_karp' in algorithms
@@ -2866,6 +2870,10 @@ def optimize_payload(data: dict) -> dict:
                'unload_s': unload_time_min * 60, 'driving_style': driving_style}
         results['ortools_fleet'] = solve_fleet(ctx, vehicles_config, goals, priority,
                                                time_limit_s=data.get('fleet_time_limit_s'))
+        if use_traffic_data:
+            # Fleet orders already end at the depot ([0, a, b, 0]).
+            for route in results['ortools_fleet']['routes']:
+                route['traffic'] = ground_truth_traffic(route['order'], False, route['travel_time_s'])
 
     return {
         "status": "ok",
