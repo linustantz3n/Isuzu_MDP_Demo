@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, MarkerF, PolylineF, InfoWindow } from '@react-google-maps/api';
+import DriveSimulation from './DriveSimulation';
 
 export const VEHICLE_COLORS = [
   '#a855f7', '#3b82f6', '#10b981', '#f59e0b',
@@ -38,7 +39,8 @@ export const MAP_STYLES = [
 // replan: /api/replan_incidents response; activeAccidents: ids switched on;
 // activeLegs: the legs rerouted for that combination of accidents
 // chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
-export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [] }) {
+// drive: {runId, speed} while the drive simulation runs (Held-Karp route, measured traffic), else null
+export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -48,6 +50,32 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
   const [fetchingRoutes, setFetchingRoutes] = useState(false);
   const [selectedMarker, setSelectedMarker] = useState(null);
   const [visibleRoutes, setVisibleRoutes] = useState(new Set());
+  const [overlay, setOverlay] = useState(null);  // DOM node over the map for the drive simulation
+
+  // Drive simulation legs: Google's road path for each Held-Karp leg (or, where an accident
+  // is on, the path it was found on), timed by the measured traffic
+  const hkDirections = routeDirections.find(r => r.label === 'Held-Karp');
+  const driveLegs = useMemo(() => {
+    const hk = results?.optimal;
+    const actual = hk?.traffic?.actual_leg_times_s;
+    const dirLegs = hkDirections?.result.routes?.[0]?.legs;
+    if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
+    const stops = hk.ordered_locations;
+    return dirLegs.map((leg, k) => ({
+      path: activeLegs.find(l => l.leg_index === k)?.original.path
+        || leg.steps.flatMap(step => step.path.map(p => ({ lat: p.lat(), lng: p.lng() }))),
+      durationS: actual[k],
+      plannedS: hk.legs[k]?.time_s ?? actual[k],
+      to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
+      toLabel: k + 1 === stops.length ? 'Depot' : `Stop ${k + 1}`,
+    }));
+  }, [results, hkDirections, activeLegs]);
+  const driveAccidents = useMemo(
+    () => (replan ? replan.accidents.filter(a => activeAccidents.includes(a.id)) : []),
+    [replan, activeAccidents]);
+  const driveUnloadS = results?.optimal
+    ? (results.optimal.unload_time_s || 0) / Math.max(results.optimal.ordered_locations.length - 1, 1)
+    : 0;
 
   const fitToRoutes = useCallback((visibleSet, directions) => {
     if (!mapRef.current || !window.google) return;
@@ -290,6 +318,7 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
           Loading Google Maps...
         </div>
       ) : (
+        <div className="relative">
         <GoogleMap
           mapContainerStyle={MAP_CONTAINER_STYLE}
           center={center}
@@ -429,6 +458,20 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
             />
           ))}
 
+          {/* Drive simulation: the truck, reroutes it takes; clock and prompt go in the overlay */}
+          {drive && driveLegs && (
+            <DriveSimulation
+              key={drive.runId}
+              legs={driveLegs}
+              accidents={driveAccidents}
+              departureTime={results.optimal.traffic.departure_time}
+              unloadS={driveUnloadS}
+              speed={drive.speed}
+              overlay={overlay}
+              onEnd={onDriveEnd}
+            />
+          )}
+
           {/* Info window on click */}
           {selectedMarker !== null && (
             <InfoWindow
@@ -446,6 +489,8 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
             </InfoWindow>
           )}
         </GoogleMap>
+        <div ref={setOverlay} className="absolute inset-0 pointer-events-none" />
+        </div>
       )}
     </div>
   );

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, TriangleAlert, RotateCcw } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, TriangleAlert, RotateCcw, Play, Square } from 'lucide-react';
 import RouteMap from './RouteMap';
+import { SIM_SPEEDS } from './DriveSimulation';
 import FleetCharts from './FleetCharts';
 import BenchmarkPanel from './BenchmarkPanel';
 import BenchmarkSimulation from './BenchmarkSimulation';
@@ -68,6 +69,8 @@ function RouteOptimizer() {
   const [replanning, setReplanning] = useState(false);
   const [replanError, setReplanError] = useState(null);
   const [activeAccidents, setActiveAccidents] = useState([]);
+  // Drive simulation of the Held-Karp route on measured traffic: {runId, speed}, or null when off
+  const [drive, setDrive] = useState(null);
   const [chargingPlans, setChargingPlans] = useState(null);  // /api/plan_charging plans by vehicle_id
   const [planningCharging, setPlanningCharging] = useState(false);
   const [chargingError, setChargingError] = useState(null);
@@ -280,6 +283,7 @@ function RouteOptimizer() {
       setLastLocations(locationsToOptimize);
       setReplan(null);
       setReplanError(null);
+      setDrive(null);
       setChargingPlans(null);
       setChargingError(null);
     } catch (err) {
@@ -1082,9 +1086,36 @@ function RouteOptimizer() {
                       <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Incident Replanning</span>
                       <span className="text-[10px] text-slate-600">historical crash hotspots · delivery order fixed</span>
                       <div className="ml-auto flex gap-2">
+                        {/* Drive simulation: single route with traffic data (measured leg times) */}
+                        {!fleet && hk.traffic && (drive ? (
+                          <>
+                            <select
+                              value={drive.speed}
+                              onChange={(e) => setDrive({ ...drive, speed: Number(e.target.value) })}
+                              className="px-2 py-1.5 bg-slate-800 border border-slate-700 text-slate-300 rounded-lg text-xs"
+                              title="Simulation speed"
+                            >
+                              {SIM_SPEEDS.map(s => <option key={s} value={s}>{s}× speed</option>)}
+                            </select>
+                            <button
+                              onClick={() => setDrive(null)}
+                              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
+                            >
+                              <Square className="w-3 h-3" /> Stop Drive
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => setDrive({ runId: Date.now(), speed: SIM_SPEEDS[1] })}
+                            title="Drive the route on the measured traffic; you'll be asked to reroute at active accidents"
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg text-xs font-medium transition-colors"
+                          >
+                            <Play className="w-3 h-3" /> Simulate Drive
+                          </button>
+                        ))}
                         {replan && (
                           <button
-                            onClick={() => { setReplan(null); setActiveAccidents([]); }}
+                            onClick={() => { setReplan(null); setActiveAccidents([]); setDrive(null); }}
                             className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
                           >
                             <RotateCcw className="w-3 h-3" /> Reset
@@ -1131,6 +1162,8 @@ function RouteOptimizer() {
                                   type="checkbox"
                                   checked={activeAccidents.includes(a.id)}
                                   onChange={() => toggleAccident(a.id)}
+                                  disabled={drive !== null}
+                                  title={drive ? 'Stop the drive simulation to change accidents' : undefined}
                                   className="sr-only peer"
                                 />
                                 <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-500"></div>
@@ -1198,6 +1231,7 @@ function RouteOptimizer() {
                 activeAccidents={activeAccidents}
                 activeLegs={activeLegs}
                 chargingPlans={chargingPlans ? Object.values(chargingPlans) : []}
+                drive={drive}
               />
 
               {/* Charts */}

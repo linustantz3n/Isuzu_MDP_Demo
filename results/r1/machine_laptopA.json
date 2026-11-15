@@ -1,0 +1,12 @@
+{
+  "machine": "laptopA",
+  "recorded_at": "2026-11-08T16:41:29",
+  "hostname": "gregrory",
+  "os": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "cpu_model": "AMD Ryzen 7 PRO 8840U w/ Radeon 780M Graphics",
+  "cpu_logical_cores": 16,
+  "ram_gb": 16.1,
+  "python": "3.12.7",
+  "ortools": "9.15.6755",
+  "commit": "017cfe3a22ad0b1467c45f04dab028b35fdc1925"
+}

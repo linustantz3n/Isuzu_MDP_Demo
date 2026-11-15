@@ -1,0 +1,5 @@
+k,instances,or_feasible,max_solve_s,mean_I_naive_pct,min_I_naive_pct,mean_I_fixed_pct,min_I_fixed_pct,mean_I_heuristic_pct,min_I_heuristic_pct,or_wins_vs_heuristic,ties_vs_heuristic
+2,12,12,27.71,38.5613,22.2809,37.8469,26.1347,0.896,0.0,7,5
+3,12,12,30.0,30.3643,21.0856,21.6992,14.1412,2.7834,0.0,11,1
+4,12,12,30.0,42.5151,30.4959,32.7654,16.4341,0.6369,0.0,8,4
+5,12,12,27.84,34.2147,21.2178,16.252,7.5862,2.1079,0.1093,12,0

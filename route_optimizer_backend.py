@@ -187,8 +187,15 @@ def get_directions(locations: list, order: list) -> dict:
 
 
 def _routes_waypoint(loc: dict) -> dict:
-    """Build a Routes API waypoint from a dict with 'lat' and 'lng' keys."""
-    return {"location": {"latLng": {"latitude": loc['lat'], "longitude": loc['lng']}}}
+    """
+    Build a Routes API waypoint from a dict with 'lat' and 'lng' keys, and an
+    optional 'heading' (degrees clockwise from north) for a vehicle already on
+    the road, so the route starts in its direction of travel.
+    """
+    location = {"latLng": {"latitude": loc['lat'], "longitude": loc['lng']}}
+    if loc.get('heading') is not None:
+        location["heading"] = round(loc['heading']) % 360
+    return {"location": location}
 
 
 # =============================================================================
@@ -514,6 +521,47 @@ def replan_route_around_hotspots(legs: list, count: int) -> dict:
             scenarios[",".join(str(a['id']) for a in active)] = replanned
 
     return {"accidents": accidents, "scenarios": scenarios}
+
+
+def reroute_from_position(position: dict, destination: dict, accident_points: list) -> dict:
+    """
+    Reroute a vehicle that is already driving a leg around accidents ahead of
+    it, from where it is now to the end of the leg (the drive simulation's
+    mid-leg reroute). Same method as replan_route_around_hotspots: Google's
+    alternatives first, else a forced detour.
+
+    Args:
+        position: Where the vehicle is ({lat, lng, heading}); the heading keeps
+                  the new route from starting with a U-turn
+        destination: End of the leg ({lat, lng})
+        accident_points: Accidents ahead ([{lat, lng}, ...])
+
+    Returns:
+        Dict with 'original' (Google's default route from the position),
+        'rerouted' (route avoiding the accidents; the original if it already
+        does, None if nothing does) and 'method' ('clear', 'alternative',
+        'detour' or None)
+    """
+    routes = compute_leg_routes(position, destination, alternatives=True)
+    if not routes:
+        raise Exception("No route found from the vehicle's position")
+
+    # Direction of travel at each accident, along the default route, for the detour
+    dense = _densify_path(routes[0]['path'])
+    accidents = []
+    for point in accident_points:
+        location = {"lat": point['lat'], "lng": point['lng']}
+        idx = min(range(len(dense)), key=lambda i: _distance_m(dense[i][0], location))
+        dx, dy = _to_local_m(dense[min(idx + 1, len(dense) - 1)][0], dense[max(idx - 1, 0)][0])
+        norm = math.hypot(dx, dy) or 1.0
+        accidents.append({"location": location, "direction": (dx / norm, dy / norm)})
+
+    if not any(_blocks(a, routes[0]['path']) for a in accidents):
+        return {"original": routes[0], "rerouted": routes[0], "method": "clear"}
+    found = reroute_leg_around_accidents(position, destination, routes, accidents)
+    if found is None:
+        return {"original": routes[0], "rerouted": None, "method": None}
+    return {"original": routes[0], "rerouted": found[0], "method": found[1]}
 
 
 # =============================================================================
@@ -1498,6 +1546,38 @@ def replan_incidents():
             "accidents": accidents,
             "scenarios": replan['scenarios'],
         })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/reroute_from', methods=['POST'])
+def reroute_from():
+    """
+    Drive simulation: the vehicle is approaching an accident partway through a
+    leg; reroute it from its current position to the end of the leg.
+
+    Request body:
+    {
+        "position": {"lat": .., "lng": .., "heading": 90},  // heading optional
+        "destination": {"lat": .., "lng": ..},              // end of the leg
+        "accidents": [{"lat": .., "lng": ..}]               // accidents ahead on the leg
+    }
+
+    Returns:
+        method: 'clear' (the default route already avoids them), 'alternative' or 'detour'
+        original, rerouted: {distance_m, time_s, path} from the position
+    """
+    data = request.json or {}
+    position, destination = data.get('position'), data.get('destination')
+    accident_points = data.get('accidents') or []
+    if not position or not destination or not accident_points:
+        return jsonify({"status": "error", "message": "Need position, destination and accidents"}), 400
+
+    try:
+        result = reroute_from_position(position, destination, accident_points)
+        if result['rerouted'] is None:
+            raise Exception("No route around the accident from here")
+        return jsonify({"status": "ok", **result})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 

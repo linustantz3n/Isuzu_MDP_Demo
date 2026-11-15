@@ -136,5 +136,46 @@ class FleetReplanningTest(unittest.TestCase):
                     self.assertEqual(accidents[accident_id]['leg_index'], leg['leg_index'], key)
 
 
+def run_reroute_from(position, destination, accidents):
+    with mock.patch.object(backend, 'compute_leg_routes', fake_compute_leg_routes):
+        response = backend.app.test_client().post(
+            '/api/reroute_from',
+            json={"position": position, "destination": destination, "accidents": accidents})
+    return response.status_code, response.get_json()
+
+
+class RerouteFromPositionTest(unittest.TestCase):
+    """Drive simulation: rerouting mid-leg from the truck's position (/api/reroute_from)."""
+
+    # Partway up A -> B, heading north, with an accident further up the road
+    POSITION = {"lat": 33.83, "lng": -117.80, "heading": 0}
+    ACCIDENT = {"lat": 33.875, "lng": -117.80}
+
+    def test_reroute_starts_at_position_and_avoids_accident(self):
+        status, result = run_reroute_from(self.POSITION, B, [self.ACCIDENT])
+        self.assertEqual(status, 200, result)
+        self.assertIn(result['method'], ('alternative', 'detour'))
+        path = result['rerouted']['path']
+        self.assertAlmostEqual(path[0]['lat'], self.POSITION['lat'])
+        self.assertAlmostEqual(path[-1]['lat'], B['lat'])
+        self.assertGreater(backend._distance_to_path_m(self.ACCIDENT, path),
+                           backend.ACCIDENT_AVOID_RADIUS_M)
+        self.assertGreater(result['rerouted']['distance_m'], result['original']['distance_m'])
+
+    def test_accident_off_the_route_needs_no_reroute(self):
+        status, result = run_reroute_from(self.POSITION, B, [{"lat": 33.875, "lng": -117.70}])
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['method'], 'clear')
+        self.assertEqual(result['rerouted'], result['original'])
+
+    def test_heading_is_sent_to_routes_api(self):
+        self.assertEqual(backend._routes_waypoint({"lat": 1, "lng": 2, "heading": 370.4})['location']['heading'], 10)
+        self.assertNotIn('heading', backend._routes_waypoint({"lat": 1, "lng": 2})['location'])
+
+    def test_missing_fields_rejected(self):
+        status, result = run_reroute_from(self.POSITION, B, [])
+        self.assertEqual(status, 400)
+
+
 if __name__ == '__main__':
     unittest.main()
