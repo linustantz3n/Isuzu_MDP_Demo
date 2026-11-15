@@ -12,11 +12,17 @@ API will be available at http://localhost:5000
 """
 
 import os
+import csv
+import gzip
 import re
 import json
 import math
 import time
 import requests
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations, permutations
+from functools import lru_cache
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -25,10 +31,23 @@ from solvers import (
     solve_tsp_held_karp,
     solve_tsp_nearest_neighbor,
     solve_tsp_2opt,
-    solve_vrp_ortools,
     solve_vrp_constrained,
+    BatteryLimitError,
 )
-from benchmark import ALGORITHMS as BENCHMARK_ALGORITHMS, list_scenarios, run_benchmark
+from energy import (
+    calculate_energy_consumption,
+    estimate_average_speed,
+    energy_matrix_kwh,
+    battery_limit_wh,
+    energy_upper_bound_matrix_wh,
+    finite,
+    DEFAULT_BATTERY_RESERVE_PCT,
+    LBS_PER_TONNE,
+)
+from benchmark import ALGORITHMS as BENCHMARK_ALGORITHMS, list_scenarios, run_benchmark, simulate
+from benchmark.runner import fixed_plan_view
+
+import traffic_data
 
 # Load environment variables from .env file
 load_dotenv()
@@ -56,7 +75,8 @@ def geocode_address(address: str) -> dict:
     data = response.json()
     
     if data["status"] != "OK":
-        raise Exception(f"Geocoding failed for '{address}': {data['status']}")
+        detail = f" ({data['error_message']})" if data.get("error_message") else ""
+        raise Exception(f"Geocoding failed for '{address}': {data['status']}{detail}")
     
     result = data["results"][0]
     location = result["geometry"]["location"]
@@ -73,61 +93,71 @@ def get_distance_matrix(locations: list, departure_ts: int = None) -> dict:
     """
     Get distance and time matrices between all locations.
 
-    Batches requests in 10x10 chunks to stay within the Google Distance Matrix
-    API limit of 100 elements per request (25 origins, 25 destinations).
+    Uses the Routes API computeRouteMatrix endpoint (the legacy Distance Matrix
+    API cannot be enabled on new projects). Batches requests in 25x25 chunks to
+    stay within the limit of 625 elements per request.
 
     Args:
         locations: List of dicts with 'lat' and 'lng' keys
         departure_ts: Unix time the trucks leave. With it, times are Google's
-            traffic prediction for that moment (duration_in_traffic); without
+            traffic prediction for that moment (TRAFFIC_AWARE routing); without
             it, Google's typical times, with no live traffic.
 
     Returns:
         Dict with 'distance' and 'time' matrices (values in meters and seconds)
     """
     n = len(locations)
-    coords = [f"{loc['lat']},{loc['lng']}" for loc in locations]
+    waypoints = [_routes_waypoint(loc) for loc in locations]
 
     distance_matrix = [[0] * n for _ in range(n)]
     time_matrix = [[0] * n for _ in range(n)]
 
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    chunk_size = 10  # 10x10 = 100 elements, exactly at the API limit
+    url = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "originIndex,destinationIndex,status,condition,distanceMeters,duration",
+    }
+    chunk_size = 25  # 25x25 = 625 elements, exactly at the API limit
 
     for i_start in range(0, n, chunk_size):
         i_end = min(i_start + chunk_size, n)
-        origin_coords = coords[i_start:i_end]
 
         for j_start in range(0, n, chunk_size):
             j_end = min(j_start + chunk_size, n)
-            dest_coords = coords[j_start:j_end]
 
-            params = {
-                "origins": "|".join(origin_coords),
-                "destinations": "|".join(dest_coords),
-                "key": GOOGLE_API_KEY,
-                "units": "imperial"
+            body = {
+                "origins": [{"waypoint": w} for w in waypoints[i_start:i_end]],
+                "destinations": [{"waypoint": w} for w in waypoints[j_start:j_end]],
+                "travelMode": "DRIVE",
             }
             if departure_ts is not None:
-                params["departure_time"] = int(departure_ts)
-                params["traffic_model"] = "best_guess"
+                # Traffic-aware durations for that moment. Routes API rejects a
+                # departure in the past, so "now" (already a few ms old) is left
+                # out, which the API reads as now.
+                body["routingPreference"] = "TRAFFIC_AWARE"
+                if departure_ts > time.time() + 60:
+                    body["departureTime"] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(departure_ts))
 
-            response = requests.get(url, params=params)
+            response = requests.post(url, json=body, headers=headers)
             data = response.json()
+            # Errors come back as {"error": ...}, sometimes wrapped in a list
+            error = data.get("error") if isinstance(data, dict) else (
+                data[0].get("error") if data and "error" in data[0] else None)
+            if response.status_code != 200 or error:
+                message = (error or {}).get("message", response.text)
+                raise Exception(f"Routes API (route matrix) error: {message}")
 
-            if data["status"] != "OK":
-                raise Exception(f"Distance Matrix API error: {data['status']}")
-
-            for ri, row in enumerate(data["rows"]):
-                for rj, element in enumerate(row["elements"]):
-                    gi = i_start + ri
-                    gj = j_start + rj
-                    if element["status"] == "OK":
-                        distance_matrix[gi][gj] = element["distance"]["value"]
-                        time_matrix[gi][gj] = (element.get("duration_in_traffic") or element["duration"])["value"]
-                    else:
-                        distance_matrix[gi][gj] = float('inf')
-                        time_matrix[gi][gj] = float('inf')
+            for element in data:
+                # Zero-valued fields (index 0, 0 meters) are omitted from the JSON
+                gi = i_start + element.get("originIndex", 0)
+                gj = j_start + element.get("destinationIndex", 0)
+                if element.get("condition") == "ROUTE_EXISTS":
+                    distance_matrix[gi][gj] = element.get("distanceMeters", 0)
+                    time_matrix[gi][gj] = round(float(element.get("duration", "0s").rstrip("s")))
+                else:
+                    distance_matrix[gi][gj] = float('inf')
+                    time_matrix[gi][gj] = float('inf')
 
     return {
         "distance": distance_matrix,
@@ -158,29 +188,679 @@ def get_directions(locations: list, order: list) -> dict:
         order: Optimized order indices
     
     Returns:
-        Directions API response with route details
+        Routes API computeRoutes response with route details
     """
     ordered_locs = [locations[i] for i in order]
-    
-    origin = f"{ordered_locs[0]['lat']},{ordered_locs[0]['lng']}"
-    destination = f"{ordered_locs[-1]['lat']},{ordered_locs[-1]['lng']}"
-    
-    waypoints = []
-    for loc in ordered_locs[1:-1]:
-        waypoints.append(f"{loc['lat']},{loc['lng']}")
-    
-    url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": origin,
-        "destination": destination,
-        "key": GOOGLE_API_KEY
+
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,"
+                            "routes.polyline.encodedPolyline,routes.legs",
     }
-    
-    if waypoints:
-        params["waypoints"] = "|".join(waypoints)
-    
-    response = requests.get(url, params=params)
-    return response.json()
+    body = {
+        "origin": _routes_waypoint(ordered_locs[0]),
+        "destination": _routes_waypoint(ordered_locs[-1]),
+        "intermediates": [_routes_waypoint(loc) for loc in ordered_locs[1:-1]],
+        "travelMode": "DRIVE",
+    }
+
+    response = requests.post(url, json=body, headers=headers)
+    data = response.json()
+    if response.status_code != 200:
+        message = data.get("error", {}).get("message", response.text)
+        raise Exception(f"Routes API (directions) error: {message}")
+    return data
+
+
+def _routes_waypoint(loc: dict) -> dict:
+    """
+    Build a Routes API waypoint from a dict with 'lat' and 'lng' keys, and an
+    optional 'heading' (degrees clockwise from north) for a vehicle already on
+    the road, so the route starts in its direction of travel.
+    """
+    location = {"latLng": {"latitude": loc['lat'], "longitude": loc['lng']}}
+    if loc.get('heading') is not None:
+        location["heading"] = round(loc['heading']) % 360
+    return {"location": location}
+
+
+# =============================================================================
+# Incident Replanning (demo: accidents at historical crash hotspots)
+# =============================================================================
+
+ACCIDENT_AVOID_RADIUS_M = 500    # a route is blocked if it passes this close to an accident
+DETOUR_OFFSETS_M = [1500, 3000]  # how far a forced detour swings out around an accident
+
+# Historical crashes: NHTSA FARS fatal crashes, built by scripts/build_crash_history.py
+CRASH_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'crash_history.csv.gz')
+CRASH_GRID_DEG = 0.01              # spatial index cell size (~1.1 km north-south)
+HOTSPOT_MATCH_RADIUS_M = 150       # a crash belongs to a route if it is this close to it
+HOTSPOT_WINDOW_M = 1000            # crashes within this stretch of road form one hotspot
+HOTSPOT_MIN_SEPARATION_M = 3000    # chosen hotspots are at least this far apart
+HOTSPOT_STOP_CLEARANCE_M = 1000    # no hotspots this close to a stop (no way around them)
+MAX_HOTSPOT_REJECTIONS = 6         # hotspots without a detour skipped before giving up
+
+_crash_grid = None
+
+
+def _grid_cell(lat: float, lng: float) -> tuple:
+    return (math.floor(lat / CRASH_GRID_DEG), math.floor(lng / CRASH_GRID_DEG))
+
+
+def load_crash_grid() -> dict:
+    """Load historical crashes once, as {grid cell: [(lat, lng, year, fatals, road), ...]}."""
+    global _crash_grid
+    if _crash_grid is None:
+        grid = {}
+        with gzip.open(CRASH_DATA_PATH, 'rt', newline='') as f:
+            for row in csv.DictReader(f):
+                lat, lng = float(row['lat']), float(row['lng'])
+                grid.setdefault(_grid_cell(lat, lng), []).append(
+                    (lat, lng, int(row['year']), int(row['fatals']), row['road']))
+        _crash_grid = grid
+    return _crash_grid
+
+
+def compute_leg_routes(origin: dict, destination: dict, vias: list = None,
+                       alternatives: bool = False) -> list:
+    """
+    Get driving routes for one leg via the Routes API computeRoutes endpoint.
+
+    Args:
+        origin, destination: Dicts with 'lat' and 'lng' keys
+        vias: Optional pass-through points (no stops) used to force a detour
+        alternatives: Also return Google's alternative routes (ignored with vias)
+
+    Returns:
+        List of dicts with 'distance_m', 'time_s' and 'path' ([{lat, lng}, ...]),
+        Google's default route first
+    """
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline",
+    }
+    body = {
+        "origin": _routes_waypoint(origin),
+        "destination": _routes_waypoint(destination),
+        "travelMode": "DRIVE",
+    }
+    if vias:
+        body["intermediates"] = [{**_routes_waypoint(v), "via": True} for v in vias]
+    elif alternatives:
+        body["computeAlternativeRoutes"] = True
+
+    response = requests.post(url, json=body, headers=headers)
+    data = response.json()
+    if response.status_code != 200:
+        message = data.get("error", {}).get("message", response.text)
+        raise Exception(f"Routes API (leg routes) error: {message}")
+
+    return [
+        {
+            "distance_m": r.get("distanceMeters", 0),
+            "time_s": round(float(r.get("duration", "0s").rstrip("s"))),
+            "path": _decode_polyline(r["polyline"]["encodedPolyline"]),
+        }
+        for r in data.get("routes", [])
+    ]
+
+
+def find_path_hotspots(path: list) -> list:
+    """
+    Find stretches of a path with the most historical crashes.
+
+    Each crash within HOTSPOT_MATCH_RADIUS_M of the path is placed at its
+    distance along the path. Every HOTSPOT_WINDOW_M stretch starting at a crash
+    is a candidate hotspot, scored by its crash count. The accident marker goes
+    on the path at the stretch's median crash.
+
+    Returns:
+        Candidate hotspots as dicts with 'location' ({lat, lng}),
+        'direction' ((ux, uy), unit direction of travel there) and 'crashes'
+    """
+    grid = load_crash_grid()
+    dense = _densify_path(path)
+
+    # Index the dense path points by grid cell, then match crashes in nearby cells
+    points_by_cell = {}
+    for idx, (point, _) in enumerate(dense):
+        points_by_cell.setdefault(_grid_cell(point['lat'], point['lng']), []).append(idx)
+
+    def neighbours(cell):
+        return [(cell[0] + dr, cell[1] + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+
+    near_cells = {c for cell in points_by_cell for c in neighbours(cell)}
+    matches = []  # (distance along path, dense point index, crash)
+    for cell in near_cells:
+        for crash in grid.get(cell, []):
+            crash_point = {"lat": crash[0], "lng": crash[1]}
+            best_idx, best_m = None, HOTSPOT_MATCH_RADIUS_M
+            for c in neighbours(cell):
+                for idx in points_by_cell.get(c, []):
+                    d = _distance_m(dense[idx][0], crash_point)
+                    if d <= best_m:
+                        best_idx, best_m = idx, d
+            if best_idx is not None:
+                matches.append((dense[best_idx][1], best_idx, crash))
+    matches.sort(key=lambda m: m[0])
+    along = [m[0] for m in matches]
+
+    candidates = []
+    for i, s_start in enumerate(along):
+        window = matches[i:bisect_right(along, s_start + HOTSPOT_WINDOW_M)]
+        _, idx, _ = window[len(window) // 2]
+        before = dense[max(idx - 1, 0)][0]
+        after = dense[min(idx + 1, len(dense) - 1)][0]
+        dx, dy = _to_local_m(after, before)
+        norm = math.hypot(dx, dy) or 1.0
+        candidates.append({
+            "location": dense[idx][0],
+            "direction": (dx / norm, dy / norm),
+            "crashes": [m[2] for m in window],
+        })
+    return candidates
+
+
+def pick_accident_hotspots(leg_paths: list, stops: list, count: int,
+                           is_avoidable=lambda chosen: True, leg_vehicles: list = None) -> list:
+    """
+    Pick the `count` worst historical crash hotspots along a route.
+
+    Spreads the accidents over different vehicles (if leg_vehicles gives each
+    leg's vehicle) and then different legs first, and keeps chosen hotspots
+    at least HOTSPOT_MIN_SEPARATION_M apart so one stretch of road (e.g. shared
+    by the outbound and return legs) is not picked twice. Hotspots next to a
+    stop are skipped, as are those for which is_avoidable(chosen + [hotspot])
+    returns False.
+    """
+    candidates = [
+        {**hotspot, "leg_index": leg_index}
+        for leg_index, path in enumerate(leg_paths)
+        for hotspot in find_path_hotspots(path)
+        if all(_distance_m(hotspot['location'], stop) >= HOTSPOT_STOP_CLEARANCE_M
+               for stop in stops)
+    ]
+    # Most crashes first; total fatalities breaks ties
+    candidates.sort(key=lambda h: (len(h['crashes']), sum(c[3] for c in h['crashes'])),
+                    reverse=True)
+
+    # Passes from most to least spread out: at most one hotspot per vehicle, per leg, then any
+    spread_keys = [lambda h: h['leg_index'], None]
+    if leg_vehicles:
+        spread_keys.insert(0, lambda h: leg_vehicles[h['leg_index']])
+
+    chosen, rejected = [], []
+    for spread_key in spread_keys:
+        for hotspot in candidates:
+            if len(chosen) == count or len(rejected) > MAX_HOTSPOT_REJECTIONS:
+                return chosen
+            if hotspot in rejected:
+                continue
+            if spread_key and any(spread_key(c) == spread_key(hotspot) for c in chosen):
+                continue
+            if any(_distance_m(hotspot['location'], c['location']) < HOTSPOT_MIN_SEPARATION_M
+                   for c in chosen):
+                continue
+            if not is_avoidable(chosen + [hotspot]):
+                rejected.append(hotspot)
+                continue
+            chosen.append(hotspot)
+    return chosen
+
+
+def _blocks(accident: dict, path: list) -> bool:
+    return _distance_to_path_m(accident['location'], path) <= ACCIDENT_AVOID_RADIUS_M
+
+
+def reroute_leg_around_accidents(origin: dict, destination: dict,
+                                 routes: list, accidents: list):
+    """
+    Find the fastest route for a leg that avoids every given accident.
+
+    Google's alternative routes are tried first. If all of them are blocked, a
+    bypass is forced around each accident on the default route through two
+    pass-through points: one diagonally behind it and one diagonally ahead of
+    it, on the same side of the road.
+
+    Args:
+        routes: The leg's routes from compute_leg_routes, default first
+        accidents: Hotspots (see find_path_hotspots) to avoid
+
+    Returns:
+        (rerouted route, method) where method is 'alternative' or 'detour',
+        or None if no route avoids the accidents
+    """
+    def avoids_accidents(route):
+        return not any(_blocks(a, route['path']) for a in accidents)
+
+    candidates = [r for r in routes[1:] if avoids_accidents(r)]
+    if candidates:
+        return min(candidates, key=lambda r: r['time_s']), "alternative"
+
+    blocking = [a for a in accidents if _blocks(a, routes[0]['path'])]
+    for offset in DETOUR_OFFSETS_M:
+        for side in (1, -1):
+            vias = []
+            for accident in blocking:
+                ux, uy = accident['direction']
+                for forward in (-1, 1):
+                    vias.append(_offset_point(accident['location'],
+                                              (ux * forward - uy * side) * offset,
+                                              (uy * forward + ux * side) * offset))
+            # Visit the pass-through points in the order the leg reaches them
+            vias.sort(key=lambda v: _distance_m(v, origin))
+            candidates += [r for r in compute_leg_routes(origin, destination, vias=vias)
+                           if avoids_accidents(r)]
+        if candidates:
+            return min(candidates, key=lambda r: r['time_s']), "detour"
+    return None
+
+
+def replan_route_around_hotspots(legs: list, count: int) -> dict:
+    """
+    Place accidents at the route's worst historical crash hotspots and reroute
+    around them, for every combination of accidents that could be active. The
+    delivery order stays fixed.
+
+    Each accident only affects the leg it was found on (stop i -> stop i+1):
+    that leg is rerouted around it, even if other legs use the same road.
+
+    Hotspots that leave their leg without a detour are skipped in favour of the
+    next worst, so every returned accident can be driven around.
+
+    Args:
+        legs: Dicts with 'from' and 'to' locations, in route order. Fleet routes
+              are passed as all vehicles' legs together, each with 'vehicle_id'.
+        count: Number of accidents to place
+
+    Returns:
+        Dict with 'accidents' (hotspots with 'id' and 'leg_index') and
+        'scenarios', mapping each non-empty set of active accident ids (sorted,
+        comma-joined, e.g. "1,3") to its rerouted legs, each with 'leg_index',
+        'accident_ids', 'original', 'rerouted' and 'method'
+    """
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        leg_routes = list(pool.map(
+            lambda leg: compute_leg_routes(leg['from'], leg['to'], alternatives=True), legs))
+    if not all(leg_routes):
+        raise Exception("No route found for one of the legs")
+
+    def reroute(leg_index, accidents_on_leg):
+        leg = legs[leg_index]
+        return reroute_leg_around_accidents(leg['from'], leg['to'], leg_routes[leg_index],
+                                            accidents_on_leg)
+
+    reroutes = {}  # leg index -> (rerouted route, method) avoiding all its chosen accidents
+
+    def is_avoidable(chosen):
+        """Reroute the newest hotspot's leg around its accidents; False if it can't be."""
+        leg_index = chosen[-1]['leg_index']
+        rerouted = reroute(leg_index, [a for a in chosen if a['leg_index'] == leg_index])
+        if rerouted is None:
+            return False
+        reroutes[leg_index] = rerouted
+        return True
+
+    stops = [leg['from'] for leg in legs] + [leg['to'] for leg in legs]
+    leg_vehicles = [leg.get('vehicle_id') for leg in legs]
+    accidents = pick_accident_hotspots([routes[0]['path'] for routes in leg_routes],
+                                       stops, count, is_avoidable,
+                                       leg_vehicles if len(set(leg_vehicles)) > 1 else None)
+    for i, accident in enumerate(accidents):
+        accident['id'] = i + 1
+
+    # Reroute each leg for every combination of its own accidents. reroutes already
+    # avoids all of them, so it covers the full set and is the fallback for a subset.
+    def reroute_subset(job):
+        leg_index, subset = job
+        on_leg = [a for a in accidents if a['leg_index'] == leg_index]
+        if len(subset) == len(on_leg):
+            return reroutes[leg_index]
+        return reroute(leg_index, list(subset)) or reroutes[leg_index]
+
+    jobs = [(leg_index, subset)
+            for leg_index in sorted({a['leg_index'] for a in accidents})
+            for size in range(1, len(accidents) + 1)
+            for subset in combinations([a for a in accidents if a['leg_index'] == leg_index], size)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        leg_reroutes = dict(zip(((i, tuple(a['id'] for a in s)) for i, s in jobs),
+                                pool.map(reroute_subset, jobs)))
+
+    scenarios = {}
+    for size in range(1, len(accidents) + 1):
+        for active in combinations(accidents, size):
+            replanned = []
+            for leg_index in sorted({a['leg_index'] for a in active}):
+                accident_ids = tuple(a['id'] for a in active if a['leg_index'] == leg_index)
+                rerouted, method = leg_reroutes[(leg_index, accident_ids)]
+                replanned.append({
+                    "leg_index": leg_index,
+                    "vehicle_id": legs[leg_index].get('vehicle_id'),
+                    "accident_ids": list(accident_ids),
+                    "original": leg_routes[leg_index][0],
+                    "rerouted": rerouted,
+                    "method": method,
+                })
+            scenarios[",".join(str(a['id']) for a in active)] = replanned
+
+    return {"accidents": accidents, "scenarios": scenarios}
+
+
+def reroute_from_position(position: dict, destination: dict, accident_points: list) -> dict:
+    """
+    Reroute a vehicle that is already driving a leg around accidents ahead of
+    it, from where it is now to the end of the leg (the drive simulation's
+    mid-leg reroute). Same method as replan_route_around_hotspots: Google's
+    alternatives first, else a forced detour.
+
+    Args:
+        position: Where the vehicle is ({lat, lng, heading}); the heading keeps
+                  the new route from starting with a U-turn
+        destination: End of the leg ({lat, lng})
+        accident_points: Accidents ahead ([{lat, lng}, ...])
+
+    Returns:
+        Dict with 'original' (Google's default route from the position),
+        'rerouted' (route avoiding the accidents; the original if it already
+        does, None if nothing does) and 'method' ('clear', 'alternative',
+        'detour' or None)
+    """
+    routes = compute_leg_routes(position, destination, alternatives=True)
+    if not routes:
+        raise Exception("No route found from the vehicle's position")
+
+    # Direction of travel at each accident, along the default route, for the detour
+    dense = _densify_path(routes[0]['path'])
+    accidents = []
+    for point in accident_points:
+        location = {"lat": point['lat'], "lng": point['lng']}
+        idx = min(range(len(dense)), key=lambda i: _distance_m(dense[i][0], location))
+        dx, dy = _to_local_m(dense[min(idx + 1, len(dense) - 1)][0], dense[max(idx - 1, 0)][0])
+        norm = math.hypot(dx, dy) or 1.0
+        accidents.append({"location": location, "direction": (dx / norm, dy / norm)})
+
+    if not any(_blocks(a, routes[0]['path']) for a in accidents):
+        return {"original": routes[0], "rerouted": routes[0], "method": "clear"}
+    found = reroute_leg_around_accidents(position, destination, routes, accidents)
+    if found is None:
+        return {"original": routes[0], "rerouted": None, "method": None}
+    return {"original": routes[0], "rerouted": found[0], "method": found[1]}
+
+
+# =============================================================================
+# Charging Stops (keep a state-of-charge reserve all the way back to the depot)
+# =============================================================================
+
+VEHICLE_MAX_CHARGE_KW = 50      # assumed max DC charging power of the truck (check Isuzu spec)
+FAST_CHARGER_MIN_KW = 50        # chargers searched first: DC fast with a CCS1 connector
+FAST_CHARGER_CONNECTOR = "EV_CONNECTOR_TYPE_CCS_COMBO_1"
+LEVEL2_CHARGER_KW = 7.2         # charging power assumed when a station doesn't report one
+
+
+def search_chargers_along_path(path: list, fast_only: bool = True) -> list:
+    """
+    Find EV charging stations along a path via Places API (New) Text Search
+    with searchAlongRouteParameters.
+
+    Args:
+        path: [{lat, lng}, ...], e.g. one leg's route
+        fast_only: Only DC fast chargers (FAST_CHARGER_MIN_KW+, CCS1)
+
+    Returns:
+        List of dicts with 'name', 'address', 'lat', 'lng', 'max_kw' (None if
+        unknown), and 'to_charger' / 'from_charger' ({distance_m, time_s}:
+        path start -> charger and charger -> path end)
+    """
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,"
+                            "places.evChargeOptions,routingSummaries",
+    }
+    body = {
+        "textQuery": "EV charging station",
+        "includedType": "electric_vehicle_charging_station",
+        "strictTypeFiltering": True,
+        "searchAlongRouteParameters": {"polyline": {"encodedPolyline": _encode_polyline(path)}},
+        "routingParameters": {"origin": {"latitude": path[0]['lat'], "longitude": path[0]['lng']}},
+        "pageSize": 20,
+    }
+    if fast_only:
+        body["evOptions"] = {"minimumChargingRateKw": FAST_CHARGER_MIN_KW,
+                             "connectorTypes": [FAST_CHARGER_CONNECTOR]}
+
+    response = requests.post(url, json=body, headers=headers)
+    data = response.json()
+    if response.status_code != 200:
+        message = data.get("error", {}).get("message", response.text)
+        raise Exception(f"Places API (charger search) error: {message}")
+
+    def trip(leg):
+        return {"distance_m": leg.get("distanceMeters", 0),
+                "time_s": round(float(leg.get("duration", "0s").rstrip("s")))}
+
+    chargers = []
+    for place, summary in zip(data.get("places", []), data.get("routingSummaries", [])):
+        legs = summary.get("legs", [])
+        if len(legs) != 2:
+            continue
+        rates = [c.get("maxChargeRateKw", 0)
+                 for c in place.get("evChargeOptions", {}).get("connectorAggregation", [])]
+        chargers.append({
+            "name": place.get("displayName", {}).get("text", "EV charging station"),
+            "address": place.get("formattedAddress"),
+            "lat": place["location"]["latitude"],
+            "lng": place["location"]["longitude"],
+            "max_kw": max(rates) if rates and max(rates) > 0 else None,
+            "to_charger": trip(legs[0]),
+            "from_charger": trip(legs[1]),
+        })
+    return chargers
+
+
+def route_energy_kwh(route: dict, leg: dict, energy_params: dict,
+                     altitude_diff_m: float = None, altitude_m: float = None) -> float:
+    """
+    Energy for driving a route ({distance_m, time_s}) in place of (part of) a
+    planned leg, with the leg's vehicle weight. Same model as /api/optimize;
+    elevation defaults to the leg's.
+    """
+    return calculate_energy_consumption(
+        distance_km=route['distance_m'] / 1000,
+        avg_speed_kmh=estimate_average_speed(route['distance_m'], route['time_s']),
+        temperature_c=energy_params.get('temperature_c', 20.0),
+        vehicle_weight_tonnes=leg.get('vehicle_weight_tonnes', 13000 / 2204.62),
+        altitude_diff_m=leg.get('elevation_gain_m', 0.0) if altitude_diff_m is None else altitude_diff_m,
+        altitude_m=leg.get('elevation_from_m', 0.0) if altitude_m is None else altitude_m,
+        has_climate_control=energy_params.get('has_climate_control', True),
+        driving_style=energy_params.get('driving_style', 'normal'),
+    )['energy_kwh']
+
+
+def plan_charging_stop(legs: list, battery_kwh: float, energy_params: dict,
+                       reserve_pct: float = DEFAULT_BATTERY_RESERVE_PCT) -> dict:
+    """
+    Plan one charging stop so a vehicle never drops below the SoC reserve
+    (reserve_pct of its battery) and is back at the depot with at least that much.
+
+    The vehicle starts full, and each leg's energy (leg['energy_kwh']) is
+    spread evenly over its distance. Chargers are searched along every leg up
+    to the point where the battery would hit the reserve. Each charger is
+    inserted into its leg (leg start -> charger -> leg end); it qualifies if
+    the vehicle reaches it above the reserve and one charge covers the rest of
+    the route plus the reserve. The vehicle charges just that much, and the
+    charger adding the least time (detour + charging) is chosen.
+
+    Args:
+        legs: The vehicle's legs in route order, as in /api/optimize fleet routes
+        battery_kwh: Battery capacity
+
+    Returns:
+        Dict with 'needed', 'reserve_pct', 'reserve_kwh' and 'final_soc_kwh' (without a stop).
+        If a stop is needed, also 'reserve_point' ({lat, lng, leg_index}: where
+        the battery would hit the reserve), 'stop' (the chosen stop, or None if
+        no charger works) and 'alternatives' (other qualifying chargers)
+    """
+    reserve_kwh = battery_kwh * reserve_pct / 100
+    energies = [leg['energy_kwh'] for leg in legs]
+    used_before = [sum(energies[:i]) for i in range(len(legs))]
+    plan = {"reserve_pct": reserve_pct, "reserve_kwh": reserve_kwh, "final_soc_kwh": battery_kwh - sum(energies)}
+    if plan['final_soc_kwh'] >= reserve_kwh:
+        return {**plan, "needed": False}
+
+    # Leg where the battery would hit the reserve, and how far into it
+    usable_kwh = battery_kwh - reserve_kwh
+    k = next(i for i in range(len(legs)) if used_before[i] + energies[i] > usable_kwh)
+    fraction = (usable_kwh - used_before[k]) / energies[k]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        routes = list(pool.map(lambda leg: compute_leg_routes(leg['from'], leg['to'])[0],
+                               legs[:k + 1]))
+    dense = _densify_path(routes[k]['path'])
+    reserve_point = min(dense, key=lambda d: abs(d[1] - fraction * dense[-1][1]))[0]
+    plan.update(needed=True, reserve_point={**reserve_point, "leg_index": k})
+
+    def search(fast_only):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            found = list(pool.map(lambda r: search_chargers_along_path(r['path'], fast_only), routes))
+        return [{**c, "leg_index": i} for i, chargers in enumerate(found) for c in chargers]
+
+    candidates = search(fast_only=True) or search(fast_only=False)
+    if not candidates:
+        return {**plan, "stop": None, "alternatives": []}
+    elevations = get_elevation_data(candidates)
+
+    options = []
+    for charger, elevation in zip(candidates, elevations):
+        i = charger['leg_index']
+        leg = legs[i]
+        start_elev = leg.get('elevation_from_m', 0.0)
+        end_elev = start_elev + leg.get('elevation_gain_m', 0.0)
+        to_kwh = route_energy_kwh(charger['to_charger'], leg, energy_params,
+                                  elevation - start_elev, start_elev)
+        from_kwh = route_energy_kwh(charger['from_charger'], leg, energy_params,
+                                    end_elev - elevation, elevation)
+        arrival_kwh = battery_kwh - used_before[i] - to_kwh
+        needed_kwh = from_kwh + sum(energies[i + 1:]) + reserve_kwh  # SoC needed leaving the charger
+        if arrival_kwh < reserve_kwh or needed_kwh > battery_kwh:
+            continue
+        charge_kwh = max(0.0, needed_kwh - arrival_kwh)
+        charge_kw = min(charger['max_kw'] or LEVEL2_CHARGER_KW, VEHICLE_MAX_CHARGE_KW)
+        charge_time_s = round(charge_kwh / charge_kw * 3600)
+        detour_time_s = (charger['to_charger']['time_s'] + charger['from_charger']['time_s']
+                         - routes[i]['time_s'])
+        options.append({
+            "charger": {key: charger[key] for key in ('name', 'address', 'lat', 'lng', 'max_kw')},
+            "leg_index": i,
+            "arrival_soc_kwh": arrival_kwh,
+            "charge_kwh": charge_kwh,
+            "charge_kw": charge_kw,
+            "charge_time_s": charge_time_s,
+            "depart_soc_kwh": arrival_kwh + charge_kwh,
+            "final_soc_kwh": arrival_kwh + charge_kwh - (needed_kwh - reserve_kwh),
+            "detour_distance_m": (charger['to_charger']['distance_m']
+                                  + charger['from_charger']['distance_m'] - routes[i]['distance_m']),
+            "detour_time_s": detour_time_s,
+            "detour_energy_kwh": to_kwh + from_kwh - route_energy_kwh(routes[i], leg, energy_params),
+            "added_time_s": detour_time_s + charge_time_s,
+        })
+    options.sort(key=lambda o: o['added_time_s'])
+    if not options:
+        return {**plan, "stop": None, "alternatives": []}
+
+    # Roads to and from the chosen charger, for the map
+    stop = options[0]
+    leg, charger = legs[stop['leg_index']], stop['charger']
+    stop['to_charger_path'] = compute_leg_routes(leg['from'], charger)[0]['path']
+    stop['from_charger_path'] = compute_leg_routes(charger, leg['to'])[0]['path']
+    return {**plan, "stop": stop, "alternatives": [o['charger'] for o in options[1:5]]}
+
+
+def _decode_polyline(encoded: str) -> list:
+    """Decode a Google encoded polyline into [{lat, lng}, ...]."""
+    points, index, lat, lng = [], 0, 0, 0
+    while index < len(encoded):
+        deltas = []
+        for _ in range(2):
+            shift, result = 0, 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1f) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            deltas.append(~(result >> 1) if result & 1 else result >> 1)
+        lat += deltas[0]
+        lng += deltas[1]
+        points.append({"lat": lat / 1e5, "lng": lng / 1e5})
+    return points
+
+
+def _encode_polyline(path: list) -> str:
+    """Encode [{lat, lng}, ...] as a Google encoded polyline (inverse of _decode_polyline)."""
+    chunks, prev_lat, prev_lng = [], 0, 0
+    for point in path:
+        lat, lng = round(point['lat'] * 1e5), round(point['lng'] * 1e5)
+        for delta in (lat - prev_lat, lng - prev_lng):
+            value = ~(delta << 1) if delta < 0 else delta << 1
+            while value >= 0x20:
+                chunks.append(chr((0x20 | (value & 0x1f)) + 63))
+                value >>= 5
+            chunks.append(chr(value + 63))
+        prev_lat, prev_lng = lat, lng
+    return "".join(chunks)
+
+
+def _to_local_m(point: dict, ref: dict) -> tuple:
+    """Project a point to (x, y) meters east/north of ref (fine over tens of km)."""
+    return ((point['lng'] - ref['lng']) * 111320 * math.cos(math.radians(ref['lat'])),
+            (point['lat'] - ref['lat']) * 110540)
+
+
+def _distance_m(a: dict, b: dict) -> float:
+    """Straight-line distance in meters between two nearby points."""
+    return math.hypot(*_to_local_m(a, b))
+
+
+def _offset_point(ref: dict, x_m: float, y_m: float) -> dict:
+    """Inverse of _to_local_m: the point x_m east and y_m north of ref."""
+    return {"lat": ref['lat'] + y_m / 110540,
+            "lng": ref['lng'] + x_m / (111320 * math.cos(math.radians(ref['lat'])))}
+
+
+def _densify_path(path: list, step_m: float = 50) -> list:
+    """Points at most step_m apart along a path, as [({lat, lng}, meters along path), ...]."""
+    dense = [(path[0], 0.0)]
+    along = 0.0
+    for a, b in zip(path, path[1:]):
+        bx, by = _to_local_m(b, a)
+        length = math.hypot(bx, by)
+        steps = max(1, math.ceil(length / step_m))
+        for k in range(1, steps + 1):
+            dense.append((_offset_point(a, bx * k / steps, by * k / steps),
+                          along + length * k / steps))
+        along += length
+    return dense
+
+
+def _distance_to_path_m(point: dict, path: list) -> float:
+    """Shortest distance in meters from a point to any segment of a path."""
+    best = float('inf')
+    for a, b in zip(path, path[1:]):
+        ax, ay = _to_local_m(a, point)  # point itself sits at the origin
+        bx, by = _to_local_m(b, point)
+        dx, dy = bx - ax, by - ay
+        seg_sq = dx * dx + dy * dy
+        t = 0.0 if seg_sq == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg_sq))
+        best = min(best, math.hypot(ax + t * dx, ay + t * dy))
+    return best
 
 
 def get_elevation_data(locations: list) -> list:
@@ -209,151 +889,6 @@ def get_elevation_data(locations: list) -> list:
         return [0.0] * len(locations)
 
     return [result["elevation"] for result in data["results"]]
-
-
-# =============================================================================
-# Energy Consumption Model — Model E regression
-# =============================================================================
-
-def calculate_energy_consumption(
-    distance_km: float,
-    avg_speed_kmh: float,
-    temperature_c: float,
-    vehicle_weight_tonnes: float,
-    altitude_diff_m: float,
-    altitude_m: float,
-    has_climate_control: bool = True,
-    driving_style: str = 'normal'
-) -> dict:
-    """
-    Calculate energy consumption using Model E polynomial regression.
-
-    Model E extends Model D with two air-density interaction terms that capture
-    how aerodynamic drag varies with temperature and absolute altitude:
-      F_aero ∝ ρ(T, alt) · v²   where ρ decreases with higher T and higher alt.
-
-    Formula (returns kWh per leg):
-      grade = alt_diff_m / dist_km   (m/km)
-      e_per_km = b0 + b1*v + b2*T + b3*W + b4*Δh + b5*v²
-               + b6*(W·grade) + b7*(v·grade)
-               + b8*(v²·T)    + b9*(v²·alt_m)
-      total_kwh = e_per_km * dist_km
-
-    Target range: 0.85–1.3 kWh/mile (Isuzu N-Series EV)
-    R²=0.9997, MAPE=3.46%, test RMSE=0.38 kWh
-
-    Args:
-        distance_km:           Leg distance in km
-        avg_speed_kmh:         Average speed in km/h
-        temperature_c:         Ambient temperature in °C
-        vehicle_weight_tonnes: Gross vehicle weight in tonnes
-        altitude_diff_m:       Elevation change over leg in m (+ = uphill)
-        altitude_m:            Absolute elevation at leg start in m (above sea level)
-        has_climate_control:   HVAC active (additive overhead, not in regression)
-        driving_style:         'eco' / 'normal' / 'aggressive': scales the energy for
-                               how hard the driver accelerates (assumed factor,
-                               STYLE_ENERGY_FACTOR; not in the regression)
-
-    Returns:
-        Dict with energy_kwh and breakdown
-    """
-    # Model E fitted coefficients (Isuzu N-Series EV, R²=0.9997, MAPE=3.46%)
-    # Units: dist=km, speed=km/h, temp=°C, weight=tonnes, alt=metres, grade=m/km
-    b0 =  5.7142142481e-01   # intercept
-    b1 = -1.0081493644e-02   # speed (v)
-    b2 =  1.4087882356e-04   # temperature (T)
-    b3 =  1.8176062830e-02   # weight (W)
-    b4 =  1.7585256876e-05   # altitude change (Δh)
-    b5 =  1.2923132040e-04   # speed squared (v²)
-    b6 =  2.8886974460e-03   # weight × road grade (W·Δh/d)
-    b7 = -9.9890433238e-06   # speed × road grade (v·Δh/d)
-    b8 = -2.6120414024e-07   # speed²×temp  (ρ–temperature coupling)
-    b9 = -8.6411314209e-09   # speed²×alt_m (ρ–altitude coupling)
-
-    # Avoid division by zero on zero-length legs
-    if distance_km <= 0:
-        return {"energy_kwh": 0.0, "energy_per_km": 0.0, "energy_per_mile": 0.0,
-                "miles_per_kwh": 0.0, "kwh_per_mile": 0.0, "breakdown": {}}
-
-    dist  = distance_km      # km
-    v     = avg_speed_kmh    # km/h
-    T     = temperature_c
-    W     = vehicle_weight_tonnes
-    dh    = altitude_diff_m
-    h     = altitude_m
-
-    # grade = alt_diff_m / dist_km  →  m/km (as model expects)
-    grade = dh / dist
-
-    energy_per_km = (
-        b0
-        + b1 * v
-        + b2 * T
-        + b3 * W
-        + b4 * dh
-        + b5 * v**2
-        + b6 * (W * grade)
-        + b7 * (v * grade)
-        + b8 * (v**2 * T)
-        + b9 * (v**2 * h)
-    )
-
-    # HVAC additive overhead (0.092 kWh/km)
-    hvac_per_km = 0.092 if has_climate_control else 0.0
-    energy_per_km += hvac_per_km
-
-    # Driving style: harder or gentler acceleration than the fitted average.
-    # Only on a leg that uses energy; regen on a steep downhill is left alone.
-    style_per_km = (energy_per_km * (STYLE_ENERGY_FACTOR.get(driving_style, 1.0) - 1)
-                    if energy_per_km > 0 else 0.0)
-    energy_per_km += style_per_km
-
-    total_energy_kwh = energy_per_km * dist
-
-    dist_miles = distance_km * 0.621371
-    energy_per_mile = total_energy_kwh / dist_miles if dist_miles > 0 else 0
-    miles_per_kwh = dist_miles / total_energy_kwh if total_energy_kwh > 0 else 0
-
-    return {
-        "energy_kwh": total_energy_kwh,
-        "energy_per_km": energy_per_km,
-        "energy_per_mile": energy_per_mile,
-        "miles_per_kwh": miles_per_kwh,
-        "kwh_per_mile": 1 / miles_per_kwh if miles_per_kwh > 0 else 0,
-        "breakdown": {
-            "intercept_kwh":       b0             * dist,
-            "speed_kwh":           b1 * v         * dist,
-            "temperature_kwh":     b2 * T         * dist,
-            "weight_kwh":          b3 * W         * dist,
-            "altitude_diff_kwh":   b4 * dh        * dist,
-            "speed_sq_kwh":        b5 * v**2      * dist,
-            "weight_grade_kwh":    b6 * W * grade * dist,
-            "speed_grade_kwh":     b7 * v * grade * dist,
-            "aero_temp_kwh":       b8 * v**2 * T  * dist,
-            "aero_alt_kwh":        b9 * v**2 * h  * dist,
-            "climate_control_kwh": hvac_per_km    * dist,
-            "driving_style_kwh":   style_per_km   * dist,
-        }
-    }
-
-
-def estimate_average_speed(distance_m: float, time_s: float) -> float:
-    """
-    Estimate average speed from distance and time.
-
-    Args:
-        distance_m: Distance in meters
-        time_s: Time in seconds
-
-    Returns:
-        Average speed in km/h
-    """
-    if time_s == 0:
-        return 0.0
-
-    distance_km = distance_m / 1000
-    time_h = time_s / 3600
-    return distance_km / time_h
 
 
 # =============================================================================
@@ -670,14 +1205,14 @@ PACK_KWH = 20.0
 PACK_WEIGHT_LBS = 200 * 2.20462  # one pack is 200 kg
 BASE_TRUCK_4PACKS_LBS = 7000.0   # empty truck with 4 packs
 DEFAULT_PACKS = 4
-LBS_PER_TONNE = 2204.62
 
 GOAL_KEYS = ('distance', 'time', 'energy', 'balance')
 GOAL_LEVELS = ('off', 'low', 'medium', 'high')
 GOAL_LEVEL_WEIGHT = {'off': 0, 'low': 1, 'medium': 2, 'high': 4}
-# Distance only, nothing enforced: exactly what the app did before goals existed.
+# Distance only, with every truck keeping DEFAULT_BATTERY_RESERVE_PCT (20%) of its
+# battery. A reserve of None means "not enforced" (reported only).
 DEFAULT_GOALS = {'distance': 'high', 'time': 'off', 'energy': 'off', 'balance': 'off',
-                 'battery_reserve_pct': None}
+                 'battery_reserve_pct': int(DEFAULT_BATTERY_RESERVE_PCT)}
 MAX_RESERVE_PCT = 50
 OBJ_SCALE = 100_000              # cost of one average leg at weight 1 (integer solvers need room)
 DROP_PENALTY = 10 ** 9           # leaving a stop unserved costs more than any route
@@ -701,7 +1236,6 @@ SPEED_PROFILES = (('city', 40), ('mixed', 60), ('highway', 90))
 
 DRIVING_STYLES = ('eco', 'normal', 'aggressive')
 STYLE_CRUISE_FACTOR = {'eco': 0.90, 'normal': 1.0, 'aggressive': 1.10}
-STYLE_ENERGY_FACTOR = {'eco': 0.95, 'normal': 1.0, 'aggressive': 1.10}
 CRUISE_KMH = 50.0
 
 
@@ -718,7 +1252,7 @@ def styled_matrices(matrices: dict, style) -> dict:
     D, T = matrices['distance'], matrices['time']
 
     def leg(d, t):
-        if _finite(d) and _finite(t) and t > 0 and d / t * 3.6 > CRUISE_KMH:
+        if finite(d) and finite(t) and t > 0 and d / t * 3.6 > CRUISE_KMH:
             return int(round(t / f))
         return t
     return {'distance': D, 'time': [[leg(d, t) for d, t in zip(dr, tr)] for dr, tr in zip(D, T)]}
@@ -842,14 +1376,17 @@ def empty_weight_lbs(packs) -> float:
 
 
 def normalize_goals(raw) -> dict:
-    """Fill in defaults and drop anything that is not a known level."""
+    """Fill in defaults and drop anything that is not a known level. A missing
+    battery_reserve_pct gets the default reserve; an explicit null turns it off."""
     goals = dict(DEFAULT_GOALS)
     if isinstance(raw, dict):
         for k in GOAL_KEYS:
             if raw.get(k) in GOAL_LEVELS:
                 goals[k] = raw[k]
-        r = raw.get('battery_reserve_pct')
-        if r is not None and r != '':
+        r = raw.get('battery_reserve_pct', goals['battery_reserve_pct'])
+        if r is None or r == '':
+            goals['battery_reserve_pct'] = None
+        else:
             try:
                 goals['battery_reserve_pct'] = int(max(0, min(MAX_RESERVE_PCT, round(float(r)))))
             except (TypeError, ValueError):
@@ -866,42 +1403,10 @@ def goal_weights(goals: dict) -> dict:
     return {k: raw[k] / total for k in GOAL_KEYS}
 
 
-def _finite(x) -> bool:
-    return x is not None and isinstance(x, (int, float)) and math.isfinite(x)
-
 
 def mean_offdiag(m: list) -> float:
-    vals = [x for i, row in enumerate(m) for j, x in enumerate(row) if i != j and _finite(x) and x > 0]
+    vals = [x for i, row in enumerate(m) for j, x in enumerate(row) if i != j and finite(x) and x > 0]
     return sum(vals) / len(vals) if vals else 1.0
-
-
-def energy_matrix_kwh(matrices: dict, elevations: list, weight_lbs: float,
-                      temperature_c: float, has_climate_control: bool, driving_style: str = 'normal') -> list:
-    """Model E energy for every ordered pair of locations at one truck weight."""
-    dist, tim = matrices['distance'], matrices['time']
-    n = len(dist)
-    elev = elevations or [0.0] * n
-    out = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            d, t = dist[i][j], tim[i][j]
-            if not (_finite(d) and _finite(t)):
-                out[i][j] = float('inf')
-                continue
-            out[i][j] = calculate_energy_consumption(
-                distance_km=d / 1000, avg_speed_kmh=estimate_average_speed(d, t),
-                temperature_c=temperature_c, vehicle_weight_tonnes=weight_lbs / LBS_PER_TONNE,
-                altitude_diff_m=elev[j] - elev[i], altitude_m=elev[i],
-                has_climate_control=has_climate_control, driving_style=driving_style)['energy_kwh']
-    return out
-
-
-def energy_matrix_wh(kwh: list) -> list:
-    """Integer Wh for OR-Tools, rounded up and floored at 0: downhill regen is not
-    banked against the battery limit, so the limit errs on the safe side."""
-    return [[int(math.ceil(max(0.0, x) * 1000)) if _finite(x) else 10 ** 9 for x in row] for row in kwh]
 
 
 def objective_matrix(matrices: dict, energy_kwh, goals: dict, num_vehicles: int = 1,
@@ -929,11 +1434,11 @@ def objective_matrix(matrices: dict, energy_kwh, goals: dict, num_vehicles: int 
 
     plain = route_w['distance'] > 0 and route_w['time'] == 0 and route_w['energy'] == 0
     if plain and not priority:
-        cost = [[x if _finite(x) else 10 ** 9 for x in row] for row in matrices['distance']]
+        cost = [[x if finite(x) else 10 ** 9 for x in row] for row in matrices['distance']]
     else:
         sources = {'distance': matrices['distance'], 'time': matrices['time']}
         if route_w['energy'] > 0:
-            clamped = [[max(0.0, x) if _finite(x) else float('inf') for x in row] for row in energy_kwh]
+            clamped = [[max(0.0, x) if finite(x) else float('inf') for x in row] for row in energy_kwh]
             sources['energy'] = clamped
             norms['energy'] = mean_offdiag(clamped)
         cost = [[0] * n for _ in range(n)]
@@ -1036,6 +1541,7 @@ def evaluate_route(nodes: list, kinds: list, cargo_delta: list, ctx: dict,
             "from": locations[a], "to": locations[b],
             "distance_m": d, "distance_mi": d / 1609.34,
             "time_s": t, "time_min": t / 60,
+            "elevation_from_m": elev[a], "elevation_to_m": elev[b], "elevation_gain_m": elev[b] - elev[a],
             "vehicle_weight_lbs": round(weight, 1),
             "vehicle_weight_tonnes": round(weight / LBS_PER_TONNE, 3),
             "energy_kwh": e,
@@ -1193,8 +1699,9 @@ def solve_fleet(ctx: dict, vehicles_config: list, goals: dict, priority=(), time
     energy_obj = None
     if w['energy'] > 0:
         mid = sum((x['gross'] + x['base']) / 2 for x in nums) / K
-        energy_obj = energy_matrix_kwh(matrices, ctx['elevations'], mid, ctx['temperature_c'],
-                                       ctx['has_climate_control'], ctx.get('driving_style', 'normal'))
+        energy_obj = energy_matrix_kwh(matrices['distance'], matrices['time'], ctx['elevations'], mid,
+                                       ctx['temperature_c'], ctx['has_climate_control'],
+                                       ctx.get('driving_style', 'normal'))
     obj = objective_matrix(matrices, energy_obj, goals, K, priority)
 
     kw = {'max_stops': [math.ceil(num_stops / K)] * K}
@@ -1202,11 +1709,16 @@ def solve_fleet(ctx: dict, vehicles_config: list, goals: dict, priority=(), time
         kw.update(time_matrix=matrices['time'],
                   service_s=[0] + [ctx['unload_s']] * num_stops, span_cost=obj['span_coef'])
     if reserve is not None:
-        kw.update(energy=[energy_matrix_wh(energy_matrix_kwh(
-                      matrices, ctx['elevations'], x['gross'], ctx['temperature_c'], ctx['has_climate_control'],
-                      ctx.get('driving_style', 'normal')))
-                      for x in nums],
-                  energy_caps=[x['battery_kwh'] * (1 - reserve / 100) * 1000 for x in nums],
+        bounds = {}   # one matrix per distinct truck build
+        for x in nums:
+            if (x['gross'], x['base']) not in bounds:
+                bounds[(x['gross'], x['base'])] = energy_upper_bound_matrix_wh(
+                    matrices['distance'], matrices['time'], ctx['elevations'],
+                    loaded_weight_lbs=x['gross'], base_weight_lbs=x['base'],
+                    temperature_c=ctx['temperature_c'], has_climate_control=ctx['has_climate_control'],
+                    driving_style=ctx.get('driving_style', 'normal'))
+        kw.update(energy=[bounds[(x['gross'], x['base'])] for x in nums],
+                  energy_caps=[battery_limit_wh(x['battery_kwh'], reserve) for x in nums],
                   soft_stop_cap=True, optional=True, drop_penalty=DROP_PENALTY)
 
     start = time.time()
@@ -1407,15 +1919,19 @@ def replan_breakdown(ctx: dict, vehicles_config: list, plan: list, event: dict,
     w = goal_weights(goals)
     if w['energy'] > 0:
         mid = sum(f['weight'] for f in fleet) / len(fleet) + stranded_lbs / 2
-        energy_obj = energy_matrix_kwh(matrices, ctx['elevations'], mid, ctx['temperature_c'],
-                                       ctx['has_climate_control'], ctx.get('driving_style', 'normal'))
+        energy_obj = energy_matrix_kwh(matrices['distance'], matrices['time'], ctx['elevations'], mid,
+                                       ctx['temperature_c'], ctx['has_climate_control'],
+                                       ctx.get('driving_style', 'normal'))
     obj = objective_matrix(matrices, energy_obj, goals, len(fleet))
     energies = []
     for f in fleet:
         heavy = min(MAX_GROSS_LBS, f['weight'] + stranded_lbs)
-        energies.append(sub(energy_matrix_wh(energy_matrix_kwh(
-            matrices, ctx['elevations'], heavy, ctx['temperature_c'], ctx['has_climate_control'],
-            ctx.get('driving_style', 'normal')))))
+        # A truck may still carry cargo home (stops it drops), so no empty return.
+        energies.append(sub(energy_upper_bound_matrix_wh(
+            matrices['distance'], matrices['time'], ctx['elevations'],
+            loaded_weight_lbs=heavy, base_weight_lbs=f['num']['base'],
+            temperature_c=ctx['temperature_c'], has_climate_control=ctx['has_climate_control'],
+            driving_style=ctx.get('driving_style', 'normal'), empty_return=False)))
     usable = [max(0.0, f['num']['battery_kwh'] * (1 - (reserve or 0) / 100) - f['used']) * 1000 for f in fleet]
 
     sol = solve_vrp_constrained(
@@ -1588,7 +2104,7 @@ def truck_limits(packs: int, temperature_c: float = 20.0, has_climate_control: b
                rlo=mixed['range_loaded_mi'], rhi=mixed['range_empty_mi'])
 
     plan_check = None
-    routes = [r for r in (plan or {}).get('vehicles') or [] if _finite(r.get('energy_kwh'))]
+    routes = [r for r in (plan or {}).get('vehicles') or [] if finite(r.get('energy_kwh'))]
     if routes:
         worst = max(routes, key=lambda r: r['energy_kwh'])
         need = float(worst['energy_kwh'])
@@ -1954,13 +2470,21 @@ def optimize_payload(data: dict) -> dict:
             ...
         ],
         "mode": "distance" | "time",
-        "algorithms": ["held_karp", "nearest_neighbor", "2opt"]  // optional
+        "algorithms": ["held_karp", "nearest_neighbor", "2opt"],  // optional
+        "traffic_source": "google" | "forecast" | "ground_truth" | "historical",  // optional
+        "departure_time": "2025-11-12T07:30"  // needed unless traffic_source is google
     }
-    
+
+    traffic_source other than google takes travel times from the traffic data
+    package (see traffic_data.py); the Held-Karp result then also gets 'traffic' with
+    its travel time when actually driven on the measured speeds.
+
     Returns optimized route with comparison between algorithms.
     """
     locations = data.get('locations', [])
     mode = data.get('mode', 'distance')
+    traffic_source = data.get('traffic_source', 'google')
+    departure_time = data.get('departure_time')
     algorithms = data.get('algorithms')
     # Accept either a `vehicles` array (new) or legacy `num_vehicles` int.
     vehicles_config = data.get('vehicles', None)
@@ -1989,20 +2513,36 @@ def optimize_payload(data: dict) -> dict:
         goals = normalize_goals(data['goals'])
     else:
         goals = normalize_goals({'distance': 'off', 'time': 'high'} if mode == 'time' else None)
+    # The battery reserve is a goal (the chat assistant sets it). A reserve sent
+    # in energy_params instead is used when the goals do not mention one.
+    legacy_reserve = (data.get('energy_params') or {}).get('battery_reserve_pct')
+    if 'battery_reserve_pct' not in (data.get('goals') or {}) and legacy_reserve is not None:
+        goals = normalize_goals({**goals, 'battery_reserve_pct': legacy_reserve})
     priority = sorted({int(i) for i in data.get('priority_stops') or []
                        if str(i).lstrip('-').isdigit() and 0 < int(i) < len(locations)})
     traffic = traffic_request(data.get('traffic'))
     driving_style = normalize_style((data.get('energy_params') or {}).get('driving_style'))
 
-    # Distance / time matrices and elevations: from the client when it sends
-    # back the ones it got for these same locations and the same traffic
-    # setting (a re-solve after a chat change), otherwise from Google.
-    pre = precomputed_inputs(data.get('precomputed'), len(locations))
+    # Distance / time matrices and elevations. Travel times come from the
+    # traffic data package when traffic_source names one (it overrides the
+    # Google traffic setting), otherwise from Google: typical times, or its
+    # prediction for the `traffic` departure. A re-solve of the same locations
+    # with the same Google setting reuses the matrices the client sends back.
+    use_traffic_data = traffic_source != 'google'
+    if use_traffic_data:
+        if not departure_time:
+            raise ValueError("departure_time is needed for traffic data")
+        traffic = None
+    pre = None if use_traffic_data else precomputed_inputs(data.get('precomputed'), len(locations))
     if pre and (pre['traffic'] or {}).get('departure') != traffic:
         pre = None
     traffic_info = (pre['traffic'] if pre else departure_info(traffic, locations[0])) if traffic else None
-    raw_matrices = pre['matrices'] if pre else get_distance_matrix(
-        locations, traffic_info['departure_ts'] if traffic_info else None)
+    if pre:
+        raw_matrices = pre['matrices']
+    elif use_traffic_data:
+        raw_matrices = traffic_data.travel_matrices(locations, traffic_source, departure_time)
+    else:
+        raw_matrices = get_distance_matrix(locations, traffic_info['departure_ts'] if traffic_info else None)
     # Everything below sees the times as this driving style drives them; the
     # response returns Google's, so a re-solve does not apply the style twice.
     matrices = styled_matrices(raw_matrices, driving_style)
@@ -2057,7 +2597,8 @@ def optimize_payload(data: dict) -> dict:
     # distance, time and energy (energy priced at vehicle 1's mid-load weight).
     energy_obj = None
     if goal_weights(goals)['energy'] > 0:
-        energy_obj = energy_matrix_kwh(matrices, elevations, (total_weight_lbs + hk_base_weight_lbs) / 2,
+        energy_obj = energy_matrix_kwh(matrices['distance'], matrices['time'], elevations,
+                                       (total_weight_lbs + hk_base_weight_lbs) / 2,
                                        temperature_c, has_climate_control, driving_style)
     objective = objective_matrix(matrices, energy_obj, goals, 1, priority)
     matrix = objective['cost']
@@ -2257,6 +2798,23 @@ def optimize_payload(data: dict) -> dict:
         result['battery_depletion'] = battery_depletion(
             legs, hk_battery_kwh, [eta[i] + (unload_time_min * 60 if i > 0 else 0) for i in range(len(legs))])
     
+    # Plan vs reality: drive a route on the measured speeds. The leg times also
+    # drive the map's drive simulation.
+    def ground_truth_traffic(order, closes_itself, planned_s):
+        actual = traffic_data.drive_on_ground_truth(
+            raw_matrices['paths'], order, departure_time, unload_time_min * 60, closes_itself)
+        return {
+            "source": traffic_source,
+            "departure_time": departure_time,
+            "planned_travel_time_s": planned_s,
+            "actual_travel_time_s": sum(actual),
+            "actual_leg_times_s": actual,
+        }
+
+    if use_traffic_data and 'optimal' in results:
+        hk = results['optimal']
+        hk['traffic'] = ground_truth_traffic(hk['order'], return_to_start, hk['travel_time_s'])
+
     # Name the solver whose route the baseline panel is actually showing.
     baseline_key = ('held_karp' if 'held_karp' in algorithms
                     else solver_decision.get('fallback_baseline', '2opt'))
@@ -2312,6 +2870,10 @@ def optimize_payload(data: dict) -> dict:
                'unload_s': unload_time_min * 60, 'driving_style': driving_style}
         results['ortools_fleet'] = solve_fleet(ctx, vehicles_config, goals, priority,
                                                time_limit_s=data.get('fleet_time_limit_s'))
+        if use_traffic_data:
+            # Fleet orders already end at the depot ([0, a, b, 0]).
+            for route in results['ortools_fleet']['routes']:
+                route['traffic'] = ground_truth_traffic(route['order'], False, route['travel_time_s'])
 
     return {
         "status": "ok",
@@ -2357,6 +2919,114 @@ def get_route_directions():
             "status": "ok",
             "directions": directions
         })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/replan_incidents', methods=['POST'])
+def replan_incidents():
+    """
+    Demo replanning: place accidents at the route's historical crash hotspots
+    (NHTSA FARS fatal crashes) and reroute around them, for every combination
+    of accidents, so the frontend can toggle each one on and off.
+
+    The delivery order stays fixed. Each accident only affects the leg it sits
+    on (stop i -> stop i+1); only that leg's from -> to route changes.
+
+    Works for one vehicle or a fleet: for a fleet, send every vehicle's legs
+    together, each tagged with its vehicle_id. The accidents are then spread
+    over the vehicles first.
+
+    Request body:
+    {
+        "legs": [...],         // results.optimal.legs, or every fleet route's legs
+                               // in route order, each with "vehicle_id"
+        "num_accidents": 3,    // 1-4 (each extra accident doubles the scenarios)
+        "energy_params": {"temperature_c": 20, "has_climate_control": true}
+    }
+
+    Returns:
+        accidents: [{id, lat, lng, leg_index, vehicle_id, crash_count, fatalities,
+                     years: [first, last], road, crashes: [{lat, lng, year}]}]
+        scenarios: {"1": legs, "1,3": legs, ...} keyed by the active accident
+                   ids (sorted, comma-joined), where legs is
+                   [{leg_index, vehicle_id, accident_ids, method, original, rerouted}] and
+                   original/rerouted have distance_m, time_s, energy_kwh and path
+    """
+    data = request.json
+    legs = data.get('legs') or []
+    num_accidents = max(1, min(int(data.get('num_accidents', 3)), 4))
+    energy_params = data.get('energy_params', {})
+
+    if not legs or any('from' not in leg or 'to' not in leg for leg in legs):
+        return jsonify({"status": "error", "message": "Need legs with 'from' and 'to'"}), 400
+
+    try:
+        replan = replan_route_around_hotspots(legs, num_accidents)
+        if not replan['accidents']:
+            raise Exception("No historical crash hotspots found along this route")
+
+        accidents = []
+        for a in replan['accidents']:
+            roads = [c[4] for c in a['crashes'] if c[4]]
+            years = [c[2] for c in a['crashes']]
+            accidents.append({
+                "id": a['id'],
+                **a['location'],
+                "leg_index": a['leg_index'],
+                "vehicle_id": legs[a['leg_index']].get('vehicle_id'),
+                "crash_count": len(a['crashes']),
+                "fatalities": sum(c[3] for c in a['crashes']),
+                "years": [min(years), max(years)],
+                "road": max(set(roads), key=roads.count) if roads else None,
+                "crashes": [{"lat": c[0], "lng": c[1], "year": c[2]} for c in a['crashes']],
+            })
+
+        # Same energy model as /api/optimize, with the leg's weight and elevation
+        for replanned in (l for s in replan['scenarios'].values() for l in s):
+            leg = legs[replanned['leg_index']]
+            for key in ('original', 'rerouted'):
+                replanned[key]['energy_kwh'] = route_energy_kwh(replanned[key], leg, energy_params)
+
+        return jsonify({
+            "status": "ok",
+            "num_requested": num_accidents,
+            "data_source": "NHTSA FARS fatal crashes",
+            "accidents": accidents,
+            "scenarios": replan['scenarios'],
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/reroute_from', methods=['POST'])
+def reroute_from():
+    """
+    Drive simulation: the vehicle is approaching an accident partway through a
+    leg; reroute it from its current position to the end of the leg.
+
+    Request body:
+    {
+        "position": {"lat": .., "lng": .., "heading": 90},  // heading optional
+        "destination": {"lat": .., "lng": ..},              // end of the leg
+        "accidents": [{"lat": .., "lng": ..}]               // accidents ahead on the leg
+    }
+
+    Returns:
+        method: 'clear' (the default route already avoids them), 'alternative' or 'detour'
+        original, rerouted: {distance_m, time_s, path} from the position
+    """
+    data = request.json or {}
+    position, destination = data.get('position'), data.get('destination')
+    accident_points = data.get('accidents') or []
+    if not position or not destination or not accident_points:
+        return jsonify({"status": "error", "message": "Need position, destination and accidents"}), 400
+
+    try:
+        result = reroute_from_position(position, destination, accident_points)
+        if result['rerouted'] is None:
+            raise Exception("No route around the accident from here")
+        return jsonify({"status": "ok", **result})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2436,6 +3106,43 @@ def suggest_route():
     lang = data.get('lang') if data.get('lang') in ('en', 'zh') else 'en'
     try:
         return jsonify({"status": "ok", "suggestion": suggest_fix(data, lang)})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/plan_charging', methods=['POST'])
+def plan_charging():
+    """
+    Find a charging stop for each vehicle that would otherwise drop below the
+    SoC reserve before it is back at the depot: the vehicle's reserve_pct (the
+    plan's battery reserve), or DEFAULT_BATTERY_RESERVE_PCT. Stops are not reordered; the charger is inserted into one leg.
+
+    Request body:
+    {
+        "vehicles": [{"vehicle_id": 1, "battery_kwh": 80, "reserve_pct": 20, "legs": [...]}],  // fleet route legs
+        "energy_params": {"temperature_c": 20, "has_climate_control": true}
+    }
+
+    Returns:
+        plans: [{vehicle_id, needed, reserve_pct, reserve_kwh, final_soc_kwh,
+        reserve_point, stop, alternatives}] (see plan_charging_stop), where stop has
+        charger {name, address, lat, lng, max_kw}, leg_index, arrival/depart/final
+        SoC in kWh, charge_kwh, charge_kw, charge_time_s, detour_distance_m,
+        detour_time_s, detour_energy_kwh, added_time_s and the to/from charger paths
+    """
+    data = request.json
+    vehicles = data.get('vehicles') or []
+    energy_params = data.get('energy_params', {})
+
+    if not vehicles or any(not v.get('legs') or not v.get('battery_kwh') for v in vehicles):
+        return jsonify({"status": "error", "message": "Need vehicles with 'battery_kwh' and 'legs'"}), 400
+
+    try:
+        plans = [{"vehicle_id": v.get('vehicle_id'),
+                  **plan_charging_stop(v['legs'], float(v['battery_kwh']), energy_params,
+                                       float(v.get('reserve_pct') or DEFAULT_BATTERY_RESERVE_PCT))}
+                 for v in vehicles]
+        return jsonify({"status": "ok", "plans": plans})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -4606,17 +5313,88 @@ def benchmark_algorithms():
     return jsonify({"status": "ok", "algorithms": [a.to_dict() for a in BENCHMARK_ALGORITHMS]})
 
 
+@app.route('/api/benchmark/fixed_plan', methods=['GET'])
+def benchmark_fixed_plan():
+    """The fixed stop order (which truck visits which stops, in order) for a scenario and fleet size."""
+    scenario_id = request.args.get('scenario_id')
+    if not scenario_id:
+        return jsonify({"status": "error", "message": "scenario_id is required"}), 400
+    try:
+        plan = fixed_plan_view(scenario_id, int(request.args.get('num_vehicles', 1)))
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    return jsonify({"status": "ok", **plan})
+
+
 @app.route('/api/benchmark/run', methods=['POST'])
 def benchmark_run():
     """
-    Run every selected algorithm for K = 1..max_vehicles on a saved scenario.
+    Run every selected algorithm on a saved scenario.
+
+    Fleet size: send "num_vehicles": 5 to run K = 5 only (add
+    "include_smaller_fleets": true to run K = 1..5). The legacy "max_vehicles"
+    runs K = 1..max_vehicles.
 
     Expected JSON:
     {
         "scenario_id": "demo_anaheim",
-        "max_vehicles": 3,
+        "num_vehicles": 5,
+        "include_smaller_fleets": false,
+        "preserve_stop_order": false,            // lock every truck to the fixed plan; all algorithms return it unchanged
         "algorithms": ["nn", "ortools", ...],   // optional, default all
-        "ortools_time_limit_s": 5                // optional, default production
+        "ortools_time_limit_s": 5,               // optional, default production
+        "objective": {                           // optional, default distance
+            "mode": "distance" | "time" | "energy" | "blend",
+            "weights": {"distance": 50, "time": 25, "energy": 25}   // blend only
+        },
+        "energy_params": {"temperature_c": 20, "loaded_weight_lbs": 13000,
+                          "base_weight_lbs": 7000, "has_climate_control": true}   // optional
+    }
+    """
+    data = request.json or {}
+    scenario_id = data.get('scenario_id')
+    if not scenario_id:
+        return jsonify({"status": "error", "message": "scenario_id is required"}), 400
+
+    time_limit = data.get('ortools_time_limit_s')
+    fleet_sizes = None
+    try:
+        if data.get('num_vehicles') is not None:
+            k = int(data['num_vehicles'])
+            fleet_sizes = list(range(1, k + 1)) if data.get('include_smaller_fleets') else [k]
+        result = run_benchmark(
+            scenario_id,
+            max_vehicles=int(data.get('max_vehicles', 3)),
+            fleet_sizes=fleet_sizes,
+            preserve_stop_order=bool(data.get('preserve_stop_order')),
+            algorithm_ids=data.get('algorithms') or None,
+            ortools_time_limit_s=int(time_limit) if time_limit else None,
+            objective=data.get('objective'),
+            energy_params=data.get('energy_params'),
+        )
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({"status": "ok", **result})
+
+
+@app.route('/api/benchmark/simulate', methods=['POST'])
+def benchmark_simulate():
+    """
+    Plan a battery-limited fleet on a saved scenario, then simulate driving it
+    with extra battery drain, replanning (and dropping stops if needed) at
+    every stop. See benchmark/simulate.py.
+
+    Expected JSON:
+    {
+        "scenario_id": "case1_plymouth_mi",
+        "num_vehicles": 4,
+        "energy_params": {"battery_kwh": 110, "battery_reserve_pct": 20, ...},   // battery_kwh required
+        "drain": {"factor": 1.3, "event": {"after_stop": 3, "factor": 1.6}},     // event optional
+        "objective": {...},                     // optional, as in /api/benchmark/run
+        "ortools_time_limit_s": 5               // optional, initial plan only
     }
     """
     data = request.json or {}
@@ -4626,13 +5404,17 @@ def benchmark_run():
 
     time_limit = data.get('ortools_time_limit_s')
     try:
-        result = run_benchmark(
+        result = simulate(
             scenario_id,
-            max_vehicles=int(data.get('max_vehicles', 3)),
-            algorithm_ids=data.get('algorithms') or None,
+            int(data.get('num_vehicles', 2)),
+            energy_params=data.get('energy_params'),
+            drain=data.get('drain'),
+            objective=data.get('objective'),
             ortools_time_limit_s=int(time_limit) if time_limit else None,
         )
-    except ValueError as e:
+    except BatteryLimitError as e:
+        return jsonify({"status": "error", "error_type": "battery_limit", "message": str(e)}), 422
+    except (ValueError, TypeError) as e:
         return jsonify({"status": "error", "message": str(e)}), 400
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -4658,11 +5440,17 @@ if __name__ == '__main__':
     print("  POST /api/geocode_batch  - Geocode multiple addresses")
     print("  POST /api/optimize       - Optimize route (main endpoint)")
     print("  POST /api/directions     - Get turn-by-turn directions")
+    print("  POST /api/replan         - Re-plan the day after a truck breaks down")
+    print("  POST /api/suggest        - Check a plan for a problem and test fixes")
+    print("  POST /api/replan_incidents - Reroute around historical crash hotspots")
+    print("  POST /api/reroute_from   - Reroute a moving truck around an accident")
+    print("  POST /api/plan_charging  - Charging stops to keep the battery reserve")
     print("  POST /api/chat           - Chat assistant (lexicon → extraction → validation)")
     print("  GET  /api/health         - Health check")
     print("  GET  /api/benchmark/scenarios  - List benchmark scenarios")
     print("  GET  /api/benchmark/algorithms - List benchmark algorithms")
     print("  POST /api/benchmark/run        - Run algorithm comparison")
+    print("  POST /api/benchmark/simulate   - Simulate battery drain + replanning")
     print()
     print("Starting server on http://localhost:5001")
     print("=" * 60)

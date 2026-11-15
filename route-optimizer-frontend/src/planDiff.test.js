@@ -46,10 +46,10 @@ test('setting changes read as chips', () => {
   const s = { goals: DEFAULT_GOALS, priorityStops: [], vehicles: [{ name: 'V1', battery_packs: 4, weight_lbs: 13000 }],
               energyParams: { temperature_c: 20, unload_time_min: 30, has_climate_control: true }, solver: 'auto',
               depot: 'x', stops: ['a', 'b'] };
-  const t = { ...s, goals: { ...DEFAULT_GOALS, energy: 'high', battery_reserve_pct: 20 },
+  const t = { ...s, goals: { ...DEFAULT_GOALS, energy: 'high', battery_reserve_pct: 30 },
               vehicles: [{ name: 'V1', battery_packs: 3, weight_lbs: 12559 }] };
   expect(settingChanges(s, t)).toEqual([
-    'Energy off → high', 'Battery reserve: not enforced → keep 20%', 'V1: 4 → 3 packs',
+    'Energy off → high', 'Battery reserve: keep 20% → keep 30%', 'V1: 4 → 3 packs',
   ]);
 });
 

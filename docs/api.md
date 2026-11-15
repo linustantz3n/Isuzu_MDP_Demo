@@ -12,13 +12,19 @@ to `http://localhost:5001/api`.
 | `/api/geocode` | POST | `{address}` → `{result: {address, formatted_address, lat, lng}}` |
 | `/api/geocode_batch` | POST | `{addresses: [...]}` → `{results: [...], errors: [...]}`; `status` is `partial` if any failed |
 | **`/api/optimize`** | POST | **The main endpoint.** Solve the routes and estimate energy (below) |
-| `/api/directions` | POST | `{locations, order}` → raw Google Directions response |
+| `/api/directions` | POST | `{locations, order}` → raw Google Routes API `computeRoutes` response |
 | `/api/replan` | POST | Simulate a breakdown on a plan and re-plan the rest of the day (below) |
+| `/api/suggest` | POST | Check a solved plan for a problem and test fixes for it |
+| `/api/replan_incidents` | POST | `{legs, num_accidents}` → crash hotspots on the route and reroutes for every on/off combination (stop order kept) |
+| `/api/reroute_from` | POST | `{position, destination, accidents}` → reroute for a truck already driving |
+| `/api/plan_charging` | POST | `{vehicles: [{vehicle_id, battery_kwh, reserve_pct?, legs}], energy_params}` → one charging stop per truck that would end below its reserve |
 | `/api/chat` | POST | Chat assistant. See [chat-assistant.md](chat-assistant.md) |
 | `/api/memory` | GET / DELETE | Saved driver profiles. See [chat-assistant.md](chat-assistant.md#driver-memory) |
 | `/api/benchmark/scenarios` | GET | Saved benchmark scenarios |
 | `/api/benchmark/algorithms` | GET | Registered benchmark algorithms |
 | `/api/benchmark/run` | POST | `{scenario_id, max_vehicles=3, algorithms?, ortools_time_limit_s?}` → per-K, per-algorithm metrics |
+| `/api/benchmark/fixed_plan` | GET | `?scenario_id=&num_vehicles=` → the fixed stop order for a scenario |
+| `/api/benchmark/simulate` | POST | Battery-limited plan driven with extra drain, re-planning at every stop (see `benchmark/simulate.py`) |
 
 Every endpoint returns `"status": "ok"` on success, or `"status": "error"` with a `message`.
 
@@ -79,9 +85,12 @@ The steps:
 | `energy_params.has_climate_control` | `true` | Adds 0.092 kWh/km |
 | `energy_params.driving_style` | `"normal"` | `eco` / `normal` / `aggressive`: assumed speed and energy factors (see [energy-model.md](energy-model.md#driving-style-and-traffic)) |
 | `traffic` | `null` | `{"departure": "now"}` or `{"departure": "HH:MM"}`: travel times are Google's traffic prediction for that departure at the depot (the next time its clock reads `HH:MM`). `null`: Google's typical times |
+| `traffic_source` | `"google"` | `"forecast"` / `"historical"` / `"ground_truth"`: travel times from the traffic data package instead (overrides `traffic`, ignores `precomputed`); needs `departure_time`. The Held-Karp result then gets `traffic` with the route's travel time driven on the measured speeds |
+| `departure_time` | — | `"2025-11-12T07:30"`, for `traffic_source` |
+| `energy_params.battery_reserve_pct` | — | Used as `goals.battery_reserve_pct` when the goals set no reserve |
 | `energy_params.total_weight_lbs`, `base_weight_lbs` | 19,500 / 7,000 | Effectively unused (see [energy-model.md](energy-model.md#other-inputs-and-what-they-affect)) |
 | `algorithms` | (from `solver`) | Explicit list to run (`held_karp` / `optimal`, `nearest_neighbor` / `greedy`, `2opt`). Overrides `solver` |
-| `goals` | distance only | Levels `off` / `low` / `medium` / `high` for `distance`, `time`, `energy`, `balance`, plus `battery_reserve_pct` (`null` = report only, 0–50 = enforce on fleets). What the solvers minimise; see [planning.md](planning.md#optimization-goals). Without `goals`, `mode: "time"` still means "minimise time" |
+| `goals` | distance only | Levels `off` / `low` / `medium` / `high` for `distance`, `time`, `energy`, `balance`, plus `battery_reserve_pct` (0–50 = enforce on fleets, default 20 when left out; `null` = report only). What the solvers minimise; see [planning.md](planning.md#optimization-goals). Without `goals`, `mode: "time"` still means "minimise time" |
 | `priority_stops` | `[]` | Location indices (1 … n−1) to serve before the other stops on their truck |
 | `precomputed` | — | `{distance, time, elevations, traffic}` as returned by an earlier solve of the **same** locations. Skips every Google call. Ignored if the shapes do not match `locations`, or if its `traffic` departure differs from the request's |
 
@@ -213,7 +222,7 @@ curl -s -X POST http://localhost:5001/api/optimize -H "Content-Type: application
 }'
 ```
 
-This needs `GOOGLE_MAPS_API_KEY` in `.env`. Each call makes `ceil(n/10)²` Distance Matrix
+This needs `GOOGLE_MAPS_API_KEY` in `.env`. Each call makes `ceil(n/25)²` Routes API route-matrix
 requests and one Elevation request, where n is the number of locations. Geocoding happens
 earlier, in the UI's "Validate Addresses" step.
 

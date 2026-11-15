@@ -1,6 +1,6 @@
 # Energy model
 
-**Code:** [`calculate_energy_consumption()`](../route_optimizer_backend.py#L218) in `route_optimizer_backend.py`.
+**Code:** [`calculate_energy_consumption()`](../energy.py) in `energy.py` (shared by the backend and `benchmark/`).
 It is called once per route leg (one stop to the next) from `optimize_route()`:
 
 - single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L2125), [return leg](../route_optimizer_backend.py#L2182)
@@ -38,7 +38,7 @@ depot, because the UI always sends closed routes.
 
 | Symbol | Meaning | Unit | Where the value comes from |
 |---|---|---|---|
-| d | Driving distance of the leg | km | Google Distance Matrix ([`get_distance_matrix`](../route_optimizer_backend.py#L72)), metres ÷ 1000 |
+| d | Driving distance of the leg | km | Google Routes API route matrix ([`get_distance_matrix`](../route_optimizer_backend.py)), metres ÷ 1000 |
 | v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L340)). No live traffic |
 | T | Ambient temperature | °C | UI slider, `energy_params.temperature_c` (default 20). Same value for every leg |
 | W | Gross vehicle weight on this leg | tonnes | Vehicle `weight_lbs` ÷ 2204.62, reduced as cargo is delivered (see [Weight model](#weight-model)) |
@@ -172,7 +172,9 @@ regen on a steep downhill is left alone. The style is applied to the time matrix
 the solvers, ETAs, battery checks and the truck-limits answer all see the same speeds.
 
 **Traffic** ([`get_distance_matrix`](../route_optimizer_backend.py#L72), [`departure_info`](../route_optimizer_backend.py#L785)): with a departure time, the
-travel times are Google's `duration_in_traffic` for that moment (`traffic_model=best_guess`).
+travel times are the Routes API's traffic-aware durations for that moment (`routingPreference: TRAFFIC_AWARE`).
+The traffic data package (`traffic_source`, see the README) is a second source of travel times that
+overrides this one.
 A clock time means the next time the depot's clock reads it, in the depot's time zone from the
 Google Time Zone API. Traffic changes each leg's average speed, so it changes energy too. On the
 Anaheim demo, a 7:30 departure made the day 32% longer and used 14% less energy than typical times,
@@ -190,7 +192,7 @@ climbs early while fully loaded can be short but costly.
 
 **With the Energy goal on** ([planning.md](planning.md#optimization-goals)), the solvers
 minimise an energy-weighted cost.
-[`energy_matrix_kwh()`](../route_optimizer_backend.py#L878) makes one
+[`energy_matrix_kwh()`](../energy.py) makes one
 `calculate_energy_consumption` call per ordered pair of stops. It uses one representative
 weight, halfway between loaded and empty, because a fixed matrix cannot know where in the
 route a leg will fall. Negative (downhill) energy is floored at 0 in the cost, so regen is
@@ -198,8 +200,11 @@ not rewarded. The reported energy is still the exact leg-by-leg value with the r
 dropping weight.
 
 **With a battery reserve**, each fleet truck also gets an energy limit. It is checked with
-that truck's matrix at its *full* gross weight, rounded up to whole Wh, so the limit errs
-on the safe side.
+[`energy_upper_bound_matrix_wh()`](../energy.py): per arc, the larger of the energy at the truck's
+full gross weight and at its empty weight (more weight means more regen downhill, so the heavier
+end is not always the costlier one), floored at 0 and rounded up to whole Wh, so the limit errs
+on the safe side. Arcs back to the depot are priced empty in a normal plan; in a breakdown re-plan
+they are not, since a truck may still carry cargo home.
 
 ## Caveats in the model as coded
 

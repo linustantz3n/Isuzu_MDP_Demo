@@ -7,7 +7,8 @@ export const LEVEL_WEIGHT = { off: 0, low: 1, medium: 2, high: 4 };
 export const RESERVE_CHOICES = [null, 0, 10, 20, 30, 40, 50];
 
 export const DEFAULT_GOALS = {
-  distance: 'high', time: 'off', energy: 'off', balance: 'off', battery_reserve_pct: null,
+  // Every truck keeps 20% of its battery unless the reserve is set to null (not enforced).
+  distance: 'high', time: 'off', energy: 'off', balance: 'off', battery_reserve_pct: 20,
 };
 
 export const GOAL_META = {

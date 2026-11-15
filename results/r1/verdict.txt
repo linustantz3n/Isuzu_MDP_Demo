@@ -1,0 +1,20 @@
+R1 VERIFICATION VERDICT -- Multi-Objective Fleet Routing with Interchangeable Stops
+==================================================================================
+Results folder: /home/joyjw/MDP-Isuzu/Isuzu_MDP_Demo/results/r1
+Reference machine(s): laptopA   commit(s): 017cfe3a22ad0b1467c45f04dab028b35fdc1925
+Instances analysed: 48 (expected 48)
+
+C1 Feasibility ............... PASS  48 of 48 OR-Tools plans feasible (need 48 of 48)
+C2 Runtime ................... PASS  max solve time 30.0 s (limit 300 s)
+C3 Gain vs naive dispatch .... PASS  mean 36.41%, min 21.09% over 48 instances (need mean >= 20%, each >= 10%)
+C4 Gain vs fixed stop order .. PASS  mean 27.14%, min 7.59% over 48 instances (need mean >= 10%, each > 0%)
+C5 Gain vs best heuristic .... PASS  min 0.00%, mean 1.61% over 48 instances; Wilcoxon one-sided W+ = 741, n non-tied = 38, p = 3.861e-08 (need each >= 0%, mean >= 1%, p < 0.05)
+   context: 95% bootstrap CI of mean I_H = [1.17%, 2.06%] (10000 resamples, seed 0)
+Replication: repeats ......... PASS  8 Set A instances, worst spread 0.000% (limit 0.5%, 3 repeats each, 8 instances)
+Replication: second machine .. FAIL  NOT RUN (second-machine file missing)
+
+OVERALL: R1 NOT PASSED
+  not met: second-machine check
+
+Notes and exclusions:
+  - B_s32: clarke_wright infeasible (uses 3 trucks (only 2 available)); excluded from best heuristic

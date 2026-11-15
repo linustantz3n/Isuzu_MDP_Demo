@@ -71,6 +71,10 @@ def main():
         if any(v == float("inf") for row in matrices[name] for v in row):
             raise SystemExit(f"Some {name} matrix elements failed; not writing a scenario.")
 
+    print("Fetching elevations...")
+    from .elevation import fetch_elevations
+    elevation_m = fetch_elevations(locations)
+
     scenario = {
         "id": args.scenario_id,
         "name": args.name,
@@ -80,6 +84,7 @@ def main():
         "locations": locations,
         "distance_m": matrices["distance"],
         "time_s": matrices["time"],
+        "elevation_m": elevation_m,
     }
     os.makedirs(SCENARIO_DIR, exist_ok=True)
     with open(out_path, "w") as f:

@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, InfoWindow } from '@react-google-maps/api';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, MarkerF, PolylineF, InfoWindow } from '@react-google-maps/api';
+import DriveSimulation from './DriveSimulation';
 import { depletionText, formatDuration } from './planDiff';
 
 export const VEHICLE_COLORS = [
@@ -7,6 +8,14 @@ export const VEHICLE_COLORS = [
   '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16', '#f97316'
 ];
 const SINGLE_COLOR = '#facc15';
+const BLOCKED_COLOR = '#ef4444';
+const REROUTE_COLOR = '#22c55e';
+const CRASH_COLOR = '#fb923c';
+// Warning triangle for crash hotspots, so they don't look like the round stop markers
+const HOTSPOT_PATH = 'M 0,-1.15 L 1.1,0.75 L -1.1,0.75 Z';
+const CHARGE_COLOR = '#22d3ee';
+const CHARGER_FILL = '#facc15';
+const BOLT_PATH = 'M 1,-10 L -6,2 L -1,2 L -2,10 L 6,-2 L 1,-2 Z';
 
 const MAP_CONTAINER_STYLE = { width: '100%', height: '500px' };
 
@@ -82,7 +91,12 @@ function pointAlongLeg(result, legIndex, fraction) {
   return { lat: end.lat(), lng: end.lng() };
 }
 
-export default function RouteMap({ results, locations }) {
+// replan: /api/replan_incidents response; activeAccidents: ids switched on;
+// activeLegs: the legs rerouted for that combination of accidents
+// chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
+// drive: {runId, speed} while the drive simulation runs (measured traffic), else null. It drives
+//   the fleet's trucks when there is a fleet, otherwise the Held-Karp route.
+export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -93,6 +107,60 @@ export default function RouteMap({ results, locations }) {
   const [selectedMarker, setSelectedMarker] = useState(null);
   const [selectedDepletion, setSelectedDepletion] = useState(null);
   const [visibleRoutes, setVisibleRoutes] = useState(new Set());
+  const [overlay, setOverlay] = useState(null);  // DOM node over the map for the drive simulation
+
+  // Drive simulation trucks: Google's road path for each leg of the route (or, where an
+  // accident is on, the path it was found on), timed by the measured traffic. One truck for
+  // the Held-Karp route; with a fleet, every truck's route. Accidents use the leg numbering
+  // of /api/replan_incidents: with a fleet, all trucks' legs in route order.
+  const driveTrucks = useMemo(() => {
+    const roadLegs = (directions, route, offset) => {
+      const actual = route?.traffic?.actual_leg_times_s;
+      const dirLegs = directions?.result.routes?.[0]?.legs;
+      if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
+      const stops = route.ordered_locations;
+      const atDepot = (k) => k + 1 >= stops.length || (k + 1 === stops.length - 1 && route.order?.[k + 1] === 0);
+      return dirLegs.map((leg, k) => ({
+        path: activeLegs.find(l => l.leg_index === offset + k)?.original.path
+          || leg.steps.flatMap(step => step.path.map(p => ({ lat: p.lat(), lng: p.lng() }))),
+        durationS: actual[k],
+        plannedS: route.legs[k]?.time_s ?? actual[k],
+        to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
+        toLabel: atDepot(k) ? 'Depot' : `Stop ${k + 1}`,
+      }));
+    };
+    const accidentsOn = (offset, n) => (replan ? replan.accidents : [])
+      .filter(a => activeAccidents.includes(a.id) && a.leg_index >= offset && a.leg_index < offset + n)
+      .map(a => ({ ...a, leg_index: a.leg_index - offset }));
+    const unloadOf = (route, stops) => (route.unload_time_s || 0) / Math.max(stops, 1);
+
+    const fleet = results?.ortools_fleet?.routes;
+    if (fleet?.length) {
+      const trucks = [];
+      let offset = 0;
+      for (const [idx, route] of fleet.entries()) {
+        const legs = roadLegs(routeDirections.find(r => r.label === `Vehicle ${route.vehicle_id}`), route, offset);
+        if (!legs) return null;  // every truck needs its road and measured times
+        trucks.push({
+          id: route.vehicle_id,
+          label: route.vehicle_name || `Vehicle ${route.vehicle_id}`,
+          color: VEHICLE_COLORS[idx % VEHICLE_COLORS.length],
+          legs,
+          accidents: accidentsOn(offset, route.legs.length),
+          unloadS: unloadOf(route, route.num_delivery_stops),
+        });
+        offset += route.legs.length;
+      }
+      return trucks;
+    }
+    const hk = results?.optimal;
+    const legs = roadLegs(routeDirections.find(r => r.label === 'Held-Karp'), hk, 0);
+    if (!legs) return null;
+    return [{ id: 'hk', label: 'The truck', color: SINGLE_COLOR, legs,
+              accidents: accidentsOn(0, legs.length), unloadS: unloadOf(hk, hk.ordered_locations.length - 1) }];
+  }, [results, routeDirections, activeLegs, replan, activeAccidents]);
+  const driveDeparture = results?.ortools_fleet?.routes?.[0]?.traffic?.departure_time
+    || results?.optimal?.traffic?.departure_time;
 
   const fitToRoutes = useCallback((visibleSet, directions) => {
     if (!mapRef.current || !window.google) return;
@@ -213,6 +281,15 @@ export default function RouteMap({ results, locations }) {
     });
   }, [isLoaded, results, locations]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Zoom to the hotspots and the legs they can block (once, not on every toggle)
+  useEffect(() => {
+    if (!isLoaded || !replan || !mapRef.current) return;
+    const bounds = new window.google.maps.LatLngBounds();
+    Object.values(replan.scenarios).flat().forEach(leg => leg.original.path.forEach(pt => bounds.extend(pt)));
+    replan.accidents.forEach(a => bounds.extend(a));
+    mapRef.current.fitBounds(bounds, 48);
+  }, [isLoaded, replan]);
+
   if (loadError) return (
     <div className="bg-slate-800 rounded-xl p-6 border border-red-500/30 text-red-400 text-sm">
       Google Maps failed to load: {loadError.message}
@@ -272,6 +349,58 @@ export default function RouteMap({ results, locations }) {
             </button>
           );
         })}
+        {/* Replanning legend */}
+        {replan && (
+          <>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-red-400">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={BLOCKED_COLOR} strokeWidth="3" strokeDasharray="4 3" />
+              </svg>
+              Blocked
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-green-400">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={REROUTE_COLOR} strokeWidth="3" />
+              </svg>
+              Reroute
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-red-400">
+              <svg width="14" height="12">
+                <path d="M 7,1 L 13,11 L 1,11 Z" fill="none" stroke={BLOCKED_COLOR} strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+              Crash hotspot
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-orange-400">
+              <svg width="10" height="10">
+                <circle cx="5" cy="5" r="4" fill={CRASH_COLOR} />
+              </svg>
+              Past fatal crash
+            </span>
+          </>
+        )}
+        {/* Charging legend */}
+        {chargingPlans.some(p => p.needed) && (
+          <>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-cyan-300">
+              <svg width="12" height="14" viewBox="-7 -11 14 22">
+                <path d={BOLT_PATH} fill={CHARGER_FILL} stroke="#0f172a" strokeWidth="1.5" />
+              </svg>
+              Charging stop
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-cyan-300">
+              <svg width="20" height="8">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={CHARGE_COLOR} strokeWidth="3" />
+              </svg>
+              Via charger
+            </span>
+            <span className="flex items-center gap-2 px-3 py-1.5 text-xs text-orange-400">
+              <svg width="10" height="10">
+                <circle cx="5" cy="5" r="4" fill="#f97316" stroke="#ffffff" strokeWidth="1" />
+              </svg>
+              Battery hits reserve
+            </span>
+          </>
+        )}
         <span className="text-[11px] text-slate-500">
           {fleetRoutes.length ? 'numbers: delivery order on each truck' : 'numbers: delivery order'}
         </span>
@@ -291,6 +420,7 @@ export default function RouteMap({ results, locations }) {
           Loading Google Maps...
         </div>
       ) : (
+        <div className="relative">
         <GoogleMap
           mapContainerStyle={MAP_CONTAINER_STYLE}
           center={center}
@@ -307,6 +437,102 @@ export default function RouteMap({ results, locations }) {
                 suppressFitBounds: true,
                 polylineOptions: { strokeColor: color, strokeOpacity, strokeWeight, zIndex },
               }}
+            />
+          ))}
+
+          {/* Replanned legs: blocked originals (dashed), reroutes, accident markers, past crashes */}
+          {replan && (
+            <>
+              {activeLegs.map(leg => (
+                <React.Fragment key={leg.leg_index}>
+                  <PolylineF
+                    path={leg.original.path}
+                    options={{
+                      strokeOpacity: 0,
+                      zIndex: 10,
+                      icons: [{
+                        icon: { path: 'M 0,-1 0,1', strokeColor: BLOCKED_COLOR, strokeOpacity: 1, scale: 3 },
+                        offset: '0',
+                        repeat: '12px',
+                      }],
+                    }}
+                  />
+                  <PolylineF
+                    path={leg.rerouted.path}
+                    options={{ strokeColor: REROUTE_COLOR, strokeOpacity: 0.95, strokeWeight: 5, zIndex: 11 }}
+                  />
+                </React.Fragment>
+              ))}
+              {replan.accidents.filter(a => activeAccidents.includes(a.id)).flatMap(a => a.crashes.map((crash, i) => (
+                <MarkerF
+                  key={`crash-${a.id}-${i}`}
+                  position={crash}
+                  icon={{
+                    path: window.google.maps.SymbolPath.CIRCLE,
+                    scale: 4,
+                    fillColor: CRASH_COLOR,
+                    fillOpacity: 0.85,
+                    strokeColor: '#0f172a',
+                    strokeWeight: 1,
+                  }}
+                  title={`Fatal crash, ${crash.year}`}
+                  zIndex={25}
+                />
+              )))}
+              {replan.accidents.map(a => {
+                const active = activeAccidents.includes(a.id);
+                return (
+                  <MarkerF
+                    key={`accident-${a.id}-${active}`}
+                    position={{ lat: a.lat, lng: a.lng }}
+                    icon={{
+                      path: HOTSPOT_PATH,
+                      scale: 13,
+                      fillColor: active ? BLOCKED_COLOR : '#0f172a',
+                      fillOpacity: active ? 1 : 0.9,
+                      strokeColor: active ? '#ffffff' : BLOCKED_COLOR,
+                      strokeWeight: 2,
+                      labelOrigin: new window.google.maps.Point(0, 0.3),
+                    }}
+                    label={{ text: String(a.id), color: active ? '#ffffff' : BLOCKED_COLOR, fontSize: '12px', fontWeight: 'bold' }}
+                    title={`${active ? 'Accident' : 'Hotspot (off)'} ${a.id}: ${a.road || 'unnamed road'} (${a.crash_count} past fatal crashes)`}
+                    zIndex={active ? 30 : 26}
+                  />
+                );
+              })}
+            </>
+          )}
+
+          {/* Charging stops: road via the charger, charger, other chargers, where the battery would hit the reserve */}
+          {chargingPlans.filter(p => p.stop).map(p => (
+            <React.Fragment key={`charge-${p.vehicle_id}`}>
+              {[p.stop.to_charger_path, p.stop.from_charger_path].map((path, i) => (
+                <PolylineF key={i} path={path} options={{ strokeColor: CHARGE_COLOR, strokeOpacity: 0.95, strokeWeight: 4, zIndex: 12 }} />
+              ))}
+              <MarkerF
+                position={{ lat: p.stop.charger.lat, lng: p.stop.charger.lng }}
+                icon={{ path: BOLT_PATH, scale: 1.4, fillColor: CHARGER_FILL, fillOpacity: 1, strokeColor: '#0f172a', strokeWeight: 1.5 }}
+                title={`Vehicle ${p.vehicle_id} charging stop: ${p.stop.charger.name}${p.stop.charger.max_kw ? ` (${p.stop.charger.max_kw} kW)` : ''}`}
+                zIndex={31}
+              />
+            </React.Fragment>
+          ))}
+          {chargingPlans.flatMap(p => (p.alternatives || []).map((c, i) => (
+            <MarkerF
+              key={`charger-alt-${p.vehicle_id}-${i}`}
+              position={{ lat: c.lat, lng: c.lng }}
+              icon={{ path: BOLT_PATH, scale: 0.9, fillColor: '#64748b', fillOpacity: 0.9, strokeColor: '#0f172a', strokeWeight: 1 }}
+              title={`Other charger for vehicle ${p.vehicle_id}: ${c.name}${c.max_kw ? ` (${c.max_kw} kW)` : ''}`}
+              zIndex={22}
+            />
+          )))}
+          {chargingPlans.filter(p => p.needed).map(p => (
+            <MarkerF
+              key={`reserve-${p.vehicle_id}`}
+              position={{ lat: p.reserve_point.lat, lng: p.reserve_point.lng }}
+              icon={{ path: window.google.maps.SymbolPath.CIRCLE, scale: 5, fillColor: '#f97316', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 1.5 }}
+              title={`Vehicle ${p.vehicle_id}: battery would hit the ${p.reserve_pct}% reserve here without charging`}
+              zIndex={24}
             />
           ))}
 
@@ -361,6 +587,18 @@ export default function RouteMap({ results, locations }) {
             />
           ))}
 
+          {/* Drive simulation: the truck, reroutes it takes; clock and prompt go in the overlay */}
+          {drive && driveTrucks && (
+            <DriveSimulation
+              key={drive.runId}
+              trucks={driveTrucks}
+              departureTime={driveDeparture}
+              speed={drive.speed}
+              overlay={overlay}
+              onEnd={onDriveEnd}
+            />
+          )}
+
           {/* Info window on click */}
           {selectedMarker !== null && (() => {
             const s = seq[selectedMarker];
@@ -414,6 +652,8 @@ export default function RouteMap({ results, locations }) {
             );
           })()}
         </GoogleMap>
+        <div ref={setOverlay} className="absolute inset-0 pointer-events-none" />
+        </div>
       )}
     </div>
   );

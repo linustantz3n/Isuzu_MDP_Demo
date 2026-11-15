@@ -37,7 +37,7 @@ function TruckRoute({ index, route, locations }) {
           <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: truckColor(index) }} />
           Truck {index + 1}
           <span className="text-slate-500 font-normal text-xs ml-2">
-            {route.stops} stop{route.stops === 1 ? '' : 's'} · {(route.distance_m / METERS_PER_MILE).toFixed(1)} mi · {(route.time_s / 60).toFixed(0)} min
+            {route.stops} stop{route.stops === 1 ? '' : 's'} · {(route.distance_m / METERS_PER_MILE).toFixed(1)} mi · {(route.time_s / 60).toFixed(0)} min · {route.energy_kwh.toFixed(1)} kWh
           </span>
         </p>
         <div className="flex flex-wrap gap-1.5">
@@ -94,7 +94,7 @@ function AlgorithmRoutes({ row, locations, open, onToggle }) {
         <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: algoColor(row) }} />
         <span className="text-sm text-white flex-1">{row.label}</span>
         <span className="text-xs text-slate-500 font-mono">
-          {m.vehicles_used} truck{m.vehicles_used === 1 ? '' : 's'} · {m.total_distance_mi.toFixed(1)} mi
+          {m.vehicles_used} truck{m.vehicles_used === 1 ? '' : 's'} · {m.total_distance_mi.toFixed(1)} mi · {m.total_energy_kwh.toFixed(1)} kWh
         </span>
       </button>
       {/* Map and route cards mount only while expanded, so Maps/Directions calls happen on demand */}

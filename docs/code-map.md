@@ -31,14 +31,17 @@ One file, in sections, top to bottom:
 | [`geocode_address(address)`](../route_optimizer_backend.py#L47) | Address → `{address, formatted_address, lat, lng}` |
 | [`get_distance_matrix(locations, departure_ts)`](../route_optimizer_backend.py#L72) | n×n driving distance (m) and time (s) matrices, fetched in 10×10 batches. With a departure time, the times are Google's traffic prediction. Pairs Google cannot route become `inf` |
 | [`get_utc_offset(lat, lng, ts)`](../route_optimizer_backend.py#L138) | The depot's UTC offset and time zone (Google Time Zone API) |
-| [`get_directions(locations, order)`](../route_optimizer_backend.py#L152) | Raw Directions API response for an ordered route |
+| [`get_directions(locations, order)`](../route_optimizer_backend.py#L152) | Raw Routes API `computeRoutes` response for an ordered route |
 | [`get_elevation_data(locations)`](../route_optimizer_backend.py#L186) | Elevation in metres per location; all zeros if the call fails |
 
-### Energy model ([explained here](energy-model.md))
+### Energy model ([explained here](energy-model.md)) — in [`energy.py`](../energy.py)
 | Function | Does |
 |---|---|
-| [`calculate_energy_consumption(distance_km, avg_speed_kmh, temperature_c, vehicle_weight_tonnes, altitude_diff_m, altitude_m, has_climate_control=True)`](../route_optimizer_backend.py#L218) | Model E regression for one leg → `{energy_kwh, energy_per_km, energy_per_mile, miles_per_kwh, kwh_per_mile, breakdown}` |
-| [`estimate_average_speed(distance_m, time_s)`](../route_optimizer_backend.py#L340) | Leg average speed in km/h |
+| `calculate_energy_consumption(distance_km, avg_speed_kmh, temperature_c, vehicle_weight_tonnes, altitude_diff_m, altitude_m, has_climate_control=True, driving_style='normal')` | Model E regression for one leg → `{energy_kwh, energy_per_km, ..., breakdown}` |
+| `estimate_average_speed(distance_m, time_s)` | Leg average speed in km/h |
+| `energy_matrix_kwh(dist, time, elevation_m, weight_lbs, ...)` | Model E energy for every pair of stops at one weight (inf when unroutable) |
+| `energy_upper_bound_matrix_wh(dist, time, elevation_m, loaded_weight_lbs, base_weight_lbs, ...)` | Integer Wh per arc that never undershoots the real energy: every battery limit uses it |
+| `battery_limit_wh(battery_kwh, reserve_pct)` | Wh a truck may use before its reserve |
 
 ### Solver registry and recommendation ([explained here](solvers.md#how-apioptimize-decides-what-to-run))
 | Name | Does |
@@ -55,7 +58,6 @@ One file, in sections, top to bottom:
 | Name | Does |
 |---|---|
 | [`GOAL_LEVEL_WEIGHT`, `DEFAULT_GOALS`](../route_optimizer_backend.py#L677), [`normalize_goals`](../route_optimizer_backend.py#L844), [`goal_weights`](../route_optimizer_backend.py#L862) | Goal levels → weights that add up to 1 |
-| [`energy_matrix_kwh`](../route_optimizer_backend.py#L878), [`energy_matrix_wh`](../route_optimizer_backend.py#L901) | Model E energy for every pair of stops at one weight; integer Wh for OR-Tools |
 | [`objective_matrix`](../route_optimizer_backend.py#L907) | **The cost matrix the solvers minimise**: weighted distance / time / energy, priority-stop penalty, balance (span) price |
 | [`precomputed_inputs`](../route_optimizer_backend.py#L965) | Validates matrices and elevations the client sends back, so a re-solve needs no Google calls |
 | [`evaluate_route`](../route_optimizer_backend.py#L1004) | Leg-by-leg distance, time, energy (at the weight on board) and arrival times for any route, including pickups |

@@ -22,6 +22,10 @@ def ctx():
             'temperature_c': 20.0, 'has_climate_control': True, 'unload_s': 1800.0}
 
 
+# Goals with the battery reserve turned off (the default keeps 20%).
+NO_RESERVE = {**be.DEFAULT_GOALS, 'battery_reserve_pct': None}
+
+
 def truck(i, packs=4):
     return {'id': i + 1, 'name': f'Vehicle {i + 1}', 'battery_packs': packs, 'battery_kwh': packs * 20,
             'weight_lbs': round(13000 - 4 * be.PACK_WEIGHT_LBS + packs * be.PACK_WEIGHT_LBS)}
@@ -90,8 +94,14 @@ def test_allowed_vehicles_keep_cargo_on_its_truck():
 
 # ---- fleet routing with goals --------------------------------------------------
 
-def test_fleet_default_serves_everything_and_maps_vehicles(ctx):
-    fleet = be.solve_fleet(ctx, [truck(0), truck(1)], be.DEFAULT_GOALS, time_limit_s=1)
+def test_reserve_defaults_to_20_and_null_turns_it_off():
+    assert be.normalize_goals(None)['battery_reserve_pct'] == 20
+    assert be.normalize_goals({'energy': 'high'})['battery_reserve_pct'] == 20
+    assert be.normalize_goals({'battery_reserve_pct': None})['battery_reserve_pct'] is None
+
+
+def test_fleet_without_reserve_serves_everything_and_maps_vehicles(ctx):
+    fleet = be.solve_fleet(ctx, [truck(0), truck(1)], NO_RESERVE, time_limit_s=1)
     served = sorted(i for r in fleet['routes'] for i in r['order'] if i)
     assert served == [1, 2, 3, 4, 5] and fleet['unserved'] == []
     assert [r['vehicle_index'] for r in fleet['routes']] == sorted(r['vehicle_index'] for r in fleet['routes'])
@@ -182,7 +192,7 @@ def test_limits_check_todays_longest_route():
 
 FORM = {'addresses': ['3301 E Imperial Hwy, Brea, CA', '11232 Knott Ave, Stanton, CA'], 'vehicle_count': 2,
         'battery_packs': 4, 'temperature_c': 20, 'has_climate_control': True, 'solver': 'auto',
-        'goals': dict(be.DEFAULT_GOALS),
+        'goals': dict(NO_RESERVE),
         'plan': {'vehicles': [{'number': 1, 'vehicle_index': 0, 'name': 'Vehicle 1', 'driver': 'Wang', 'stops': 3},
                               {'number': 2, 'vehicle_index': 1, 'name': 'Vehicle 2', 'driver': '', 'stops': 2}]}}
 
@@ -419,13 +429,16 @@ def test_traffic_asks_google_for_the_departure_and_uses_the_traffic_time(monkeyp
     seen = {}
 
     class Resp:
+        status_code = 200
+
         def json(self):
-            el = {'status': 'OK', 'distance': {'value': 1000}, 'duration': {'value': 100},
-                  'duration_in_traffic': {'value': 160}}
-            return {'status': 'OK', 'rows': [{'elements': [el, el]}, {'elements': [el, el]}]}
-    monkeypatch.setattr(be.requests, 'get', lambda url, params=None, **kw: seen.update(params) or Resp())
+            return [{'originIndex': i, 'destinationIndex': j, 'condition': 'ROUTE_EXISTS',
+                     'distanceMeters': 1000, 'duration': '160s'} for i in range(2) for j in range(2)]
+    monkeypatch.setattr(be.requests, 'post', lambda url, json=None, **kw: seen.update(json) or Resp())
+    monkeypatch.setattr(be.time, 'time', lambda: 1_700_000_000)
     out = be.get_distance_matrix([{'lat': 0, 'lng': 0}, {'lat': 1, 'lng': 1}], departure_ts=1_800_000_000)
-    assert seen['departure_time'] == 1_800_000_000 and out['time'][0][1] == 160
+    assert seen['routingPreference'] == 'TRAFFIC_AWARE'
+    assert seen['departureTime'] == '2027-01-15T08:00:00Z' and out['time'][0][1] == 160
 
 
 def test_driving_style_slows_only_cruising_legs_and_orders_the_energy():
@@ -540,15 +553,15 @@ def facts(**kw):
 
 def test_the_most_pressing_problem_is_named():
     f, r = facts()
-    assert be.plan_problem(f, be.DEFAULT_GOALS) is None
+    assert be.plan_problem(f, NO_RESERVE) is None
     dead = dict(r, battery_depleted=True, battery_remaining_pct=0.0, total_energy_kwh=103.0)
     f, _ = facts(routes=[dead])
-    kind, text = be.plan_problem(f, be.DEFAULT_GOALS)
+    kind, text = be.plan_problem(f, NO_RESERVE)
     assert kind == 'battery' and 'needs 103 of 80 kWh' in text
     f, _ = facts(routes=[dict(r, battery_remaining_pct=9.0)])
-    assert be.plan_problem(f, be.DEFAULT_GOALS)[0] == 'thin'
+    assert be.plan_problem(f, NO_RESERVE)[0] == 'thin'
     f, _ = facts(routes=[dict(r, total_time_s=2 * 3600), dict(r, vehicle_name='Vehicle 2', total_time_s=4 * 3600)])
-    kind, text = be.plan_problem(f, be.DEFAULT_GOALS)
+    kind, text = be.plan_problem(f, NO_RESERVE)
     assert kind == 'imbalance' and text.startswith('Vehicle 2 gets back 2h 00m after Vehicle 1')
 
 
@@ -577,7 +590,7 @@ def test_suggestion_on_the_demo_offers_a_tested_fix_as_a_yes_no_question(ctx):
     locs = [dict(loc, lat=0.0, lng=0.0) if isinstance(loc, dict) else {'address': loc, 'lat': 0.0, 'lng': 0.0}
             for loc in ctx['locations']]
     data = {'locations': locs, 'return_to_start': True, 'vehicles': [truck(0), truck(1)], 'solver': 'auto',
-            'energy_params': {'temperature_c': 20}, 'goals': dict(be.DEFAULT_GOALS),
+            'energy_params': {'temperature_c': 20}, 'goals': dict(NO_RESERVE),
             'precomputed': {**ctx['matrices'], 'elevations': ctx['elevations']}}
     data['results'] = be.optimize_payload(dict(data, fleet_time_limit_s=2))['results']
     sug = be.suggest_fix(data)
@@ -587,3 +600,28 @@ def test_suggestion_on_the_demo_offers_a_tested_fix_as_a_yes_no_question(ctx):
     assert sug['message'].endswith('Apply it? (yes / no)')
     # Nothing is suggested without the plan's matrices: no Google calls for a suggestion.
     assert be.suggest_fix(dict(data, precomputed=None)) is None
+
+
+def test_traffic_data_times_every_fleet_truck_for_the_drive_simulation(monkeypatch, ctx):
+    n = len(ctx['locations'])
+    locs = [dict(loc, lat=0.0, lng=0.0) for loc in ctx['locations']]
+    driven = []
+
+    def drive(paths, order, departure_time, unload_s, closes_itself):
+        driven.append((list(order), closes_itself))
+        return [60] * (len(order) - (0 if closes_itself else 1))
+    monkeypatch.setattr(be.traffic_data, 'travel_matrices',
+                        lambda locations, source, dep: {**ctx['matrices'], 'paths': {}})
+    monkeypatch.setattr(be.traffic_data, 'drive_on_ground_truth', drive)
+    monkeypatch.setattr(be, 'get_elevation_data', lambda locations: [0.0] * n)
+    out = be.optimize_payload({'locations': locs, 'vehicles': [truck(0), truck(1)], 'return_to_start': True,
+                               'goals': NO_RESERVE, 'traffic_source': 'forecast',
+                               'departure_time': '2025-11-12T07:30', 'fleet_time_limit_s': 1})
+    routes = out['results']['ortools_fleet']['routes']
+    assert len(routes) == 2
+    for r in routes:
+        t = r['traffic']
+        assert len(t['actual_leg_times_s']) == len(r['legs']) == len(r['order']) - 1
+        assert t['departure_time'] == '2025-11-12T07:30' and t['planned_travel_time_s'] == r['travel_time_s']
+        assert (r['order'], False) in driven      # fleet orders already end at the depot
+    assert out['results']['optimal']['traffic']['actual_leg_times_s']

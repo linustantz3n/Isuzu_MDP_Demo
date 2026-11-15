@@ -74,8 +74,8 @@ levels by hand.
 ## Battery reserve
 
 `battery_reserve_pct` is the share of every truck's battery that must be left when it gets
-back. It can be **not enforced** (the default: battery is reported only), or 0–50%, where
-0% means "never run a truck flat".
+back. It defaults to **20%**, can be set to 0–50% (0% means "never run a truck flat"),
+or set to `null` / "not enforced" so the battery is only reported.
 
 - **Fleet (2+ trucks): enforced.** Each truck gets an energy limit of
   `packs × 20 kWh × (1 − reserve)`. The route energy for the limit is priced at the truck's
