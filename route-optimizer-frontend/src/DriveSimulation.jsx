@@ -259,7 +259,8 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
     <div className="absolute top-3 left-3 pointer-events-auto bg-slate-900/95 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-300 shadow-lg min-w-[230px] max-w-[300px]">
       <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Drive simulation · measured traffic · {trucks.length} trucks</p>
       <p className="text-lg font-semibold text-white leading-tight">{fmtClock(nowMs)}</p>
-      {view.phase === 'prompt' && <p className="mt-0.5 text-red-400">Paused: crash reported ahead of {promptTruck.label}</p>}
+      {/* `prompt`, not view.phase: view lags one animation frame behind a decision */}
+      {promptTruck && <p className="mt-0.5 text-red-400">Paused: crash reported ahead of {promptTruck.label}</p>}
       <ul className="mt-1.5 space-y-1">
         {trucks.map((truck, i) => {
           const v = view.trucks[i];
