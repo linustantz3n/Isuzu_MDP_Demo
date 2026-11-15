@@ -27,3 +27,7 @@ route-optimizer-frontend/node_modules/
 poc_route_planning_v1/
 poc_route_planning_v1.zip
 *:Zone.Identifier
+
+# Fleet memory (runtime state, not source)
+fleet_memory.json
+fleet_memory.json.tmp

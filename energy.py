@@ -7,6 +7,11 @@ without importing each other.
 
 import math
 
+# Driving style is assumed, not fitted: it scales a leg's energy for gentler or
+# harder acceleration than the fitted average (see the backend for how a style
+# also changes cruising speed).
+STYLE_ENERGY_FACTOR = {'eco': 0.95, 'normal': 1.0, 'aggressive': 1.10}
+
 # =============================================================================
 # Energy Consumption Model — Model E regression
 # =============================================================================
@@ -18,7 +23,8 @@ def calculate_energy_consumption(
     vehicle_weight_tonnes: float,
     altitude_diff_m: float,
     altitude_m: float,
-    has_climate_control: bool = True
+    has_climate_control: bool = True,
+    driving_style: str = 'normal'
 ) -> dict:
     """
     Calculate energy consumption using Model E polynomial regression.
@@ -45,6 +51,9 @@ def calculate_energy_consumption(
         altitude_diff_m:       Elevation change over leg in m (+ = uphill)
         altitude_m:            Absolute elevation at leg start in m (above sea level)
         has_climate_control:   HVAC active (additive overhead, not in regression)
+        driving_style:         'eco' / 'normal' / 'aggressive': scales the energy for
+                               how hard the driver accelerates (assumed factor,
+                               STYLE_ENERGY_FACTOR; not in the regression)
 
     Returns:
         Dict with energy_kwh and breakdown
@@ -94,6 +103,12 @@ def calculate_energy_consumption(
     hvac_per_km = 0.092 if has_climate_control else 0.0
     energy_per_km += hvac_per_km
 
+    # Driving style: harder or gentler acceleration than the fitted average.
+    # Only on a leg that uses energy; regen on a steep downhill is left alone.
+    style_per_km = (energy_per_km * (STYLE_ENERGY_FACTOR.get(driving_style, 1.0) - 1)
+                    if energy_per_km > 0 else 0.0)
+    energy_per_km += style_per_km
+
     total_energy_kwh = energy_per_km * dist
 
     dist_miles = distance_km * 0.621371
@@ -118,6 +133,7 @@ def calculate_energy_consumption(
             "aero_temp_kwh":       b8 * v**2 * T  * dist,
             "aero_alt_kwh":        b9 * v**2 * h  * dist,
             "climate_control_kwh": hvac_per_km    * dist,
+            "driving_style_kwh":   style_per_km   * dist,
         }
     }
 
@@ -155,6 +171,48 @@ def battery_limit_wh(battery_kwh: float, reserve_pct: float) -> int:
     return int(math.floor(usable * 1000))
 
 
+def finite(x) -> bool:
+    return x is not None and isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def energy_matrix_kwh(
+    dist: list,
+    time: list,
+    elevation_m: list,
+    weight_lbs: float,
+    temperature_c: float,
+    has_climate_control: bool = True,
+    driving_style: str = 'normal',
+) -> list:
+    """Model E energy (kWh) for every ordered pair of locations at one truck
+    weight. An unroutable pair (no finite distance or time) is inf."""
+    n = len(dist)
+    elev = elevation_m or [0.0] * n
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d, t = dist[i][j], time[i][j]
+            if not (finite(d) and finite(t)):
+                out[i][j] = float('inf')
+                continue
+            out[i][j] = calculate_energy_consumption(
+                distance_km=d / 1000,
+                avg_speed_kmh=estimate_average_speed(d, t),
+                temperature_c=temperature_c,
+                vehicle_weight_tonnes=weight_lbs / LBS_PER_TONNE,
+                altitude_diff_m=elev[j] - elev[i],
+                altitude_m=elev[i],
+                has_climate_control=has_climate_control,
+                driving_style=driving_style,
+            )["energy_kwh"]
+    return out
+
+
+UNROUTABLE_WH = 10 ** 9   # energy of an arc that cannot be driven: more than any battery
+
+
 def energy_upper_bound_matrix_wh(
     dist: list,
     time: list,
@@ -163,42 +221,32 @@ def energy_upper_bound_matrix_wh(
     base_weight_lbs: float,
     temperature_c: float,
     has_climate_control: bool = True,
+    driving_style: str = 'normal',
+    empty_return: bool = True,
 ) -> list:
     """
     Directed arc energy (whole Wh) that never undershoots the weight-aware
-    energy the fleet solver reports for that arc.
+    energy the solvers report for that arc. Used for every battery limit.
 
-    A truck leaves the depot loaded and sheds cargo at every stop, so on any
-    outbound arc it weighs somewhere between base and loaded. Energy is linear
-    in weight, so the larger of the two endpoints bounds every weight in
+    A truck weighs somewhere between base and loaded on any arc. Energy is
+    linear in weight, so the larger of the two endpoints bounds every weight in
     between (the heavier end is not always the costlier one: on steep
-    downhills more weight means more regen). Return arcs (into the depot) are
-    always driven empty. Negative arcs are clamped to 0 and values rounded up,
-    so a route that fits under the limit with these numbers fits in reality.
+    downhills more weight means more regen). With empty_return, arcs into the
+    depot (node 0) are priced at base weight only, for plans where a truck is
+    always empty by the time it heads home. Negative arcs are clamped to 0 and
+    values rounded up, so a route that fits under the limit with these numbers
+    fits in reality. Unroutable arcs get UNROUTABLE_WH.
     """
     n = len(dist)
-
-    def leg(i, j, weight_lbs):
-        elev_i = elevation_m[i] if elevation_m else 0.0
-        elev_j = elevation_m[j] if elevation_m else 0.0
-        return calculate_energy_consumption(
-            distance_km=dist[i][j] / 1000,
-            avg_speed_kmh=estimate_average_speed(dist[i][j], time[i][j]),
-            temperature_c=temperature_c,
-            vehicle_weight_tonnes=weight_lbs / LBS_PER_TONNE,
-            altitude_diff_m=elev_j - elev_i,
-            altitude_m=elev_i,
-            has_climate_control=has_climate_control,
-        )["energy_kwh"]
-
+    loaded = energy_matrix_kwh(dist, time, elevation_m, loaded_weight_lbs, temperature_c,
+                               has_climate_control, driving_style)
+    base = energy_matrix_kwh(dist, time, elevation_m, base_weight_lbs, temperature_c,
+                             has_climate_control, driving_style)
     out = [[0] * n for _ in range(n)]
     for i in range(n):
         for j in range(n):
-            if i == j or dist[i][j] <= 0:
+            if i == j:
                 continue
-            if j == 0:
-                kwh = leg(i, j, base_weight_lbs)
-            else:
-                kwh = max(leg(i, j, loaded_weight_lbs), leg(i, j, base_weight_lbs))
-            out[i][j] = int(math.ceil(max(0.0, kwh) * 1000))
+            kwh = base[i][j] if (empty_return and j == 0) else max(loaded[i][j], base[i][j])
+            out[i][j] = int(math.ceil(max(0.0, kwh) * 1000)) if finite(kwh) else UNROUTABLE_WH
     return out

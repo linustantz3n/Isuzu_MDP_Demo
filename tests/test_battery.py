@@ -109,7 +109,7 @@ def test_benchmark_ortools_respects_battery_limit():
 def api(monkeypatch):
     problem = make_problem(n_stops=6, seed=3)
     monkeypatch.setattr(backend, "get_distance_matrix",
-                        lambda locs: {"distance": problem.dist, "time": problem.time})
+                        lambda locs, departure_ts=None: {"distance": problem.dist, "time": problem.time})
     monkeypatch.setattr(backend, "get_elevation_data", lambda locs: [0.0] * len(locs))
     client = backend.app.test_client()
 
@@ -127,20 +127,24 @@ def _vehicle(i, packs=4):
 
 
 def test_api_fleet_routes_stay_above_reserve(api):
-    res = api([_vehicle(1), _vehicle(2)])
+    # A reserve sent in energy_params is used as the battery reserve goal.
+    res = api([_vehicle(1), _vehicle(2)], battery_reserve_pct=20)
     assert res.status_code == 200
-    fleet = res.get_json()["results"]["ortools_fleet"]
-    assert fleet["battery_reserve_pct"] == 20
-    for r in fleet["routes"]:
-        assert r["battery_remaining_pct"] >= 20 and not r["below_battery_reserve"]
-
-
-def test_api_reports_battery_limit_as_422(api):
-    res = api([_vehicle(1), _vehicle(2)], battery_reserve_pct=99.5)
-    assert res.status_code == 422
     body = res.get_json()
-    assert body["error_type"] == "battery_limit" and body["unreachable_stops"]
+    fleet = body["results"]["ortools_fleet"]
+    assert body["goals"]["battery_reserve_pct"] == 20 and not fleet["unserved"]
+    for r in fleet["routes"]:
+        assert r["battery_remaining_pct"] >= 20 and r["battery_reserve_ok"]
 
 
-def test_api_rejects_bad_reserve(api):
-    assert api([_vehicle(1), _vehicle(2)], battery_reserve_pct=100).status_code == 400
+def test_api_reports_stops_out_of_battery_range_as_unserved(api):
+    tiny = [{**_vehicle(1), "battery_kwh": 1}, {**_vehicle(2), "battery_kwh": 1}]
+    res = api(tiny, battery_reserve_pct=20)
+    assert res.status_code == 200
+    assert res.get_json()["results"]["ortools_fleet"]["unserved"]
+
+
+def test_api_clamps_the_reserve(api):
+    res = api([_vehicle(1), _vehicle(2)], battery_reserve_pct=100)
+    assert res.status_code == 200
+    assert res.get_json()["goals"]["battery_reserve_pct"] == backend.MAX_RESERVE_PCT

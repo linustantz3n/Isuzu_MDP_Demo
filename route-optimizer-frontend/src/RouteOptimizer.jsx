@@ -1,11 +1,26 @@
-import React, { useState } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, TriangleAlert, RotateCcw, Play, Square } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, User, BarChart3, Activity, Star, AlertTriangle, TriangleAlert, ArrowLeftRight, RotateCcw, Play, Square } from 'lucide-react';
 import RouteMap from './RouteMap';
 import { SIM_SPEEDS } from './DriveSimulation';
 import FleetCharts from './FleetCharts';
+import AIChatbot from './AIChatbot';
 import BenchmarkPanel from './BenchmarkPanel';
 import BenchmarkSimulation from './BenchmarkSimulation';
+import GoalsPanel from './GoalsPanel';
+import PlanComparison from './PlanComparison';
+import { DEFAULT_GOALS, goalsSummary, trafficLabel } from './goals';
+import { planOf, metricRows, impactText, shortPlace, formatClock, depletionText } from './planDiff';
 import { API_BASE } from './api';
+
+const locationsKey = (locs) => locs.map(l => `${l.lat},${l.lng}`).join('|');
+const MAX_VERSIONS = 12;
+
+// Which sidebar section a chat change lands in, so it can flash.
+const AXIS_SECTION = {
+  goals: 'goals', priority_stops: 'goals', traffic: 'goals', driving_style: 'goals', depot: 'stops', addresses: 'stops',
+  vehicle_count: 'vehicles', battery_packs: 'vehicles', vehicle_weight_lbs: 'vehicles', fleet: 'vehicles',
+  temperature_c: 'conditions', unload_time_min: 'conditions', has_climate_control: 'conditions',
+};
 
 // Demo replanning: this many historical crash hotspots on the route, each toggled on/off as an accident
 const NUM_ACCIDENTS = 3;
@@ -50,6 +65,12 @@ const TRAFFIC_DAYS = [
 ];
 const label = (options, value) => options.find(([v]) => v === value)?.[1] ?? value;
 
+// Reserve a fleet route's battery is checked against for charging stops: the
+// battery reserve goal it was planned with, or 20% when no reserve goal is set.
+const CHARGE_RESERVE_PCT = 20;
+const reserveOf = (route) => route.battery_reserve_pct ?? CHARGE_RESERVE_PCT;
+const belowReserve = (route) => route.battery_remaining_pct < reserveOf(route);
+
 function RouteOptimizer() {
   const [activeTab, setActiveTab] = useState('solver');
   const [addresses, setAddresses] = useState(['', '', '']);
@@ -74,18 +95,43 @@ function RouteOptimizer() {
   const [chargingPlans, setChargingPlans] = useState(null);  // /api/plan_charging plans by vehicle_id
   const [planningCharging, setPlanningCharging] = useState(false);
   const [chargingError, setChargingError] = useState(null);
-  const [traffic, setTraffic] = useState({ source: 'google', day: '2025-11-12', time: '07:30' });
+  // Travel times from the traffic data package (source/day/time); 'google' = not used.
+  // Separate from `traffic` below (Google's prediction for a departure time).
+  const [trafficData, setTrafficData] = useState({ source: 'google', day: '2025-11-12', time: '07:30' });
+  // 'auto' lets the backend price Held-Karp before running it; the chatbot can
+  // pin a specific solver via the `solver` axis.
+  const [solver, setSolver] = useState('auto');
   const [energyParams, setEnergyParams] = useState({
     temperature_c: 20,
     total_weight_lbs: 19500,
     base_weight_lbs: 7000,
     unload_time_min: 30,
-    has_climate_control: true
+    has_climate_control: true,
+    driving_style: 'normal',
   });
+  // Traffic: null = Google's typical times, 'now' or 'HH:MM' = traffic for that departure.
+  const [traffic, setTraffic] = useState(null);
+  // What the solver optimizes for. The assistant picks these from plain language.
+  const [goals, setGoals] = useState(DEFAULT_GOALS);
+  const [goalsSetBy, setGoalsSetBy] = useState(null);
+  const [priorityStops, setPriorityStops] = useState([]);
+  // Every solve is kept as a version so any two can be compared side by side.
+  const [versions, setVersions] = useState([]);
+  const [compareBase, setCompareBase] = useState(null);
+  const [showCompare, setShowCompare] = useState(true);
+  const [stale, setStale] = useState(null);
+  const [resolvingNote, setResolvingNote] = useState(null);
+  const [flash, setFlash] = useState({});
+  // The open chat panel takes the right edge; on wide screens the page moves over for it.
+  const [chatDocked, setChatDocked] = useState(false);
+  const dockRoom = chatDocked ? 'xl:mr-[31.5rem]' : '';
+  const [resolveRequest, setResolveRequest] = useState(null);
+  const resolveWaiters = useRef({});
+  const mainRef = useRef(null);
 
-  const updateTraffic = (field, value) => {
-    setTraffic({ ...traffic, [field]: value });
-    setResults(null);
+  const updateTrafficData = (field, value) => {
+    setTrafficData({ ...trafficData, [field]: value });
+    if (results) setStale('Travel times changed — click Optimize Routes to re-solve.');
   };
 
   const addVehicle = () => {
@@ -167,67 +213,47 @@ function RouteOptimizer() {
     setResults(null);
   };
 
+  // Geocode the depot and every stop. Returns the locations and stores them;
+  // throws with a readable message on failure.
+  const geocodeAll = async () => {
+    const validAddresses = addresses.filter(a => a.trim());
+    if (validAddresses.length < 2) throw new Error('Please enter at least 2 addresses');
+    if (useDepot && !depot.trim()) throw new Error('Please enter a depot address');
+
+    const depotResponse = await fetch(`${API_BASE}/geocode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: depot })
+    });
+    const depotData = await depotResponse.json();
+    if (depotData.status === 'error') {
+      throw new Error(`Failed to geocode depot: ${depotData.message}`);
+    }
+
+    const response = await fetch(`${API_BASE}/geocode_batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ addresses: validAddresses })
+    });
+    const data = await response.json();
+    if (data.status === 'error') throw new Error(data.message);
+    if (data.errors && data.errors.length > 0) {
+      throw new Error(`Failed to geocode: ${data.errors.map(e => e.address).join(', ')}`);
+    }
+    const validLocations = data.results.filter(r => r !== null);
+    if (validLocations.length < 2) throw new Error('Need at least 2 valid locations after geocoding');
+
+    setValidatedDepot(depotData.result);
+    setValidatedLocations(validLocations);
+    return [depotData.result, ...validLocations];
+  };
+
   const validateAddresses = async () => {
     setValidating(true);
     setError(null);
     setResults(null);
-
-    const validAddresses = addresses.filter(a => a.trim());
-
-    if (validAddresses.length < 2) {
-      setError('Please enter at least 2 addresses');
-      setValidating(false);
-      return;
-    }
-
-    if (useDepot && !depot.trim()) {
-      setError('Please enter a depot address');
-      setValidating(false);
-      return;
-    }
-
     try {
-      if (useDepot && depot.trim()) {
-        const depotResponse = await fetch(`${API_BASE}/geocode`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address: depot })
-        });
-
-        const depotData = await depotResponse.json();
-
-        if (depotData.status === 'error') {
-          throw new Error(`Failed to geocode depot: ${depotData.message}`);
-        }
-
-        setValidatedDepot(depotData.result);
-      }
-
-      const response = await fetch(`${API_BASE}/geocode_batch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ addresses: validAddresses })
-      });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
-
-      if (data.errors && data.errors.length > 0) {
-        const errorMsg = `Failed to geocode: ${data.errors.map(e => e.address).join(', ')}`;
-        throw new Error(errorMsg);
-      }
-
-      const validLocations = data.results.filter(r => r !== null);
-
-      if (validLocations.length < 2) {
-        throw new Error('Need at least 2 valid locations after geocoding');
-      }
-
-      setValidatedLocations(validLocations);
-
+      await geocodeAll();
     } catch (err) {
       setError(err.message || 'Failed to validate addresses');
       setValidatedLocations([]);
@@ -236,6 +262,92 @@ function RouteOptimizer() {
       setValidating(false);
     }
   };
+
+  // Settings a version was solved with, for the before / after comparison.
+  const snapshotSettings = () => ({
+    goals: { ...goals },
+    priorityStops: [...priorityStops],
+    vehicles: vehicles.map(v => ({ ...v })),
+    energyParams: { ...energyParams },
+    traffic,
+    trafficData: { ...trafficData },
+    solver,
+    depot,
+    stops: addresses.filter(a => a.trim()),
+  });
+
+  // Stop i on the form is location i + 1 (the depot is 0).
+  const priorityIndices = () => {
+    const stops = addresses.filter(a => a.trim());
+    return priorityStops.map(p => stops.indexOf(p)).filter(i => i >= 0).map(i => i + 1);
+  };
+
+  // One solve. Sends back the matrices of the last solve of these same
+  // locations, so a re-solve after a chat change makes no Google calls.
+  const callOptimize = async (locations, previous) => {
+    const body = {
+      locations,
+      mode: 'distance',
+      return_to_start: useDepot,
+      num_vehicles: vehicles.length,
+      vehicles,
+      energy_params: energyParams,
+      solver,
+      goals,
+      priority_stops: priorityIndices(),
+      traffic: traffic ? { departure: traffic } : null,
+      traffic_source: trafficData.source,
+      departure_time: trafficData.source === 'google' ? undefined : `${trafficData.day}T${trafficData.time}`,
+    };
+    // Kept with the version (without the matrices), so the suggestion check can
+    // re-solve the same request with a fix.
+    const request = { ...body };
+    // Matrices fetched for other traffic settings are not reused.
+    if (previous?.inputs && locationsKey(previous.locations) === locationsKey(locations)
+        && (previous.inputs.traffic?.departure ?? null) === traffic && trafficData.source === 'google') {
+      body.precomputed = previous.inputs;
+    }
+    const response = await fetch(`${API_BASE}/optimize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await response.json();
+    if (data.status === 'error') throw new Error(data.message);
+    return {
+      // `solver` rides along on results so the panel and the data stay in sync.
+      results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [],
+                 traffic: data.traffic || null, driving_style: data.energy_params?.driving_style || 'normal' },
+      inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations,
+                traffic: data.traffic || null },
+      request,
+    };
+  };
+
+  const commitVersion = ({ results: r, locations, inputs, request, label, source, trigger, settings, baseId }) => {
+    const prev = versions[versions.length - 1];
+    const v = {
+      id: (prev?.id || 0) + 1, label, source, trigger: trigger || null,
+      results: r, locations, inputs, request: request || null, settings: settings || snapshotSettings(),
+    };
+    setVersions(list => [...list, v].slice(-MAX_VERSIONS));
+    setCompareBase(baseId ?? prev?.id ?? null);
+    setShowCompare(true);
+    setResults(r);
+    setLastLocations(locations);
+    setStale(null);
+    setReplan(null);
+    setReplanError(null);
+    setDrive(null);
+    setChargingPlans(null);
+    setChargingError(null);
+    if (prev) mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    return v;
+  };
+
+  const currentVersion = versions[versions.length - 1];
+  // The plan a breakdown is simulated on: the latest one that is not itself a breakdown.
+  const cleanVersion = [...versions].reverse().find(v => !v.results.ortools_fleet?.disruption);
 
   const optimizeRoute = async () => {
     if (validatedLocations.length < 2) {
@@ -255,37 +367,11 @@ function RouteOptimizer() {
       const locationsToOptimize = useDepot
         ? [validatedDepot, ...validatedLocations]
         : validatedLocations;
-
-      const response = await fetch(`${API_BASE}/optimize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          locations: locationsToOptimize,
-          // With traffic data, optimize for time so traffic can change the stop order
-          mode: traffic.source === 'google' ? 'distance' : 'time',
-          traffic_source: traffic.source,
-          departure_time: traffic.source === 'google' ? undefined : `${traffic.day}T${traffic.time}`,
-          return_to_start: useDepot,
-          num_vehicles: vehicles.length,
-          vehicles: vehicles,
-          energy_params: energyParams
-        })
+      const out = await callOptimize(locationsToOptimize, currentVersion);
+      commitVersion({
+        ...out, locations: locationsToOptimize,
+        label: versions.length ? 'Re-run by hand' : 'Initial plan', source: 'manual',
       });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        const far = (data.unreachable_stops || []).map(l => l.name || l.address).join('; ');
-        throw new Error(far ? `${data.message} Out of range: ${far}` : data.message);
-      }
-
-      setResults(data.results);
-      setLastLocations(locationsToOptimize);
-      setReplan(null);
-      setReplanError(null);
-      setDrive(null);
-      setChargingPlans(null);
-      setChargingError(null);
     } catch (err) {
       setError(err.message || 'Failed to optimize route');
     } finally {
@@ -330,12 +416,12 @@ function RouteOptimizer() {
     setChargingError(null);
 
     try {
-      const lowRoutes = results.ortools_fleet.routes.filter(r => r.battery_below_reserve);
+      const lowRoutes = results.ortools_fleet.routes.filter(belowReserve);
       const response = await fetch(`${API_BASE}/plan_charging`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          vehicles: lowRoutes.map(r => ({ vehicle_id: r.vehicle_id, battery_kwh: r.battery_capacity_kwh, legs: r.legs })),
+          vehicles: lowRoutes.map(r => ({ vehicle_id: r.vehicle_id, battery_kwh: r.battery_capacity_kwh, reserve_pct: reserveOf(r), legs: r.legs })),
           energy_params: energyParams
         })
       });
@@ -359,6 +445,151 @@ function RouteOptimizer() {
   };
 
   const activeLegs = (replan && activeAccidents.length > 0 && replan.scenarios[scenarioKey(activeAccidents)]) || [];
+  // ── Chat-driven re-solve ──────────────────────────────────────────────
+  // The chatbot applies its changes, then hands the turn here. The re-solve
+  // runs in an effect so it sees the state those changes produced.
+  const handleChatTurn = (turn) => new Promise(resolve => {
+    if (turn.lang) chatLang.current = turn.lang;
+    const wantsRun = turn.action?.type === 'resolve';
+    if (!results && !wantsRun && turn.action?.type !== 'breakdown') return resolve(null);
+    const id = Date.now() + Math.random();
+    resolveWaiters.current[id] = resolve;
+    setResolveRequest({ id, ...turn });
+  });
+
+  // After each solve, ask whether the plan has a problem worth fixing. The
+  // backend tests candidate fixes by re-solving with the same matrices, and the
+  // chat offers one that works as a yes / no question. A suggestion already
+  // made for these same settings (taken or turned down) is not made again.
+  const [proactive, setProactive] = useState(null);
+  const suggested = useRef(new Set());
+  const chatLang = useRef('en');
+  useEffect(() => {
+    const v = versions[versions.length - 1];
+    if (!v?.request || v.source === 'breakdown' || v.results?.ortools_fleet?.disruption) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/suggest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...v.request, precomputed: v.inputs, results: v.results, lang: chatLang.current }),
+        });
+        const s = (await res.json()).suggestion;
+        if (cancelled || !s) return;
+        const key = `${s.kind}|${s.fix?.label || '-'}|${JSON.stringify(v.settings)}`;
+        if (suggested.current.has(key)) return;
+        suggested.current.add(key);
+        setProactive({ id: `v${v.id}-${s.kind}`, ...s });
+      } catch { /* a suggestion is optional */ }
+    })();
+    return () => { cancelled = true; };
+  }, [versions]);
+
+  const runBreakdown = async (req) => {
+    const base = cleanVersion;
+    if (!base) return { error: true, text: 'Run Optimize first — a breakdown is simulated on the current plan.' };
+    const r = base.results;
+    const plan = r.ortools_fleet
+      ? r.ortools_fleet.routes.map(rt => ({ vehicle_index: rt.vehicle_index, order: rt.order }))
+      : [{ vehicle_index: 0, order: [...r.optimal.order, 0] }];
+    const a = req.action;
+    const response = await fetch(`${API_BASE}/replan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        locations: base.locations,
+        vehicles: base.settings.vehicles,
+        energy_params: base.settings.energyParams,
+        goals: base.settings.goals,
+        plan,
+        event: { vehicle_index: a.vehicle_index, after_stop: a.after_stop, at_minute: a.at_minute, spare_truck: a.spare_truck },
+        precomputed: base.inputs,
+        lang: req.lang,
+      })
+    });
+    const data = await response.json();
+    if (data.status === 'error') throw new Error(data.message);
+    if (data.nothing) return { text: data.message };
+    const after = { ...r, ortools_fleet: data.results.ortools_fleet };
+    const v = commitVersion({
+      results: after, locations: base.locations, inputs: base.inputs, settings: base.settings,
+      label: `Breakdown · ${a.vehicle_label}`, source: 'breakdown',
+      trigger: { text: req.text, note: data.message }, baseId: base.id,
+    });
+    const before = planOf(r), now = planOf(after);
+    return { text: `${data.message} (v${v.id} — see "What changed" above the results.)`, rows: metricRows(before, now) };
+  };
+
+  const runChatResolve = async (req) => {
+    const before = currentVersion;
+    let locations = useDepot && validatedDepot && validatedLocations.length >= 2
+      ? [validatedDepot, ...validatedLocations] : null;
+    if (!locations) {
+      setResolvingNote('Geocoding the new stops…');
+      locations = await geocodeAll();
+    }
+    setResolvingNote('Re-solving with your chat changes…');
+    const out = await callOptimize(locations, before);
+    const label = req.changes[0]?.label || (before ? 'Re-run' : 'Initial plan');
+    const v = commitVersion({
+      ...out, locations, label: req.changes.length > 1 ? `${label} +${req.changes.length - 1}` : label,
+      source: 'chat', trigger: { text: req.text },
+    });
+    const pb = planOf(before?.results), pa = planOf(out.results);
+    if (!pb) {
+      return { text: `Optimized: ${pa.label}, ${(pa.distance_m / 1609.34).toFixed(1)} mi, ${pa.energy_kwh.toFixed(1)} kWh. Tell me what matters today and I'll re-tune it.` };
+    }
+    return {
+      text: impactText(pb, pa, { lang: req.lang, versionLabel: `v${v.id}`, cleared: !!before.results.ortools_fleet?.disruption }),
+      rows: metricRows(pb, pa),
+    };
+  };
+
+  useEffect(() => {
+    if (!resolveRequest) return;
+    const req = resolveRequest;
+    setResolveRequest(null);
+    (async () => {
+      let out;
+      setResolvingNote(req.action?.type === 'breakdown' ? 'Simulating the breakdown and re-planning…' : 'Re-solving with your chat changes…');
+      try {
+        out = req.action?.type === 'breakdown' ? await runBreakdown(req) : await runChatResolve(req);
+      } catch (err) {
+        setStale(`Couldn't re-solve: ${err.message}`);
+        out = { error: true, text: `Couldn't re-solve: ${err.message}` };
+      } finally {
+        setResolvingNote(null);
+      }
+      resolveWaiters.current[req.id]?.(out);
+      delete resolveWaiters.current[req.id];
+    })();
+  }, [resolveRequest]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A priority star belongs to a stop; when the stop is edited away, so is the star.
+  useEffect(() => {
+    const stops = addresses.map(a => a.trim());
+    setPriorityStops(prev => (prev.every(p => stops.includes(p)) ? prev : prev.filter(p => stops.includes(p))));
+  }, [addresses]);
+
+  const flashSection = (name) => {
+    if (!name) return;
+    setFlash(f => ({ ...f, [name]: true }));
+    setTimeout(() => setFlash(f => ({ ...f, [name]: false })), 2600);
+  };
+
+  const togglePriority = (address) => {
+    const a = address.trim();
+    if (!a) return;
+    setPriorityStops(prev => prev.includes(a) ? prev.filter(p => p !== a) : [...prev, a]);
+    if (results) setStale('Priority stops changed — click Optimize Routes to re-solve.');
+  };
+
+  const updateGoalsByHand = (next) => {
+    setGoals(next);
+    setGoalsSetBy(null);
+    if (results) setStale('Goals changed — click Optimize Routes to re-solve.');
+  };
 
   const formatDistance = (meters) => {
     const miles = meters / 1609.34;
@@ -383,6 +614,144 @@ function RouteOptimizer() {
 
   const isDepotValidated = () => {
     return useDepot && depot.trim() && validatedDepot !== null;
+  };
+
+  // Chatbot "apply change" outcome: one call touches exactly one axis. The
+  // plan on screen stays put — it is the "before" of the re-solve that
+  // follows the chat turn (handleChatTurn) — and the section that changed flashes.
+  const applyChatChange = ({ axis, op, value, evidence }) => {
+    flashSection(AXIS_SECTION[axis]);
+    if (results) setStale('Settings changed — the plan below is from before.');
+    switch (axis) {
+      case 'depot':
+        setDepot(value);
+        setValidatedDepot(null);
+        break;
+      case 'addresses':
+        setAddresses(prev => {
+          const current = prev.filter(a => a.trim());
+          let next;
+          if (op === 'add') next = [...current, ...value];
+          else if (op === 'remove') next = current.filter(a => !value.some(v => a.toLowerCase().includes(v.toLowerCase())));
+          else next = [...value];
+          while (next.length < 2) next.push('');
+          return next;
+        });
+        setValidatedLocations([]);
+        break;
+      case 'priority_stops':
+        setPriorityStops(prev => {
+          if (op === 'add') return [...prev, ...value.filter(v => !prev.includes(v))];
+          if (op === 'remove') return prev.filter(p => !value.includes(p));
+          return [...value];
+        });
+        break;
+      case 'goals':
+        setGoals(value);
+        setGoalsSetBy({ evidence });
+        break;
+      case 'vehicle_count':
+        setVehicles(prev => {
+          if (value <= prev.length) return prev.slice(0, value);
+          const out = [...prev];
+          while (out.length < value) {
+            const id = out.length ? Math.max(...out.map(v => v.id)) + 1 : 1;
+            out.push({ id, name: `Vehicle ${id}`, weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 });
+          }
+          return out;
+        });
+        break;
+      case 'battery_packs':
+        setVehicles(prev => prev.map(v => ({
+          ...v,
+          battery_packs: value,
+          battery_kwh: value * 20,
+          weight_lbs: Math.round(BASE_WEIGHT_NO_BATTERY + value * PACK_WEIGHT_LBS),
+        })));
+        break;
+      case 'vehicle_weight_lbs':
+        setVehicles(prev => prev.map(v => ({ ...v, weight_lbs: value })));
+        break;
+      case 'temperature_c':
+      case 'unload_time_min':
+      case 'has_climate_control':
+        setEnergyParams(prev => ({ ...prev, [axis]: value }));
+        break;
+      case 'solver':
+        setSolver(value);
+        break;
+      case 'driving_style':
+        setEnergyParams(prev => ({ ...prev, driving_style: value }));
+        break;
+      case 'traffic':
+        setTraffic(value?.departure || null);
+        break;
+      case 'fleet':
+        // A memory recall: one vehicle per recalled driver. A driver profile may
+        // carry its truck's packs and weight; whatever it leaves out, that
+        // vehicle slot keeps (packs alone re-derive the weight, as above).
+        setVehicles(prev => value.map((v, i) => {
+          const base = prev[i] || { name: `Vehicle ${i + 1}`, battery_packs: 4, weight_lbs: 13000 };
+          const packs = v.battery_packs ?? base.battery_packs;
+          const weight = v.weight_lbs ?? (v.battery_packs != null
+            ? Math.round(BASE_WEIGHT_NO_BATTERY + packs * PACK_WEIGHT_LBS)
+            : base.weight_lbs);
+          return {
+            id: i + 1,
+            name: base.name,
+            battery_packs: packs,
+            battery_kwh: packs * 20,
+            weight_lbs: weight,
+            driver: v.driver || '',
+          };
+        }));
+        break;
+      default:
+        break;
+    }
+  };
+
+  // Snapshot the chatbot sends with every message so relative requests
+  // ("one more truck") resolve against what is actually on screen.
+  const chatFormState = {
+    depot,
+    addresses: addresses.filter(a => a.trim()),
+    vehicle_count: vehicles.length,
+    battery_packs: vehicles[0]?.battery_packs ?? 4,
+    vehicle_weight_lbs: vehicles[0]?.weight_lbs ?? 13000,
+    fleet: vehicles.map(v => ({
+      name: v.name, battery_packs: v.battery_packs,
+      weight_lbs: v.weight_lbs, driver: v.driver || '',
+    })),
+    temperature_c: energyParams.temperature_c,
+    unload_time_min: energyParams.unload_time_min,
+    has_climate_control: energyParams.has_climate_control,
+    driving_style: energyParams.driving_style,
+    traffic: { departure: traffic },
+    solver,
+    goals,
+    priority_stops: priorityStops,
+    // The plan a breakdown would be simulated on, and what each truck's route needs.
+    plan: (() => {
+      const p = planOf(cleanVersion?.results);
+      if (!p) return null;
+      const fleetRoutes = cleanVersion.results.ortools_fleet?.routes;
+      return {
+        kind: p.kind,
+        vehicles: fleetRoutes
+          ? fleetRoutes.map(r => ({
+              number: r.vehicle_index + 1, vehicle_index: r.vehicle_index, name: r.vehicle_name,
+              driver: r.driver || '', stops: r.num_delivery_stops,
+              energy_kwh: Math.round(r.total_energy_kwh * 10) / 10, battery_pct: r.battery_remaining_pct,
+            }))
+          : [{
+              number: 1, vehicle_index: 0, name: vehicles[0]?.name || 'Vehicle 1', driver: vehicles[0]?.driver || '',
+              stops: cleanVersion.results.optimal.weight_params?.num_delivery_stops ?? 0,
+              energy_kwh: Math.round(cleanVersion.results.optimal.total_energy_kwh * 10) / 10,
+              battery_pct: cleanVersion.results.optimal.battery_remaining_pct,
+            }],
+      };
+    })(),
   };
 
   const hk = results?.optimal;
@@ -444,7 +813,7 @@ function RouteOptimizer() {
       </header>
 
       {/* ── Benchmark tab (kept mounted so results survive tab switches) ── */}
-      <div className={`flex flex-1 min-h-0 ${activeTab === 'benchmark' ? '' : 'hidden'}`}>
+      <div className={`flex flex-1 min-h-0 ${dockRoom} ${activeTab === 'benchmark' ? '' : 'hidden'}`}>
         <BenchmarkPanel />
       </div>
 
@@ -454,11 +823,28 @@ function RouteOptimizer() {
       </div>
 
       {/* ── Body ───────────────────────────────────────────── */}
-      <div className={`flex flex-1 min-h-0 ${activeTab === 'solver' ? '' : 'hidden'}`}>
+      <div className={`flex flex-1 min-h-0 ${dockRoom} ${activeTab === 'solver' ? '' : 'hidden'}`}>
 
         {/* ── Sidebar ──────────────────────────────────────── */}
         <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0">
           <div className="flex-1 overflow-y-auto p-5 space-y-6">
+
+            <GoalsPanel
+              goals={goals}
+              onChange={updateGoalsByHand}
+              priorityStops={priorityStops}
+              onRemovePriority={togglePriority}
+              setBy={goalsSetBy}
+              hot={flash.goals}
+              vehicleCount={vehicles.length}
+              traffic={traffic}
+              onTrafficChange={(t) => { setTraffic(t); if (results) setStale('Traffic changed — click Optimize Routes to re-solve.'); }}
+              drivingStyle={energyParams.driving_style}
+              onStyleChange={(st) => { setEnergyParams(p => ({ ...p, driving_style: st }));
+                                       if (results) setStale('Driving style changed — click Optimize Routes to re-solve.'); }}
+            />
+
+            <div className="border-t border-slate-800" />
 
             {/* Vehicle Parameters */}
             <section>
@@ -481,7 +867,7 @@ function RouteOptimizer() {
               </div>
 
               {/* Ambient conditions */}
-              <div className="space-y-3 mb-4">
+              <div className={`space-y-3 mb-4 rounded-lg transition-shadow duration-500 ${flash.conditions ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
                 <div>
                   <div className="flex justify-between items-center mb-1.5">
                     <label className="text-xs text-slate-400">Ambient Temperature</label>
@@ -550,7 +936,7 @@ function RouteOptimizer() {
             <div className="border-t border-slate-800" />
 
             {/* Fleet Vehicles */}
-            <section>
+            <section className={`rounded-lg transition-shadow duration-500 ${flash.vehicles ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Fleet Vehicles</h3>
                 <button
@@ -577,6 +963,13 @@ function RouteOptimizer() {
                         </button>
                       )}
                     </div>
+                    {v.driver && (
+                      <div className="flex items-center gap-2 mb-2 -mt-1">
+                        <span className="text-[10px] text-slate-500 flex items-center gap-1">
+                          <User className="w-2.5 h-2.5" />{v.driver}
+                        </span>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="text-[10px] text-slate-500 block mb-1">Battery Packs</label>
@@ -611,31 +1004,31 @@ function RouteOptimizer() {
             <section>
               <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest mb-3">Travel Times</h3>
               <select
-                value={traffic.source}
-                onChange={(e) => updateTraffic('source', e.target.value)}
+                value={trafficData.source}
+                onChange={(e) => updateTrafficData('source', e.target.value)}
                 className="w-full px-2 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-xs text-white focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
               >
                 {TRAFFIC_SOURCES.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
               </select>
-              {traffic.source !== 'google' && (
+              {trafficData.source !== 'google' && (
                 <>
                   <div className="grid grid-cols-2 gap-2 mt-2">
                     <select
-                      value={traffic.day}
-                      onChange={(e) => updateTraffic('day', e.target.value)}
+                      value={trafficData.day}
+                      onChange={(e) => updateTrafficData('day', e.target.value)}
                       className="w-full px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-white focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
                     >
                       {TRAFFIC_DAYS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
                     </select>
                     <input
                       type="time" step="300"
-                      value={traffic.time}
-                      onChange={(e) => updateTraffic('time', e.target.value)}
+                      value={trafficData.time}
+                      onChange={(e) => updateTrafficData('time', e.target.value)}
                       className="w-full px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
                     />
                   </div>
                   <p className="text-[10px] text-slate-600 mt-2 leading-relaxed">
-                    Traffic data covers only the Cerritos–Stanton area (load Demo 0). Routes are optimized for time, then driven on the measured speeds.
+                    Traffic data covers only the Cerritos–Stanton area (load Demo 0). Overrides the Google traffic setting. Turn the Time goal up so traffic can change the stop order; the Held-Karp route is then driven on the measured speeds.
                   </p>
                 </>
               )}
@@ -644,7 +1037,7 @@ function RouteOptimizer() {
             <div className="border-t border-slate-800" />
 
             {/* Delivery Stops */}
-            <section>
+            <section className={`rounded-lg transition-shadow duration-500 ${flash.stops ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Delivery Stops</h3>
                 <div className="flex items-center gap-3">
@@ -684,6 +1077,14 @@ function RouteOptimizer() {
                         <CheckCircle className="w-3 h-3 text-green-400 absolute right-2.5 top-1/2 -translate-y-1/2" />
                       )}
                     </div>
+                    <button
+                      onClick={() => togglePriority(address)}
+                      disabled={!address.trim()}
+                      title={priorityStops.includes(address.trim()) ? 'Priority stop — served first on its truck' : 'Mark as priority'}
+                      className={`px-1 transition-colors ${priorityStops.includes(address.trim()) ? 'text-amber-400' : 'text-slate-700 hover:text-amber-400'} disabled:opacity-30`}
+                    >
+                      <Star className="w-3.5 h-3.5" fill={priorityStops.includes(address.trim()) ? 'currentColor' : 'none'} />
+                    </button>
                     {addresses.length > 2 && (
                       <button
                         onClick={() => removeAddress(index)}
@@ -735,7 +1136,7 @@ function RouteOptimizer() {
 
             <button
               onClick={optimizeRoute}
-              disabled={loading || validatedLocations.length < 2 || (useDepot && !validatedDepot)}
+              disabled={loading || !!resolvingNote || validatedLocations.length < 2 || (useDepot && !validatedDepot)}
               className="w-full py-2.5 bg-[#C8002F] hover:bg-[#a80027] disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-all flex items-center justify-center gap-2 shadow-lg shadow-[#C8002F]/20"
             >
               {loading
@@ -747,8 +1148,12 @@ function RouteOptimizer() {
         </aside>
 
         {/* ── Main content ─────────────────────────────────── */}
-        <main className="flex-1 overflow-y-auto bg-slate-950">
-          {!results ? (
+        <main ref={mainRef} className="flex-1 overflow-y-auto bg-slate-950">
+          {!results && resolvingNote ? (
+            <div className="h-full flex items-center justify-center">
+              <span className="text-sm text-emerald-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />{resolvingNote}</span>
+            </div>
+          ) : !results ? (
             /* Empty state */
             <div className="h-full flex items-center justify-center p-8">
               <div className="text-center max-w-md">
@@ -776,6 +1181,59 @@ function RouteOptimizer() {
           ) : hk && (
             <div className="p-6 space-y-5 max-w-5xl">
 
+              {/* Re-solve status */}
+              {resolvingNote && (
+                <div className="sticky top-0 z-10 bg-emerald-950/90 backdrop-blur border border-emerald-600/40 rounded-lg px-4 py-2 text-xs text-emerald-200 flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> {resolvingNote}
+                </div>
+              )}
+              {stale && !resolvingNote && (
+                <div className="bg-amber-950/40 border border-amber-600/40 rounded-lg px-4 py-2 text-xs text-amber-200 flex items-center gap-2 text-left">
+                  <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" /> {stale}
+                </div>
+              )}
+
+              {/* Before / after of the last change */}
+              {showCompare && versions.length > 1 && compareBase != null && (
+                <PlanComparison
+                  versions={versions}
+                  baseId={compareBase}
+                  currentId={currentVersion.id}
+                  onBaseChange={setCompareBase}
+                  onClose={() => setShowCompare(false)}
+                />
+              )}
+              {!showCompare && versions.length > 1 && (
+                <button onClick={() => setShowCompare(true)} className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1.5">
+                  <ArrowLeftRight className="w-3.5 h-3.5" /> Show what changed ({versions.length} versions)
+                </button>
+              )}
+
+              {/* Simulated breakdown */}
+              {fleet?.disruption && (
+                <div className="bg-red-950/30 border border-red-600/40 rounded-xl px-4 py-3 flex items-start gap-3 text-left">
+                  <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-red-200">Simulated breakdown · {fleet.disruption.vehicle_label}</p>
+                    <p className="text-xs text-red-200/80 mt-1 leading-relaxed">{fleet.disruption.message}</p>
+                    <p className="text-[10px] text-red-300/60 mt-1">
+                      Stranded cargo is collected from the broken-down truck ({fleet.disruption.transfer_min_per_order} min per stop) by the truck that takes it over.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Stops no truck could take within its limits */}
+              {fleet?.unserved?.length > 0 && !fleet.disruption && (
+                <div className="bg-amber-950/30 border border-amber-600/40 rounded-xl px-4 py-3 flex items-start gap-3 text-left">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-amber-100/90 leading-relaxed">
+                    <span className="font-semibold">{fleet.unserved.length} stop{fleet.unserved.length !== 1 ? 's' : ''} can't be served within the battery limits:</span>{' '}
+                    {fleet.unserved.map(u => shortPlace(u.location)).join(', ')}. Ask the assistant “what are the limits of a 4-pack truck?”, or add packs or a truck.
+                  </p>
+                </div>
+              )}
+
               {/* Results header */}
               <div className="flex items-start justify-between">
                 <div>
@@ -784,6 +1242,9 @@ function RouteOptimizer() {
                     {lastLocations.length} stops
                     {fleet && ` · ${fleet.num_vehicles_used} vehicle${fleet.num_vehicles_used !== 1 ? 's' : ''} dispatched`}
                     {fleet && fleet.num_vehicles_requested !== fleet.num_vehicles_used && ` (${fleet.num_vehicles_requested} requested)`}
+                    {results.solver && ` · solver: ${results.solver.requested === 'auto' ? 'auto' : results.solver.baseline_label}`}
+                    {results.goals && ` · goals: ${goalsSummary(results.goals)}`}
+                    {results.driving_style && results.driving_style !== 'normal' && ` · ${results.driving_style} driving`}
                   </p>
                   {hk.traffic && (
                     <p className="text-xs text-slate-500 mt-1">
@@ -793,6 +1254,20 @@ function RouteOptimizer() {
                         {Math.round(hk.traffic.actual_travel_time_s / 60)} min
                       </span>
                       {' '}of driving (planned {Math.round(hk.traffic.planned_travel_time_s / 60)} min)
+                    </p>
+                  )}
+                  {!hk?.traffic && (
+                  <p className="text-xs mt-0.5 text-slate-500">
+                    {results.traffic
+                      ? <>Traffic: <span className="text-sky-300">{trafficLabel(results.traffic.departure)}</span>
+                          {' '}· departs {results.traffic.departure_local} ({results.traffic.time_zone})</>
+                      : 'Traffic: off — Google\'s typical travel times'}
+                  </p>
+                  )}
+                  {results.solver?.note && (
+                    <p className="text-[11px] text-amber-400/80 mt-1 flex items-center gap-1.5">
+                      <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                      {results.solver.note}
                     </p>
                   )}
                 </div>
@@ -811,8 +1286,12 @@ function RouteOptimizer() {
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
                   <div className="flex items-center gap-2 mb-3">
                     <Route className="w-4 h-4 text-yellow-400" />
-                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Held-Karp</span>
-                    <span className="ml-auto text-[10px] text-slate-600">exact · 1 vehicle</span>
+                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+                      {results.solver?.baseline_label || 'Held-Karp'}
+                    </span>
+                    <span className="ml-auto text-[10px] text-slate-600">
+                      {results.solver?.baseline_exact === false ? 'approx' : 'exact'} · 1 vehicle
+                    </span>
                   </div>
                   <div className="space-y-2">
                     <div className="flex justify-between items-center">
@@ -846,6 +1325,17 @@ function RouteOptimizer() {
                         <span className="text-xs text-slate-500 flex items-center gap-1.5"><Zap className="w-3 h-3 opacity-50" />Efficiency</span>
                         <span className="text-sm text-yellow-300 font-semibold">{hk.avg_energy_per_mile.toFixed(2)} kWh/mi</span>
                       </div>
+                    )}
+                    {hk.battery_capacity_kwh != null && (
+                      <div className="flex justify-between items-center gap-3" title="Checked against vehicle 1's battery">
+                        <span className="text-xs text-slate-500 flex items-center gap-1.5 flex-shrink-0"><Zap className="w-3 h-3 opacity-50" />Battery left</span>
+                        <span className={`text-sm font-semibold text-right ${hk.battery_depleted ? 'text-red-400' : hk.battery_remaining_pct < 20 ? 'text-orange-400' : 'text-green-400'}`}>
+                          {hk.battery_depleted ? `DEPLETED · ${hk.total_energy_kwh.toFixed(0)}/${hk.battery_capacity_kwh} kWh` : `${hk.battery_remaining_pct}%`}
+                        </span>
+                      </div>
+                    )}
+                    {hk.battery_depletion && (
+                      <p className="text-[10px] text-red-300/80 text-right -mt-1">{depletionText(hk.battery_depletion)}</p>
                     )}
                   </div>
                 </div>
@@ -1273,7 +1763,7 @@ function RouteOptimizer() {
                     <div className="px-4 py-3 border-b border-slate-800 flex items-center gap-2">
                       <Truck className="w-3.5 h-3.5 text-purple-400" />
                       <span className="text-sm font-medium text-slate-300">Fleet Stop Assignments</span>
-                      {results.ortools_fleet.routes.some(r => r.battery_below_reserve) && (
+                      {results.ortools_fleet.routes.some(belowReserve) && (
                         <button
                           onClick={findChargingStops}
                           disabled={planningCharging || chargingPlans !== null}
@@ -1297,6 +1787,19 @@ function RouteOptimizer() {
                               {route.vehicle_id}
                             </span>
                             <span className="text-xs font-semibold text-purple-300">{route.vehicle_name || `Vehicle ${route.vehicle_id}`}</span>
+                            {route.driver && (
+                              <span className="text-[10px] text-slate-500 flex items-center gap-1">
+                                <User className="w-2.5 h-2.5" />{route.driver}
+                              </span>
+                            )}
+                            {route.status && route.status !== 'continues' && (
+                              <span className={`text-[9px] px-1.5 rounded border ${
+                                route.status === 'broken_down' ? 'bg-red-500/15 text-red-300 border-red-500/40'
+                                  : route.status === 'spare' ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+                                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'}`}>
+                                {route.status === 'broken_down' ? 'broke down' : route.status === 'spare' ? 'spare truck' : 'took stranded stops'}
+                              </span>
+                            )}
                             <span className="ml-auto text-[10px] text-slate-600">
                               {formatDistance(route.total_distance_m)} · {formatTime(route.total_time_s)}
                             </span>
@@ -1311,26 +1814,29 @@ function RouteOptimizer() {
                                 </span>
                                 <span className={`font-semibold ${
                                   route.battery_depleted ? 'text-red-400' :
-                                  route.battery_below_reserve ? 'text-orange-400' :
+                                  belowReserve(route) ? 'text-orange-400' :
                                   'text-green-400'
                                 }`}>
                                   {route.battery_depleted ? 'DEPLETED'
-                                    : route.battery_below_reserve ? `${route.battery_remaining_pct}% · BELOW ${route.battery_reserve_pct}% RESERVE`
+                                    : belowReserve(route) ? `${route.battery_remaining_pct}% · BELOW ${reserveOf(route)}% RESERVE`
                                     : `${route.battery_remaining_pct}%`}
                                 </span>
                               </div>
                               <div className="relative h-1.5 bg-slate-700 rounded-full overflow-hidden">
                                 {/* Reserve the vehicle must be back at the depot with */}
-                                <div className="absolute inset-y-0 w-px bg-slate-400 z-10" style={{ left: `${route.battery_reserve_pct}%` }} />
+                                <div className="absolute inset-y-0 w-px bg-slate-400 z-10" style={{ left: `${reserveOf(route)}%` }} />
                                 <div
                                   className={`h-full rounded-full transition-all ${
                                     route.battery_depleted ? 'bg-red-500' :
-                                    route.battery_remaining_pct < (route.battery_reserve_pct ?? 20) ? 'bg-orange-500' :
+                                    belowReserve(route) ? 'bg-orange-500' :
                                     'bg-green-500'
                                   }`}
                                   style={{ width: `${Math.min(100, route.battery_remaining_pct || 0)}%` }}
                                 />
                               </div>
+                              {route.battery_depletion && (
+                                <p className="text-[10px] text-red-300/80 mt-1">{depletionText(route.battery_depletion)}</p>
+                              )}
                               {chargingPlans?.[route.vehicle_id] && (() => {
                                 const { stop } = chargingPlans[route.vehicle_id];
                                 const pct = (kwh) => `${Math.round(kwh / route.battery_capacity_kwh * 100)}%`;
@@ -1343,43 +1849,65 @@ function RouteOptimizer() {
                                   </p>
                                 ) : (
                                   <p className="mt-1.5 text-[10px] text-red-400">
-                                    No charger along this route keeps the {route.battery_reserve_pct}% reserve with a single stop.
+                                    No charger along this route keeps the {reserveOf(route)}% reserve with a single stop.
                                   </p>
                                 );
                               })()}
                             </div>
                           )}
                           <div className="space-y-1.5 pl-1">
-                            {route.ordered_locations.map((loc, i) => {
-                              const stop = chargingPlans?.[route.vehicle_id]?.stop;
-                              const pct = (kwh) => `${Math.round(kwh / route.battery_capacity_kwh * 100)}%`;
-                              return (
-                                <React.Fragment key={i}>
+                            {(() => {
+                              let n = 0;
+                              const last = route.ordered_locations.length - 1;
+                              return route.ordered_locations.map((loc, i) => {
+                                const kind = route.stop_kinds?.[i] || (i === 0 || i === last ? 'depot' : 'stop');
+                                const broke = route.status === 'broken_down' && i === last && kind !== 'depot';
+                                const delivery = kind === 'stop' || kind === 'done' || kind === 'rescue';
+                                if (delivery) n += 1;
+                                const badge = kind === 'depot' ? 'D' : kind === 'pickup' ? '⇄' : broke ? '!' : n;
+                                const badgeCls = broke ? 'bg-red-500/20 text-red-300'
+                                  : kind === 'pickup' ? 'bg-cyan-500/15 text-cyan-300'
+                                  : kind === 'rescue' ? 'bg-emerald-500/20 text-emerald-300'
+                                  : kind === 'done' ? 'bg-slate-800 text-slate-600'
+                                  : 'bg-slate-800 text-slate-500';
+                                const note = broke ? 'broke down here' : kind === 'pickup' ? 'pick up stranded cargo'
+                                  : kind === 'rescue' ? 'stranded stop' : kind === 'done' ? 'delivered' : '';
+                                const charge = chargingPlans?.[route.vehicle_id]?.stop;
+                                const pct = (kwh) => `${Math.round(kwh / route.battery_capacity_kwh * 100)}%`;
+                                return (
+                                  <React.Fragment key={i}>
                                   <div className="flex items-start gap-2">
-                                    <div className="w-5 h-5 flex-shrink-0 bg-slate-800 rounded flex items-center justify-center text-[10px] text-slate-500 font-bold">
-                                      {i === 0 || i === route.ordered_locations.length - 1 ? 'D' : i}
+                                    <div className={`w-5 h-5 flex-shrink-0 rounded flex items-center justify-center text-[10px] font-bold ${badgeCls}`}>
+                                      {badge}
                                     </div>
-                                    <p className="text-slate-400 text-xs truncate leading-5">{loc.formatted_address}</p>
+                                    <p className={`text-xs truncate leading-5 flex-1 ${kind === 'done' ? 'text-slate-600' : 'text-slate-400'}`}>
+                                      {loc.formatted_address}
+                                      {note && <span className={`ml-1.5 text-[10px] ${broke ? 'text-red-400' : kind === 'rescue' ? 'text-emerald-400' : kind === 'pickup' ? 'text-cyan-400' : 'text-slate-600'}`}>· {note}</span>}
+                                    </p>
+                                    {route.eta_s?.[i] != null && i > 0 && (
+                                      <span className="text-[10px] text-slate-600 font-mono leading-5" title="Arrival, after dispatch">{formatClock(route.eta_s[i])}</span>
+                                    )}
                                   </div>
-                                  {stop && stop.leg_index === i && (
+                                  {charge && charge.leg_index === i && (
                                     <div className="flex items-start gap-2">
                                       <div className="w-5 h-5 flex-shrink-0 bg-cyan-500/20 rounded flex items-center justify-center">
                                         <Zap className="w-3 h-3 text-cyan-300" />
                                       </div>
                                       <div className="min-w-0">
                                         <p className="text-cyan-300 text-xs truncate leading-5">
-                                          {stop.charger.name}{stop.charger.max_kw ? ` · ${stop.charger.max_kw} kW` : ''}
-                                          <span className="text-slate-500"> — {stop.charger.address}</span>
+                                          {charge.charger.name}{charge.charger.max_kw ? ` · ${charge.charger.max_kw} kW` : ''}
+                                          <span className="text-slate-500"> — {charge.charger.address}</span>
                                         </p>
                                         <p className="text-[10px] text-slate-500">
-                                          arrive {pct(stop.arrival_soc_kwh)} → charge {stop.charge_kwh.toFixed(1)} kWh at {stop.charge_kw} kW ({Math.round(stop.charge_time_s / 60)} min) → leave {pct(stop.depart_soc_kwh)}
+                                          arrive {pct(charge.arrival_soc_kwh)} → charge {charge.charge_kwh.toFixed(1)} kWh at {charge.charge_kw} kW ({Math.round(charge.charge_time_s / 60)} min) → leave {pct(charge.depart_soc_kwh)}
                                         </p>
                                       </div>
                                     </div>
                                   )}
-                                </React.Fragment>
-                              );
-                            })}
+                                  </React.Fragment>
+                                );
+                              });
+                            })()}
                           </div>
                         </div>
                       ))}
@@ -1392,6 +1920,8 @@ function RouteOptimizer() {
           )}
         </main>
       </div>
+      <AIChatbot formState={chatFormState} onApplyChange={applyChatChange} onTurn={handleChatTurn} proactive={proactive}
+                 onDockChange={setChatDocked} />
     </div>
   );
 }
