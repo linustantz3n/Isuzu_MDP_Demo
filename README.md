@@ -3,7 +3,7 @@
 Route planning for battery-electric Isuzu delivery trucks. You give it a depot, delivery stops
 and the truck setup. It orders the stops for one truck using Held-Karp (exact), 2-opt or nearest
 neighbor. With more than one truck, it also splits the stops across the fleet with Google
-OR-Tools. It then estimates each route's energy use with a fitted regression model ("Model E")
+OR-Tools. It then estimates each route's energy use with the frozen City NN energy model
 and checks the result against each truck's battery.
 
 Operators tune it in plain language. They tell the chat assistant what the day looks like
@@ -14,14 +14,31 @@ plan before and after side by side.
 
 > **By default the solvers minimize driving distance; energy is calculated afterwards, on the
 > finished route.** The [optimization goals](docs/planning.md#optimization-goals) can weight
-> time, Model E energy and fleet balance instead, and a battery reserve (20% by default) makes each
-> truck's battery a hard limit. See [docs/energy-model.md](docs/energy-model.md#how-energy-relates-to-the-solvers).
+> time, City NN energy and fleet balance instead, and a battery reserve (20% by default) makes each
+> fleet truck's battery a hard limit (single-truck TSP results are checked and flagged). See [docs/energy-model.md](docs/energy-model.md#how-energy-relates-to-the-solvers).
+
+## Driver-aware City NN planning
+
+Save `Remember Wang as an aggressive driver.`, then `Assign Wang to Truck 2.`
+Truck 2 now plans with Wang's usual style. `Use Eco for Truck 2 on this run.` is a
+run-only override; `Restore driver default for Truck 2.` restores Aggressive.
+The Fleet Vehicles controls expose these same assignments and overrides.
+
+Each truck gets its own NN costs, travel times and battery bounds. Changing a style
+can change its route or stop allocation when the objectives or battery constraints
+make that beneficial. A distance-only problem may keep the same route.
+
+The bundled `energy_nn_results_city.json` is required. All energy calculations use
+City NN; no alternative model is selected at runtime. Synthetic driving traces are
+simulation inputs, not measured driver telemetry. Missing/invalid weights fail
+explicitly. Verified Eco suggestions require confirmation and never silently drop
+previously served stops or lower the reserve. See [driver workflow](docs/chat-assistant.md).
 
 ## Where to find things
 
 | You want… | Go to |
 |---|---|
-| **The energy model**: formula, coefficients, inputs, weight and battery logic | [docs/energy-model.md](docs/energy-model.md) · code: [`energy.py`](energy.py) (`calculate_energy_consumption()`) |
+| **The energy model**: network, features, inputs, weight and battery logic | [docs/energy-model.md](docs/energy-model.md) · code: [`energy.py`](energy.py) (`calculate_energy_consumption()`) |
 | **The solvers** and how one gets picked | [docs/solvers.md](docs/solvers.md) · code: [`solvers.py`](solvers.py), [`resolve_solver()`](route_optimizer_backend.py#L605) |
 | **What a solve takes as input and returns** | [docs/api.md](docs/api.md) · code: [`optimize_route()`](route_optimizer_backend.py#L1934) |
 | **What every file and function does** | [docs/code-map.md](docs/code-map.md) |
@@ -50,6 +67,7 @@ RouteOptimizer.jsx
                                                    6. for every leg:           calculate_energy_consumption()
                                                    7. JSON: routes, legs, time, energy, battery, Maps links
   result cards, RouteMap, FleetCharts ◄────────────┘
+  Road maps ──────────── /api/directions ───────► Routes API computeRoutes → decoded road and per-leg paths
   PlanComparison  ◄── every solve is a plan version: before | after side by side
 AIChatbot.jsx ───────── /api/chat ─────────────► lexicon → GPT-4o-mini → validation → one change, goals,
      │                                            truck limits, or a breakdown action
@@ -66,7 +84,7 @@ BenchmarkPanel.jsx ──── /api/benchmark/* ──────► benchmark
 route_optimizer_backend.py   Flask API: Google calls, solver selection, optimization goals, /api/optimize,
                              /api/replan (breakdowns), accident replanning, charging stops, chat assistant,
                              driver memory, benchmark endpoints
-energy.py                    Model E energy model and battery-limit helpers (shared with benchmark/)
+energy.py, energy_model/     City NN energy model and battery-limit helpers (shared with benchmark/)
 traffic_data.py              Travel times from the licensed traffic data package (optional)
 data/crash_history.csv.gz    Historical fatal crashes (NHTSA FARS) for accident replanning
 scripts/build_crash_history.py   Rebuilds the crash data from FARS downloads
@@ -78,7 +96,7 @@ tests/                       pytest suite: solvers, planning, battery, charging,
 route-optimizer-frontend/    React app: src/RouteOptimizer.jsx is the main page
 docs/                        Energy model, solvers, planning (goals, breakdowns), API, code map, chat assistant
 prompt_test.py, prompt_demo.py   Chat-assistant regression scripts (need a running server)
-r4_test.py                   R4 test set: 50 bilingual weight / traffic / style requests
+r4_test.py                   R4 test set: 50 English weight / traffic / style requests
 route_optimizer.jsx          Legacy prototype from the first commit; not used
 ```
 
@@ -92,12 +110,16 @@ pip install -r requirements.txt
 # .env in the repo root:
 #   GOOGLE_MAPS_API_KEY=...   Geocoding, Routes, Elevation, Time Zone and Places (New) APIs enabled
 #   OPENAI_API_KEY=...        optional; only the chat assistant's model step uses it
-#   or, for the U-M GPT Toolkit (any OpenAI-compatible endpoint works), instead of OPENAI_API_KEY:
+#   or use an OpenAI-compatible endpoint with strict JSON Schema support, such as the U-M GPT Toolkit:
 #   LLM_BASE_URL=https://api.toolkit.umgpt.umich.edu/v1
 #   LLM_API_KEY=...           your Toolkit key
 #   LLM_MODEL=gpt-4o-mini     the default; the prompt tests were run with it
 python route_optimizer_backend.py          # http://localhost:5001
 ```
+
+The root [`.env.example`](.env.example) lists these settings without keys.
+See [natural driver requests and LLM configuration](docs/chat-assistant.md#natural-driver-requests-with-an-llm)
+for the structured driver workflow and provider requirements.
 
 **Frontend:**
 
@@ -111,6 +133,27 @@ npm start                                  # http://localhost:3000
 
 The frontend calls `http://localhost:5001/api`, which is hard-coded in `src/api.js`.
 
+Use two Google Cloud keys with billing enabled on the project:
+
+- The browser key (`REACT_APP_GOOGLE_MAPS_API_KEY`) needs **Maps JavaScript API**.
+  Restrict it to the app's website URLs, including `http://localhost:3000/*` for local development.
+- The backend key (`GOOGLE_MAPS_API_KEY`) needs **Routes API**, **Geocoding API** and
+  **Elevation API** for normal planning. Enable **Time Zone API** for scheduled traffic
+  and **Places API (New)** for charger searches. Keep this key in the backend `.env`;
+  a browser referrer restriction is not suitable for server requests.
+
+The planner, benchmark and simulation maps obtain road geometry through the backend's
+Routes API `computeRoutes` endpoint. They do not need legacy Directions API or
+Distance Matrix API. The stop order stays fixed; per-leg paths also drive vehicle
+playback and battery-depletion markers. Failed road requests show an error and a retry
+button. Long benchmark routes are split into requests with at most 25 intermediate stops.
+
+After adding keys, restart both servers using the normal commands above. If switching
+from the saved-data demo, stop `run_demo.py`, run `route_optimizer_backend.py`, and set
+`REACT_APP_SAVED_DEMO=false` when starting the frontend. The saved-data launcher always
+shows a schematic and intentionally disables live Google requests, even if keys exist.
+The LLM key is separate and is not needed to display a map or compute road routes.
+
 **Tests and benchmark** (no API keys needed):
 
 ```bash
@@ -119,13 +162,40 @@ python -m benchmark.cli --list
 python -m benchmark.cli demo_anaheim --max-vehicles 3 --csv results.csv
 ```
 
+## Local demo without API keys
+
+The saved-data launcher uses the real City NN and optimizer with the repository's
+Anaheim road matrices. It seeds three demonstration drivers in a separate temporary
+memory file and never sends requests to Google. Start two terminals:
+
+```bash
+# Backend, using your Python environment with requirements.txt installed
+python run_demo.py
+```
+
+```bash
+cd route-optimizer-frontend
+REACT_APP_SAVED_DEMO=true npm start
+```
+
+Open http://localhost:3000. The depot, five deliveries and three assigned trucks
+are prefilled. Click **Optimize Routes**, then try **Run driving style** or the
+chat command `Use Eco for Truck 1 on this run.`. The sample trucks have eight packs,
+160 kWh capacity and 14,764 lb departure weight. Driver changes preserve those specs.
+
+The map is explicitly a stop-order schematic: its straight lines are not road
+geometry. Road cost/time matrices are cached; NN energy is computed locally.
+Live traffic, road directions, accident detours and charger searches require the
+normal launcher with Google credentials. Standard driver commands work without an
+LLM key; other natural-language requests need a configured LLM endpoint.
+
 ## What is and is not modelled
 
 | Modelled | Not modelled (yet) |
 |---|---|
 | Stop order for one truck: exact (Held-Karp, up to ~17 stops by default) or heuristic | State-of-charge curves; more than one charging stop per route |
 | Splitting stops across 2+ trucks (OR-Tools, balanced stop counts) | Time windows, driver-hours limits |
-| What to optimize: distance, time, Model E energy and fleet balance, weighted by goals | Payload capacity in normal planning (only in breakdown re-plans) |
+| What to optimize: distance, time, City NN energy and fleet balance, weighted by goals | Payload capacity in normal planning (only in breakdown re-plans) |
 | Energy per leg from speed, temperature, weight, elevation, HVAC | Road closures other than simulated accidents |
 | Cargo weight dropping stop by stop; the truck returns empty | More than one breakdown at a time |
 | Battery per truck (packs × 20 kWh): checked always; fleets keep a 20% reserve by default (adjustable or off) | More than 25 locations per request |
@@ -134,7 +204,7 @@ python -m benchmark.cli demo_anaheim --max-vehicles 3 --csv results.csv
 | A truck breaking down mid-route: stranded stops re-assigned, cargo collected, optional spare truck | |
 | Unloading time per stop | |
 | Live traffic for a departure time (Google's traffic prediction) | |
-| Driving style eco / normal / aggressive (assumed speed and energy factors) | |
+| Driving style eco / normal / aggressive (synthetic driver traces and per-truck NN predictions) | |
 | Measured / forecast traffic replays of four past days (traffic data package, Cerritos–Stanton only) | |
 | Accidents at historical crash hotspots: the road between two stops is rerouted, stop order kept | |
 | One charging stop for a fleet truck that would end below its battery reserve | |

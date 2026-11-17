@@ -58,6 +58,7 @@ export default function BenchmarkPanel() {
   const [fixedPlan, setFixedPlan] = useState(null);
   const [fixedPlanError, setFixedPlanError] = useState(null);
   const [timeLimit, setTimeLimit] = useState('');
+  const [drivingStyle, setDrivingStyle] = useState('normal');
   const [objectiveMode, setObjectiveMode] = useState('distance');
   const [blendWeights, setBlendWeights] = useState({ distance: 50, time: 25, energy: 25 });
   const [loading, setLoading] = useState(false);
@@ -121,6 +122,7 @@ export default function BenchmarkPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           scenario_id: scenarioId,
+          energy_params: { driving_style: drivingStyle },
           num_vehicles: effectiveK,
           include_smaller_fleets: includeSmaller,
           preserve_stop_order: preserveOrder,
@@ -161,6 +163,11 @@ export default function BenchmarkPanel() {
     <div className="flex flex-1 min-h-0">
       {/* ── Sidebar ──────────────────────────────────────── */}
       <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0">
+        <label className="block text-xs text-slate-400 px-5 pt-4">City NN · comparison driving style
+          <select aria-label="Benchmark driving style" value={drivingStyle} onChange={e => setDrivingStyle(e.target.value)} className="w-full bg-slate-800 text-white rounded p-2 mt-1">
+            {['eco', 'normal', 'aggressive'].map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </label>
         <div className="flex-1 overflow-y-auto p-5 space-y-6">
           <section>
             <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest mb-3">Scenario</h3>
@@ -531,7 +538,7 @@ export default function BenchmarkPanel() {
                 Gaps are the {result.objective.label} (the quantity being minimized) relative to the reference in the same fleet size.
                 Makespan = longest single truck's drive time.
                 {selectedK === 1 && ' "vs Optimal" compares against Held-Karp, the exact single-truck optimum.'}
-                {' '}Energy is scored with the production Model E regression ({result.energy.temperature_c}°C, {result.energy.loaded_weight_lbs.toLocaleString()} lb loaded / {result.energy.base_weight_lbs.toLocaleString()} lb empty, each truck lighter after every stop).
+                {' '}Energy is scored with the shared City NN predictor ({result.energy.temperature_c}°C, {result.energy.loaded_weight_lbs.toLocaleString()} lb loaded / {result.energy.base_weight_lbs.toLocaleString()} lb empty, each truck lighter after every stop).
                 {!result.energy.has_elevation && ' This scenario has no elevation data, so energy assumes flat terrain.'}
               </p>
             </div>

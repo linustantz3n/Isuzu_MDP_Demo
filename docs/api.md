@@ -12,7 +12,7 @@ to `http://localhost:5001/api`.
 | `/api/geocode` | POST | `{address}` → `{result: {address, formatted_address, lat, lng}}` |
 | `/api/geocode_batch` | POST | `{addresses: [...]}` → `{results: [...], errors: [...]}`; `status` is `partial` if any failed |
 | **`/api/optimize`** | POST | **The main endpoint.** Solve the routes and estimate energy (below) |
-| `/api/directions` | POST | `{locations, order}` → raw Google Routes API `computeRoutes` response |
+| `/api/directions` | POST | `{locations, order}` → raw Routes API response in `directions`, decoded road geometry in `route` (below) |
 | `/api/replan` | POST | Simulate a breakdown on a plan and re-plan the rest of the day (below) |
 | `/api/suggest` | POST | Check a solved plan for a problem and test fixes for it |
 | `/api/replan_incidents` | POST | `{legs, num_accidents}` → crash hotspots on the route and reroutes for every on/off combination (stop order kept) |
@@ -29,6 +29,33 @@ to `http://localhost:5001/api`.
 Every endpoint returns `"status": "ok"` on success, or `"status": "error"` with a `message`.
 
 ---
+
+## `POST /api/directions`
+
+The planner and benchmark/simulation maps use this proxy instead of the legacy
+browser `DirectionsService`. The Google server key is read from `GOOGLE_MAPS_API_KEY`;
+the browser sends only coordinates and the solver's fixed stop order.
+
+`locations` is a list of `{lat, lng}` objects. `order` contains 2–27 valid location
+indices (origin, at most 25 intermediates, destination), defaulting to input order.
+Include the starting depot again to close a route; open breakdown routes stay open.
+Waypoint reordering is disabled. Invalid input returns 400 before making a Google call.
+
+Success returns `{status: "ok", directions, route}`. `directions` retains the raw
+`computeRoutes` response for existing clients. `route` contains:
+
+- `path`: decoded road coordinates, each `{lat, lng}`.
+- `distance_m`, `time_s`: Google's road distance and duration.
+- `legs`: one entry per consecutive pair in `order`, with the same three fields.
+
+These paths draw the map and position playback/depletion markers; they do not replace
+the optimizer's NN estimates or traffic measurements. The frontend shares requests
+across maps, caches geometry for five minutes and splits longer routes at a shared
+boundary stop without losing leg alignment.
+
+A missing backend key returns 503 (`code: "google_key_missing"`); an upstream timeout
+returns 504; rejected or incomplete Google routes return 502 with a message. Failed
+requests are retryable and are never substituted with straight-line road geometry.
 
 ## `POST /api/optimize`
 
@@ -63,7 +90,7 @@ The steps:
     "temperature_c": 20,
     "unload_time_min": 30,
     "has_climate_control": true,
-    "driving_style": "eco"
+    "model": "city_nn"
   },
   "traffic": {"departure": "07:30"},
   "goals": {"distance": "low", "time": "off", "energy": "high", "balance": "off", "battery_reserve_pct": 20},
@@ -82,10 +109,12 @@ The steps:
 | `num_vehicles` | 1 | Older form of the fleet size. Ignored when `vehicles` is sent |
 | `energy_params.temperature_c` | 20 | Ambient °C, used for every leg |
 | `energy_params.unload_time_min` | 30 | Minutes per delivery stop. Adds to time, not energy |
-| `energy_params.has_climate_control` | `true` | Adds 0.092 kWh/km |
-| `energy_params.driving_style` | `"normal"` | `eco` / `normal` / `aggressive`: assumed speed and energy factors (see [energy-model.md](energy-model.md#driving-style-and-traffic)) |
+| `energy_params.has_climate_control` | `true` | Adds 4 kW over driving duration |
+| `vehicles[].driving_style_override` | `null` | `eco` / `normal` / `aggressive`, or `null` to use the assigned driver’s usual style |
+| `vehicles[].driver_id` | `null` | Saved driver ID; moving a driver preserves truck specifications |
+| `energy_params.model` | `"city_nn"` | Only City NN is supported |
 | `traffic` | `null` | `{"departure": "now"}` or `{"departure": "HH:MM"}`: travel times are Google's traffic prediction for that departure at the depot (the next time its clock reads `HH:MM`). `null`: Google's typical times |
-| `traffic_source` | `"google"` | `"forecast"` / `"historical"` / `"ground_truth"`: travel times from the traffic data package instead (overrides `traffic`, ignores `precomputed`); needs `departure_time`. The Held-Karp result then gets `traffic` with the route's travel time driven on the measured speeds |
+| `traffic_source` | `"google"` | `"forecast"` / `"historical"` / `"ground_truth"`: travel times from the traffic data package instead (overrides `traffic`; reuses matching `precomputed` traffic source and departure); needs `departure_time`. The Held-Karp result then gets `traffic` with the route's travel time driven on the measured speeds |
 | `departure_time` | — | `"2025-11-12T07:30"`, for `traffic_source` |
 | `energy_params.battery_reserve_pct` | — | Used as `goals.battery_reserve_pct` when the goals set no reserve |
 | `energy_params.total_weight_lbs`, `base_weight_lbs` | 19,500 / 7,000 | Effectively unused (see [energy-model.md](energy-model.md#other-inputs-and-what-they-affect)) |
@@ -101,7 +130,7 @@ The empty truck weighs 7,000 lbs at 4 packs. The details are in [energy-model.md
 
 Besides the results, the response carries `matrices` (Google's distance and time matrices,
 **before** the driving style is applied, so a re-solve that sends them back does not apply it
-twice), `elevations`, `goals`, `priority_stops`, `energy_params.driving_style`, and `traffic`:
+twice), `elevations`, `goals`, `priority_stops`, resolved `vehicles`, `energy_model`, and `traffic`:
 `null`, or `{departure, departure_ts, departure_local, time_zone}`, the departure the travel times
 were priced for (`time_zone` is the depot's, from the Google Time Zone API, or "server local time").
 
@@ -156,7 +185,7 @@ were priced for (`time_zone` is the depot's, from the Google Time Zone API, or "
 | `elevation_from_m`, `elevation_to_m`, `elevation_gain_m` | `h` and `Δh` in the energy model |
 | `vehicle_weight_lbs`, `vehicle_weight_tonnes` | `W` for this leg |
 | `energy_kwh`, `energy_per_km`, `energy_per_mile` | The leg's energy |
-| `energy_breakdown` | kWh per regression term (see [energy-model.md](energy-model.md#per-term-output)) |
+| `energy_breakdown` | `propulsion`, `base_aux`, `epto`, `hvac` in kWh |
 | `return_leg` | `true` on the leg back to the depot |
 
 **`<fleet>`** (`results.ortools_fleet`):
@@ -235,7 +264,7 @@ it after every solve; see [chat-assistant.md](chat-assistant.md#suggestions-afte
 
 **Request:** the `/api/optimize` request that produced the plan, plus `precomputed` (its matrices
 and elevations, as the optimize response returned them), `results` (the optimize response's
-`results`) and `lang` (`en` / `zh`). Without `precomputed` nothing is checked, so the endpoint
+`results`) and `lang` (`en`). Without `precomputed` nothing is checked, so the endpoint
 never makes Google calls.
 
 **Response:** `{"status": "ok", "suggestion": null}` when the plan has no problem, else
@@ -294,3 +323,27 @@ The fleet has the `/api/optimize` shape. It covers the whole day, from dispatch,
 
 If the truck had already finished its deliveries at that moment, the response is
 `{"status": "ok", "nothing": true, "message": "..."}`.
+
+## Driver and model snapshots
+
+Resolved vehicles and routes include `driver_id`, `driver_snapshot` (`id`, `name`,
+`driving_style`), `driver_default_style`, `driving_style_override`,
+`effective_driving_style` and `style_source` (`driver`, `run_override`, `default`).
+A driver can be assigned only once per run. Unassigned trucks default to Normal.
+GET `/api/memory` returns profiles including stable IDs and usual styles.
+
+`energy_model` contains `name`, `model_version`, `sha256`, `adapter_version`.
+Send it as `expected_energy_model` to dependent optimize, suggest, charging, incident
+or breakdown calls. Stale snapshots return 409; missing/invalid NN weights return 503
+with `code: model_unavailable`. Other energy model selections return 400.
+
+`/api/suggest` accepts `plan_context`, an opaque identifier for the current settings.
+Its pending confirmation includes that identifier and the NN metadata. Echo the
+current identifier in `/api/chat`'s `form_state.plan_context`; stale confirmations
+produce no changes. The verified fix can be `vehicle_style_overrides` with value
+`[{"vehicle_id": 2, "driving_style_override": "eco"}]`.
+
+`/api/benchmark/simulate` accepts `vehicle_styles`, one style per truck in order.
+Results include each truck's `effective_driving_style` and top-level model metadata.
+The algorithm benchmark uses `energy_params.driving_style` uniformly across its
+comparison runs; planner requests use per-vehicle overrides instead.

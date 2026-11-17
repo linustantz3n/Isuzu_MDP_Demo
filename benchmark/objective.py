@@ -57,7 +57,7 @@ def _mean_arc(matrix: list) -> float:
     return sum(vals) / len(vals) if vals else 1.0
 
 
-def build_cost_matrix(objective: dict, dist: list, time: list, energy_kwh: list) -> list:
+def build_cost_matrix(objective: dict, dist: list, time: list, energy_kwh: list, normalization=None) -> list:
     mode = objective["mode"]
     if mode == "distance":
         return dist
@@ -67,6 +67,6 @@ def build_cost_matrix(objective: dict, dist: list, time: list, energy_kwh: list)
         return [[v * 1000 for v in row] for row in energy_kwh]
 
     mats = {"distance": dist, "time": time, "energy": energy_kwh}
-    scales = {m: objective["weights"][m] / _mean_arc(mats[m]) * 1000 for m in METRICS if objective["weights"][m] > 0}
+    scales = {m: objective["weights"][m] / ((normalization or {}).get(m) or _mean_arc(mats[m])) * 1000 for m in METRICS if objective["weights"][m] > 0}
     n = len(dist)
     return [[sum(mats[m][i][j] * s for m, s in scales.items()) for j in range(n)] for i in range(n)]

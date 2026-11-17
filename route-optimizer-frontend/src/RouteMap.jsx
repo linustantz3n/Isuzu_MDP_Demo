@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, MarkerF, PolylineF, InfoWindow } from '@react-google-maps/api';
+import { GoogleMap, useJsApiLoader, Marker, MarkerF, PolylineF, InfoWindow } from '@react-google-maps/api';
 import DriveSimulation from './DriveSimulation';
+import { fetchRoadRoute, pointAlongLeg } from './roadRoutes';
 import { depletionText, formatDuration } from './planDiff';
 
 export const VEHICLE_COLORS = [
@@ -62,35 +63,6 @@ export function stopSequence(results) {
   return seq;
 }
 
-// Metres between two google.maps.LatLng points (haversine).
-function metres(a, b) {
-  const R = 6371000, rad = Math.PI / 180;
-  const dLat = (b.lat() - a.lat()) * rad, dLng = (b.lng() - a.lng()) * rad;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat() * rad) * Math.cos(b.lat() * rad) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-// The point `fraction` of the way along leg `legIndex` of a directions result,
-// following the road as drawn. The legs match the route's legs one to one:
-// one per pair of consecutive locations.
-function pointAlongLeg(result, legIndex, fraction) {
-  const leg = result.routes?.[0]?.legs?.[legIndex];
-  const path = (leg?.steps || []).flatMap(s => s.path || []);
-  if (path.length === 0) return null;
-  const segs = path.slice(1).map((p, i) => metres(path[i], p));
-  let left = fraction * segs.reduce((a, b) => a + b, 0);
-  for (let i = 0; i < segs.length; i++) {
-    if (left <= segs[i]) {
-      const w = segs[i] > 0 ? left / segs[i] : 0;
-      const a = path[i], b = path[i + 1];
-      return { lat: a.lat() + w * (b.lat() - a.lat()), lng: a.lng() + w * (b.lng() - a.lng()) };
-    }
-    left -= segs[i];
-  }
-  const end = path[path.length - 1];
-  return { lat: end.lat(), lng: end.lng() };
-}
-
 // replan: /api/replan_incidents response; activeAccidents: ids switched on;
 // activeLegs: the legs rerouted for that combination of accidents
 // chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
@@ -104,6 +76,8 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
   const mapRef = useRef(null);
   const [routeDirections, setRouteDirections] = useState([]);
   const [fetchingRoutes, setFetchingRoutes] = useState(false);
+  const [routeErrors, setRouteErrors] = useState([]);
+  const [retry, setRetry] = useState(0);
   const [selectedMarker, setSelectedMarker] = useState(null);
   const [selectedDepletion, setSelectedDepletion] = useState(null);
   const [visibleRoutes, setVisibleRoutes] = useState(new Set());
@@ -116,13 +90,13 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
   const driveTrucks = useMemo(() => {
     const roadLegs = (directions, route, offset) => {
       const actual = route?.traffic?.actual_leg_times_s;
-      const dirLegs = directions?.result.routes?.[0]?.legs;
+      const dirLegs = directions?.geometry.legs;
       if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
       const stops = route.ordered_locations;
       const atDepot = (k) => k + 1 >= stops.length || (k + 1 === stops.length - 1 && route.order?.[k + 1] === 0);
       return dirLegs.map((leg, k) => ({
         path: activeLegs.find(l => l.leg_index === offset + k)?.original.path
-          || leg.steps.flatMap(step => step.path.map(p => ({ lat: p.lat(), lng: p.lng() }))),
+          || leg.path,
         durationS: actual[k],
         plannedS: route.legs[k]?.time_s ?? actual[k],
         to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
@@ -167,8 +141,8 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
     const visible = directions.filter(r => visibleSet.has(r.label));
     if (visible.length === 0) return;
     const bounds = new window.google.maps.LatLngBounds();
-    visible.forEach(({ result }) => {
-      const path = result.routes?.[0]?.overview_path;
+    visible.forEach(({ geometry }) => {
+      const path = geometry.path;
       if (path) path.forEach(pt => bounds.extend(pt));
     });
     if (!bounds.isEmpty()) mapRef.current.fitBounds(bounds, 48);
@@ -188,98 +162,52 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
   useEffect(() => {
     if (!isLoaded || !results || !locations?.length) return;
 
+    let cancelled = false;
+    let fitTimer;
     setFetchingRoutes(true);
+    setRouteErrors([]);
     setRouteDirections([]);
     setSelectedMarker(null);
     setSelectedDepletion(null);
 
-    // Build list of routes to fetch road directions for
     const routesToFetch = [];
     const hasFleet = results.ortools_fleet?.routes?.length > 0;
-
-    // Held-Karp single vehicle — ordered_locations = [depot, stop1, stop2, ...]
     if (results.optimal?.ordered_locations?.length > 1) {
       const locs = results.optimal.ordered_locations;
+      const closed = locs[0].lat === locs[locs.length - 1].lat && locs[0].lng === locs[locs.length - 1].lng;
       routesToFetch.push({
-        origin: { lat: locs[0].lat, lng: locs[0].lng },
-        destination: { lat: locs[0].lat, lng: locs[0].lng }, // closed loop back to depot
-        waypoints: locs.slice(1).map(l => ({ location: { lat: l.lat, lng: l.lng }, stopover: true })),
-        color: SINGLE_COLOR,
-        label: 'Held-Karp',
-        name: 'The truck',
-        // With a fleet the single-truck route is only a comparison, not a truck
-        // in the plan, so where it would run out is not marked.
+        points: closed ? locs : [...locs, locs[0]], color: SINGLE_COLOR,
+        label: 'Held-Karp', name: 'The truck',
         depletion: hasFleet ? null : results.optimal.battery_depletion,
-        strokeWeight: 3,
-        strokeOpacity: 0.75,
-        zIndex: 1,
+        strokeWeight: 3, strokeOpacity: 0.75, zIndex: 1,
       });
     }
-
-    // Fleet vehicles — ordered_locations = [depot, stop1, ..., depot] (depot at both ends)
-    if (results.ortools_fleet?.routes) {
-      results.ortools_fleet.routes.forEach((route, idx) => {
-        const locs = route.ordered_locations;
-        if (locs.length < 2) return;
-        // Depot at both ends is a full day; a truck that broke down ends where
-        // it stopped, so its line ends there instead of returning to the depot.
-        const closedFormat = locs[0].lat === locs[locs.length - 1].lat
-          && locs[0].lng === locs[locs.length - 1].lng;
-        const end = locs[locs.length - 1];
-        const waypoints = locs.slice(1, -1).map(l => ({ location: { lat: l.lat, lng: l.lng }, stopover: true }));
-
-        routesToFetch.push({
-          origin: { lat: locs[0].lat, lng: locs[0].lng },
-          destination: closedFormat ? { lat: locs[0].lat, lng: locs[0].lng } : { lat: end.lat, lng: end.lng },
-          waypoints,
-          color: VEHICLE_COLORS[idx % VEHICLE_COLORS.length],
-          label: `Vehicle ${route.vehicle_id}`,
-          name: route.vehicle_name || `Vehicle ${route.vehicle_id}`,
-          depletion: route.battery_depletion,
-          strokeWeight: 5,
-          strokeOpacity: 0.9,
-          zIndex: 2 + idx,
-        });
+    (results.ortools_fleet?.routes || []).forEach((route, idx) => {
+      if (route.ordered_locations.length < 2) return;
+      // A broken truck's open route ends at its breakdown location.
+      routesToFetch.push({
+        points: route.ordered_locations, color: VEHICLE_COLORS[idx % VEHICLE_COLORS.length],
+        label: `Vehicle ${route.vehicle_id}`, name: route.vehicle_name || `Vehicle ${route.vehicle_id}`,
+        depletion: route.battery_depletion, strokeWeight: 5, strokeOpacity: 0.9, zIndex: 2 + idx,
       });
-    }
-
-    const service = new window.google.maps.DirectionsService();
-
-    const promises = routesToFetch.map(({ origin, destination, waypoints, color, label, name, depletion, strokeWeight, strokeOpacity, zIndex }) =>
-      new Promise((resolve) => {
-        service.route(
-          {
-            origin,
-            destination,
-            waypoints,
-            travelMode: window.google.maps.TravelMode.DRIVING,
-            optimizeWaypoints: false, // Order already optimized by our solver
-          },
-          (result, status) => {
-            if (status === 'OK') {
-              // Where the battery runs out, placed on the road as drawn.
-              const position = depletion ? pointAlongLeg(result, depletion.leg_index, depletion.fraction) : null;
-              resolve({ result, color, label, name, depletion: position ? { ...depletion, position } : null,
-                        strokeWeight, strokeOpacity, zIndex });
-            } else {
-              console.warn(`DirectionsService failed for ${label}: ${status}`);
-              resolve(null);
-            }
-          }
-        );
-      })
-    );
-
-    Promise.all(promises).then((resolved) => {
-      const valid = resolved.filter(Boolean);
+    });
+    Promise.all(routesToFetch.map(({ points, depletion, ...style }) =>
+      fetchRoadRoute(points).then(geometry => {
+        const position = depletion ? pointAlongLeg(geometry, depletion.leg_index, depletion.fraction) : null;
+        return { ...style, geometry, depletion: position ? { ...depletion, position } : null };
+      }).catch(error => ({ error: `${style.name}: ${error.message}` }))
+    )).then(resolved => {
+      if (cancelled) return;
+      const valid = resolved.filter(r => !r.error);
       const allVisible = new Set(valid.map(r => r.label));
+      setRouteErrors(resolved.filter(r => r.error).map(r => r.error));
       setRouteDirections(valid);
       setVisibleRoutes(allVisible);
       setFetchingRoutes(false);
-      // Delay fit until after DirectionsRenderers have mounted (avoids race with suppressFitBounds)
-      setTimeout(() => fitToRoutes(allVisible, valid), 100);
+      fitTimer = setTimeout(() => fitToRoutes(allVisible, valid), 100);
     });
-  }, [isLoaded, results, locations]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; clearTimeout(fitTimer); };
+  }, [isLoaded, results, locations, retry, fitToRoutes]);
 
   // Zoom to the hotspots and the legs they can block (once, not on every toggle)
   useEffect(() => {
@@ -415,6 +343,11 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
         )}
       </div>
 
+      {routeErrors.length > 0 && <div role="alert" className="p-3 text-xs text-amber-300 border-b border-slate-700">
+        <p>Some road routes could not be loaded.</p>
+        {routeErrors.map((message, i) => <p key={i}>{message}</p>)}
+        <button onClick={() => setRetry(n => n + 1)} className="underline mt-1">Retry road routes</button>
+      </div>}
       {!isLoaded ? (
         <div style={MAP_CONTAINER_STYLE} className="flex items-center justify-center bg-slate-900 text-slate-500 text-sm">
           Loading Google Maps...
@@ -428,16 +361,9 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
           options={{ styles: MAP_STYLES, streetViewControl: false, mapTypeControl: false, gestureHandling: 'greedy' }}
         >
           {/* Road route polylines */}
-          {routeDirections.filter(r => visibleRoutes.has(r.label)).map(({ result, color, label, strokeWeight, strokeOpacity, zIndex }) => (
-            <DirectionsRenderer
-              key={label}
-              directions={result}
-              options={{
-                suppressMarkers: true,
-                suppressFitBounds: true,
-                polylineOptions: { strokeColor: color, strokeOpacity, strokeWeight, zIndex },
-              }}
-            />
+          {routeDirections.filter(r => visibleRoutes.has(r.label)).map(({ geometry, color, label, strokeWeight, strokeOpacity, zIndex }) => (
+            <PolylineF key={label} path={geometry.path}
+              options={{ strokeColor: color, strokeOpacity, strokeWeight, zIndex }} />
           ))}
 
           {/* Replanned legs: blocked originals (dashed), reroutes, accident markers, past crashes */}

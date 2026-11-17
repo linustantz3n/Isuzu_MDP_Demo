@@ -1,6 +1,9 @@
+import VehicleDriverControls from './VehicleDriverControls';
+import { assignDriver, applyStyleOverrides, effectiveStyle } from './driverState';
 import React, { useState, useEffect, useRef } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, User, BarChart3, Activity, Star, AlertTriangle, TriangleAlert, ArrowLeftRight, RotateCcw, Play, Square } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, Star, AlertTriangle, TriangleAlert, ArrowLeftRight, RotateCcw, Play, Square, User } from 'lucide-react';
 import RouteMap from './RouteMap';
+import SchematicRouteMap from './SchematicRouteMap';
 import { SIM_SPEEDS } from './DriveSimulation';
 import FleetCharts from './FleetCharts';
 import AIChatbot from './AIChatbot';
@@ -14,11 +17,12 @@ import { API_BASE } from './api';
 
 const locationsKey = (locs) => locs.map(l => `${l.lat},${l.lng}`).join('|');
 const MAX_VERSIONS = 12;
+const SAVED_DEMO = process.env.REACT_APP_SAVED_DEMO === 'true';
 
 // Which sidebar section a chat change lands in, so it can flash.
 const AXIS_SECTION = {
   goals: 'goals', priority_stops: 'goals', traffic: 'goals', driving_style: 'goals', depot: 'stops', addresses: 'stops',
-  vehicle_count: 'vehicles', battery_packs: 'vehicles', vehicle_weight_lbs: 'vehicles', fleet: 'vehicles',
+  driver_assignments: 'vehicles', vehicle_style_overrides: 'vehicles', vehicle_count: 'vehicles', battery_packs: 'vehicles', vehicle_weight_lbs: 'vehicles', fleet: 'vehicles',
   temperature_c: 'conditions', unload_time_min: 'conditions', has_climate_control: 'conditions',
 };
 
@@ -85,6 +89,17 @@ function RouteOptimizer() {
   const [vehicles, setVehicles] = useState([
     { id: 1, name: 'Vehicle 1', weight_lbs: 13000, battery_packs: 4, battery_kwh: 80 }
   ]);
+  const [drivers, setDrivers] = useState([]);
+  const [savedDemo, setSavedDemo] = useState(null);
+  const solveSequence = useRef(0);
+  const refreshDrivers = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/memory`);
+      const data = await response.json();
+      if (data.status === 'ok') setDrivers(data.drivers || []);
+    } catch { /* Driver profiles can be loaded when the backend becomes available. */ }
+  };
+  useEffect(() => { refreshDrivers(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [lastLocations, setLastLocations] = useState([]);
   const [replan, setReplan] = useState(null);
   const [replanning, setReplanning] = useState(false);
@@ -108,7 +123,6 @@ function RouteOptimizer() {
     base_weight_lbs: 7000,
     unload_time_min: 30,
     has_climate_control: true,
-    driving_style: 'normal',
   });
   // Traffic: null = Google's typical times, 'now' or 'HH:MM' = traffic for that departure.
   const [traffic, setTraffic] = useState(null);
@@ -130,9 +144,47 @@ function RouteOptimizer() {
   const resolveWaiters = useRef({});
   const mainRef = useRef(null);
 
+  const loadSavedDemo = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/demo/bootstrap`);
+      const data = await response.json();
+      if (data.status !== 'ok') throw new Error(data.message || 'Could not load the saved demo');
+      solveSequence.current += 1;
+      setSavedDemo(data);
+      setVersions([]);
+      setReplan(null);
+      setChargingPlans(null);
+      setStale(null);
+      setDepot(data.locations[0].address);
+      setAddresses(data.locations.slice(1).map(p => p.address));
+      setValidatedDepot(data.locations[0]);
+      setValidatedLocations(data.locations.slice(1));
+      setVehicles(data.vehicles);
+      setGoals(data.goals);
+      setTraffic(null);
+      setTrafficData({ source: 'google', day: '2025-11-12', time: '07:30' });
+      setResults(null);
+      setDrive(null);
+      setProactive(null);
+      setError(null);
+    } catch (err) { setError(err.message); }
+  };
+  useEffect(() => { if (SAVED_DEMO) loadSavedDemo(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const updateTrafficData = (field, value) => {
     setTrafficData({ ...trafficData, [field]: value });
     if (results) setStale('Travel times changed — click Optimize Routes to re-solve.');
+  };
+
+  const changeDriverConfig = (next, label) => {
+    solveSequence.current += 1;
+    setVehicles(next);
+    setDrive(null);
+    setProactive(null);
+    if (results) {
+      setStale('Driver settings changed — updating the plan.');
+      setResolveRequest({ id: Date.now() + Math.random(), changes: [{ label }], text: label, lang: 'en' });
+    }
   };
 
   const addVehicle = () => {
@@ -285,7 +337,8 @@ function RouteOptimizer() {
 
   // One solve. Sends back the matrices of the last solve of these same
   // locations, so a re-solve after a chat change makes no Google calls.
-  const callOptimize = async (locations, previous) => {
+  const callOptimize = async (locations, previous, generation = ++solveSequence.current) => {
+    if (generation !== solveSequence.current) { const err = new Error('Configuration changed'); err.superseded = true; throw err; }
     const body = {
       locations,
       mode: 'distance',
@@ -302,10 +355,14 @@ function RouteOptimizer() {
     };
     // Kept with the version (without the matrices), so the suggestion check can
     // re-solve the same request with a fix.
+    if (SAVED_DEMO) body.fleet_time_limit_s = 2;
     const request = { ...body };
+    if (savedDemo && !traffic && trafficData.source === 'google' && locationsKey(savedDemo.locations) === locationsKey(locations)) body.precomputed = savedDemo.precomputed;
     // Matrices fetched for other traffic settings are not reused.
     if (previous?.inputs && locationsKey(previous.locations) === locationsKey(locations)
-        && (previous.inputs.traffic?.departure ?? null) === traffic && trafficData.source === 'google') {
+        && (previous.inputs.traffic?.departure ?? null) === traffic
+        && (previous.inputs.traffic_source || 'google') === trafficData.source
+        && (trafficData.source === 'google' || previous.inputs.departure_time === `${trafficData.day}T${trafficData.time}`)) {
       body.precomputed = previous.inputs;
     }
     const response = await fetch(`${API_BASE}/optimize`, {
@@ -314,13 +371,19 @@ function RouteOptimizer() {
       body: JSON.stringify(body)
     });
     const data = await response.json();
+    if (generation !== solveSequence.current) {
+      const error = new Error('A newer configuration superseded this solve'); error.superseded = true; throw error;
+    }
     if (data.status === 'error') throw new Error(data.message);
+    request.vehicles = data.vehicles || vehicles;
+    request.expected_energy_model = data.energy_model;
     return {
       // `solver` rides along on results so the panel and the data stay in sync.
       results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [],
-                 traffic: data.traffic || null, driving_style: data.energy_params?.driving_style || 'normal' },
+                 traffic: data.traffic || null, vehicles: data.vehicles || vehicles, energy_model: data.energy_model },
       inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations,
-                traffic: data.traffic || null },
+                traffic: data.traffic || null, traffic_source: trafficData.source,
+                departure_time: trafficData.source === 'google' ? null : `${trafficData.day}T${trafficData.time}` },
       request,
     };
   };
@@ -329,12 +392,13 @@ function RouteOptimizer() {
     const prev = versions[versions.length - 1];
     const v = {
       id: (prev?.id || 0) + 1, label, source, trigger: trigger || null,
-      results: r, locations, inputs, request: request || null, settings: settings || snapshotSettings(),
+      results: r, locations, inputs, request: request || null, settings: settings || { ...snapshotSettings(), vehicles: request?.vehicles || vehicles },
     };
     setVersions(list => [...list, v].slice(-MAX_VERSIONS));
     setCompareBase(baseId ?? prev?.id ?? null);
     setShowCompare(true);
     setResults(r);
+    if (request?.vehicles) setVehicles(request.vehicles);
     setLastLocations(locations);
     setStale(null);
     setReplan(null);
@@ -374,7 +438,7 @@ function RouteOptimizer() {
         label: versions.length ? 'Re-run by hand' : 'Initial plan', source: 'manual',
       });
     } catch (err) {
-      setError(err.message || 'Failed to optimize route');
+      if (!err.superseded) setError(err.message || 'Failed to optimize route');
     } finally {
       setLoading(false);
     }
@@ -392,7 +456,8 @@ function RouteOptimizer() {
         body: JSON.stringify({
           legs: incidentLegs(results),
           num_accidents: NUM_ACCIDENTS,
-          energy_params: energyParams
+          energy_params: energyParams,
+          expected_energy_model: results.energy_model
         })
       });
 
@@ -423,7 +488,8 @@ function RouteOptimizer() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           vehicles: lowRoutes.map(r => ({ vehicle_id: r.vehicle_id, battery_kwh: r.battery_capacity_kwh, reserve_pct: reserveOf(r), legs: r.legs })),
-          energy_params: energyParams
+          energy_params: energyParams,
+          expected_energy_model: results.energy_model
         })
       });
 
@@ -469,15 +535,17 @@ function RouteOptimizer() {
     const v = versions[versions.length - 1];
     if (!v?.request || v.source === 'breakdown' || v.results?.ortools_fleet?.disruption) return;
     let cancelled = false;
+    const generation = solveSequence.current;
     (async () => {
       try {
         const res = await fetch(`${API_BASE}/suggest`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...v.request, precomputed: v.inputs, results: v.results, lang: chatLang.current }),
+          body: JSON.stringify({ ...v.request, precomputed: v.inputs, results: v.results,
+            plan_context: JSON.stringify(v.settings), lang: 'en' }),
         });
         const s = (await res.json()).suggestion;
-        if (cancelled || !s) return;
+        if (cancelled || generation !== solveSequence.current || !s) return;
         const key = `${s.kind}|${s.fix?.label || '-'}|${JSON.stringify(v.settings)}`;
         if (suggested.current.has(key)) return;
         suggested.current.add(key);
@@ -488,6 +556,7 @@ function RouteOptimizer() {
   }, [versions]);
 
   const runBreakdown = async (req) => {
+    const generation = ++solveSequence.current;
     const base = cleanVersion;
     if (!base) return { error: true, text: 'Run Optimize first — a breakdown is simulated on the current plan.' };
     const r = base.results;
@@ -502,6 +571,7 @@ function RouteOptimizer() {
         locations: base.locations,
         vehicles: base.settings.vehicles,
         energy_params: base.settings.energyParams,
+        expected_energy_model: base.results.energy_model,
         goals: base.settings.goals,
         plan,
         event: { vehicle_index: a.vehicle_index, after_stop: a.after_stop, at_minute: a.at_minute, spare_truck: a.spare_truck },
@@ -511,6 +581,7 @@ function RouteOptimizer() {
     });
     const data = await response.json();
     if (data.status === 'error') throw new Error(data.message);
+    if (generation !== solveSequence.current) { const err = new Error('Configuration changed'); err.superseded = true; throw err; }
     if (data.nothing) return { text: data.message };
     const after = { ...r, ortools_fleet: data.results.ortools_fleet };
     const v = commitVersion({
@@ -523,6 +594,7 @@ function RouteOptimizer() {
   };
 
   const runChatResolve = async (req) => {
+    const generation = ++solveSequence.current;
     const before = currentVersion;
     let locations = useDepot && validatedDepot && validatedLocations.length >= 2
       ? [validatedDepot, ...validatedLocations] : null;
@@ -531,7 +603,7 @@ function RouteOptimizer() {
       locations = await geocodeAll();
     }
     setResolvingNote('Re-solving with your chat changes…');
-    const out = await callOptimize(locations, before);
+    const out = await callOptimize(locations, before, generation);
     const label = req.changes[0]?.label || (before ? 'Re-run' : 'Initial plan');
     const v = commitVersion({
       ...out, locations, label: req.changes.length > 1 ? `${label} +${req.changes.length - 1}` : label,
@@ -557,7 +629,7 @@ function RouteOptimizer() {
       try {
         out = req.action?.type === 'breakdown' ? await runBreakdown(req) : await runChatResolve(req);
       } catch (err) {
-        setStale(`Couldn't re-solve: ${err.message}`);
+        if (!err.superseded) setStale(`Couldn't re-solve: ${err.message}`);
         out = { error: true, text: `Couldn't re-solve: ${err.message}` };
       } finally {
         setResolvingNote(null);
@@ -681,8 +753,17 @@ function RouteOptimizer() {
       case 'solver':
         setSolver(value);
         break;
-      case 'driving_style':
-        setEnergyParams(prev => ({ ...prev, driving_style: value }));
+      case 'vehicle_style_overrides':
+        solveSequence.current += 1;
+        setVehicles(prev => applyStyleOverrides(prev, value));
+        setDrive(null);
+        setProactive(null);
+        break;
+      case 'driver_assignments':
+        solveSequence.current += 1;
+        setVehicles(value);
+        setDrive(null);
+        setProactive(null);
         break;
       case 'traffic':
         setTraffic(value?.departure || null);
@@ -703,7 +784,8 @@ function RouteOptimizer() {
             battery_packs: packs,
             battery_kwh: packs * 20,
             weight_lbs: weight,
-            driver: v.driver || '',
+            driver: v.driver || '', driver_id: v.driver_id || null, driver_snapshot: v.driver_snapshot || null,
+            driver_default_style: v.driver_default_style || 'normal', driving_style_override: v.driving_style_override ?? null,
           };
         }));
         break;
@@ -720,14 +802,11 @@ function RouteOptimizer() {
     vehicle_count: vehicles.length,
     battery_packs: vehicles[0]?.battery_packs ?? 4,
     vehicle_weight_lbs: vehicles[0]?.weight_lbs ?? 13000,
-    fleet: vehicles.map(v => ({
-      name: v.name, battery_packs: v.battery_packs,
-      weight_lbs: v.weight_lbs, driver: v.driver || '',
-    })),
+    fleet: vehicles.map(v => ({ ...v })),
     temperature_c: energyParams.temperature_c,
     unload_time_min: energyParams.unload_time_min,
     has_climate_control: energyParams.has_climate_control,
-    driving_style: energyParams.driving_style,
+    plan_context: JSON.stringify(snapshotSettings()),
     traffic: { departure: traffic },
     solver,
     goals,
@@ -798,7 +877,7 @@ function RouteOptimizer() {
             </button>
           ))}
         </nav>
-        <span className="text-xs text-slate-600 hidden lg:block">Held-Karp TSP · OR-Tools CVRP · Mercedes eActros Energy Model</span>
+        <span className="text-xs text-slate-600 hidden lg:block">Held-Karp TSP · OR-Tools CVRP · City NN Energy Model</span>
         <div className={`ml-auto flex items-center gap-3 ${activeTab === 'solver' ? '' : 'hidden'}`}>
           {loading && (
             <span className="text-xs text-blue-400 flex items-center gap-1.5">
@@ -840,9 +919,8 @@ function RouteOptimizer() {
               vehicleCount={vehicles.length}
               traffic={traffic}
               onTrafficChange={(t) => { setTraffic(t); if (results) setStale('Traffic changed — click Optimize Routes to re-solve.'); }}
-              drivingStyle={energyParams.driving_style}
-              onStyleChange={(st) => { setEnergyParams(p => ({ ...p, driving_style: st }));
-                                       if (results) setStale('Driving style changed — click Optimize Routes to re-solve.'); }}
+              drivingStyle={vehicles.every(v => effectiveStyle(v) === effectiveStyle(vehicles[0])) ? effectiveStyle(vehicles[0]) : 'mixed'}
+              onStyleChange={st => changeDriverConfig(vehicles.map(v => ({ ...v, driving_style_override: st })), `All trucks → ${st} for this run`)}
             />
 
             <div className="border-t border-slate-800" />
@@ -921,15 +999,15 @@ function RouteOptimizer() {
               </div>
 
               <p className="text-[10px] text-slate-600 leading-relaxed">
-                Model E energy regression · real-world validated · weight decreases leg-by-leg as cargo is delivered
+                City NN · synthetic driving traces · each truck uses its effective driving style and unloading weight
               </p>
               <div className="mt-2 p-2 bg-slate-900 rounded-lg border border-slate-800">
                 <p className="text-[9px] text-slate-500 mb-1 font-semibold uppercase tracking-wider">Calculated with:</p>
                 <p className="text-[9px] text-slate-400 font-mono leading-relaxed break-all">
-                  E/km = β₀ + β₁v + β₂T + β₃W + β₄Δh + β₅v² + β₆(W·g) + β₇(v·g) + β₈(v²T) + β₉(v²·alt)
+                  Energy = City NN propulsion + auxiliary energy over driving time
                 </p>
                 <p className="text-[9px] text-slate-600 mt-1 leading-relaxed">
-                  v=speed (km/h) · T=temp (°C) · W=weight (t) · Δh=elev gain (m) · g=grade (m/km) · alt=altitude (m) · R²=0.9997
+                  Synthetic acceleration, speed, elevation, temperature and load features. Predictions are estimates; Eco savings are checked by replanning.
                 </p>
               </div>
             </section>
@@ -964,13 +1042,9 @@ function RouteOptimizer() {
                         </button>
                       )}
                     </div>
-                    {v.driver && (
-                      <div className="flex items-center gap-2 mb-2 -mt-1">
-                        <span className="text-[10px] text-slate-500 flex items-center gap-1">
-                          <User className="w-2.5 h-2.5" />{v.driver}
-                        </span>
-                      </div>
-                    )}
+                    <VehicleDriverControls vehicle={v} drivers={drivers}
+                      onAssign={driver => changeDriverConfig(assignDriver(vehicles, v.id, driver), `${v.name}: driver ${driver?.name || 'unassigned'}`)}
+                      onOverride={style => changeDriverConfig(applyStyleOverrides(vehicles, [{ vehicle_id: v.id, driving_style_override: style }]), `${v.name}: ${style || 'driver default'}`)} />
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="text-[10px] text-slate-500 block mb-1">Battery Packs</label>
@@ -1043,6 +1117,7 @@ function RouteOptimizer() {
                 <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Delivery Stops</h3>
                 <div className="flex items-center gap-3">
                   <button
+                    disabled={SAVED_DEMO}
                     onClick={() => loadDemoAddresses('/demo_stops_traffic_area.txt')}
                     title="Stops inside the traffic data area (Cerritos – Stanton)"
                     className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
@@ -1109,6 +1184,11 @@ function RouteOptimizer() {
 
           {/* Sidebar footer — action buttons */}
           <div className="flex-shrink-0 p-4 border-t border-slate-800 space-y-2">
+            {SAVED_DEMO && <div className="rounded-lg border border-sky-500/30 bg-sky-950/30 p-3 text-xs text-sky-200">
+              <p className="font-semibold">Anaheim saved-data demo</p>
+              <p className="mt-1 text-sky-200/70">City NN runs locally. Road matrices are cached; the map shows stop order. Live traffic and Google map searches are unavailable.</p>
+              <button className="underline mt-2" onClick={loadSavedDemo}>Reload sample fleet</button>
+            </div>}
             {error && (
               <div className="bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2 text-red-400 text-xs flex items-start gap-2">
                 <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
@@ -1241,11 +1321,12 @@ function RouteOptimizer() {
                   <h2 className="text-white font-semibold text-lg">Optimization Results</h2>
                   <p className="text-slate-500 text-sm mt-0.5">
                     {lastLocations.length} stops
+                    {!fleet && ` · ${hk?.driver || 'Unassigned driver'} · ${hk?.effective_driving_style || 'normal'} (${hk?.style_source === 'run_override' ? 'run override' : 'driver default'})`}
                     {fleet && ` · ${fleet.num_vehicles_used} vehicle${fleet.num_vehicles_used !== 1 ? 's' : ''} dispatched`}
                     {fleet && fleet.num_vehicles_requested !== fleet.num_vehicles_used && ` (${fleet.num_vehicles_requested} requested)`}
                     {results.solver && ` · solver: ${results.solver.requested === 'auto' ? 'auto' : results.solver.baseline_label}`}
                     {results.goals && ` · goals: ${goalsSummary(results.goals)}`}
-                    {results.driving_style && results.driving_style !== 'normal' && ` · ${results.driving_style} driving`}
+                    {' · City NN energy'}
                   </p>
                   {hk.traffic && (
                     <p className="text-xs text-slate-500 mt-1">
@@ -1613,8 +1694,9 @@ function RouteOptimizer() {
                           </button>
                         )}
                         <button
+                          title={SAVED_DEMO ? 'Requires live Google Maps credentials' : undefined}
                           onClick={findHotspots}
-                          disabled={replanning || replan !== null}
+                          disabled={SAVED_DEMO || replanning || replan !== null}
                           className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-red-500/30 text-red-400 rounded-lg text-xs font-medium transition-colors"
                         >
                           {replanning
@@ -1715,7 +1797,7 @@ function RouteOptimizer() {
               })()}
 
               {/* Map */}
-              <RouteMap
+              {SAVED_DEMO ? <SchematicRouteMap results={results} locations={lastLocations} /> : <RouteMap
                 results={results}
                 locations={lastLocations}
                 replan={replan}
@@ -1723,7 +1805,7 @@ function RouteOptimizer() {
                 activeLegs={activeLegs}
                 chargingPlans={chargingPlans ? Object.values(chargingPlans) : []}
                 drive={drive}
-              />
+              />}
 
               {/* Charts */}
               <FleetCharts results={results} />
@@ -1766,8 +1848,9 @@ function RouteOptimizer() {
                       <span className="text-sm font-medium text-slate-300">Fleet Stop Assignments</span>
                       {results.ortools_fleet.routes.some(belowReserve) && (
                         <button
+                          title={SAVED_DEMO ? 'Requires live Google Maps credentials' : undefined}
                           onClick={findChargingStops}
-                          disabled={planningCharging || chargingPlans !== null}
+                          disabled={SAVED_DEMO || planningCharging || chargingPlans !== null}
                           className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-cyan-500/30 text-cyan-300 rounded-lg text-xs font-medium transition-colors"
                         >
                           {planningCharging
@@ -1793,6 +1876,7 @@ function RouteOptimizer() {
                                 <User className="w-2.5 h-2.5" />{route.driver}
                               </span>
                             )}
+                            <span className="text-[10px] text-slate-400">{route.effective_driving_style || 'normal'} · {route.style_source === 'run_override' ? 'run override' : route.driver_id ? 'driver default' : 'default'}</span>
                             {route.status && route.status !== 'continues' && (
                               <span className={`text-[9px] px-1.5 rounded border ${
                                 route.status === 'broken_down' ? 'bg-red-500/15 text-red-300 border-red-500/40'
@@ -1921,7 +2005,7 @@ function RouteOptimizer() {
           )}
         </main>
       </div>
-      <AIChatbot formState={chatFormState} onApplyChange={applyChatChange} onTurn={handleChatTurn} proactive={proactive}
+      <AIChatbot onProfilesChanged={refreshDrivers} formState={chatFormState} onApplyChange={applyChatChange} onTurn={handleChatTurn} proactive={proactive}
                  onDockChange={setChatDocked} />
     </div>
   );

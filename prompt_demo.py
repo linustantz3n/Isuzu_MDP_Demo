@@ -112,7 +112,7 @@ def ask(msg, pending=None, history=None):
         except Exception as e:
             err = e
             time.sleep(1 + attempt)
-    return {"status": "error", "intent": "连接失败", "source": "-",
+    return {"status": "error", "intent": "Connection failed", "source": "-",
             "message": str(err), "changes": [], "rejected": [], "pending": None}
 
 

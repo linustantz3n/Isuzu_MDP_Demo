@@ -37,9 +37,9 @@ One file, in sections, top to bottom:
 ### Energy model ([explained here](energy-model.md)) — in [`energy.py`](../energy.py)
 | Function | Does |
 |---|---|
-| `calculate_energy_consumption(distance_km, avg_speed_kmh, temperature_c, vehicle_weight_tonnes, altitude_diff_m, altitude_m, has_climate_control=True, driving_style='normal')` | Model E regression for one leg → `{energy_kwh, energy_per_km, ..., breakdown}` |
+| `calculate_energy_consumption(distance_km, avg_speed_kmh, temperature_c, vehicle_weight_tonnes, altitude_diff_m, altitude_m, has_climate_control=True, driving_style='normal')` | City NN for one leg → `{energy_kwh, energy_per_km, ..., breakdown}` |
 | `estimate_average_speed(distance_m, time_s)` | Leg average speed in km/h |
-| `energy_matrix_kwh(dist, time, elevation_m, weight_lbs, ...)` | Model E energy for every pair of stops at one weight (inf when unroutable) |
+| `energy_matrix_kwh(dist, time, elevation_m, weight_lbs, ...)` | City NN energy for every pair of stops at one weight (inf when unroutable) |
 | `energy_upper_bound_matrix_wh(dist, time, elevation_m, loaded_weight_lbs, base_weight_lbs, ...)` | Integer Wh per arc that never undershoots the real energy: every battery limit uses it |
 | `battery_limit_wh(battery_kwh, reserve_pct)` | Wh a truck may use before its reserve |
 
@@ -52,7 +52,7 @@ One file, in sections, top to bottom:
 | [`recommend_solver(stops, vehicles, need_optimal, lang)`](../route_optimizer_backend.py#L531) | Which solver fits, and the reason (used by the chat and by `auto`) |
 | [`solver_table(stops, vehicles, lang)`](../route_optimizer_backend.py#L576) | Per-solver feasibility and cost (chat table) |
 | [`resolve_solver(requested, stops, vehicles)`](../route_optimizer_backend.py#L605) | **Turns the `solver` setting into the list of algorithms `/api/optimize` runs** |
-| `REASONS`, `PHRASES`, `format_duration`, `detect_lang` | English/Chinese text for the advice |
+| `REASONS`, `PHRASES`, `format_duration`, `detect_lang` | English text for the advice |
 
 ### Optimization goals, truck limits and breakdown re-planning ([explained here](planning.md))
 | Name | Does |
@@ -185,7 +185,7 @@ Created with Create React App and styled with Tailwind. The entry chain is `src/
 | File | What it is |
 |---|---|
 | `prompt_test.py` / `prompt_test_results.txt` | Prompt battery for `/api/chat`, with its last results |
-| `r4_test.py` / `r4_test_results*.txt` | R4 test set: 50 bilingual weight / traffic / style requests, parameters, traceability and metric direction |
+| `r4_test.py` / `r4_test_results*.txt` | R4 test set: 50 English weight / traffic / style requests, parameters, traceability and metric direction |
 | `prompt_demo.py` / `prompt_demo_results.txt` | Ten example prompts with full replies |
 | `route_optimizer.jsx` | **Legacy.** A standalone React prototype from the first commit that solved the TSP in the browser. Nothing imports it; the live app is `route-optimizer-frontend/` |
 | `google_maps_api_guide.md` | Reference notes on the Geocoding, Distance Matrix and Directions APIs |

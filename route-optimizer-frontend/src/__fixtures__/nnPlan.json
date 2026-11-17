@@ -1,0 +1,628 @@
+{
+  "status": "ok",
+  "mode": "distance",
+  "num_locations": 3,
+  "vehicles": [
+    {
+      "id": 1,
+      "name": "Truck 1",
+      "battery_packs": 4,
+      "battery_kwh": 80,
+      "weight_lbs": 13000,
+      "driver": "",
+      "driver_snapshot": null,
+      "driver_id": null,
+      "driver_default_style": "normal",
+      "driving_style_override": null,
+      "effective_driving_style": "normal",
+      "style_source": "default"
+    }
+  ],
+  "energy_model": {
+    "name": "city_nn",
+    "model_version": "energy_nn_v1",
+    "sha256": "55dc579913123773589f8858293ff7b17313af641292941a9843799430e394d5",
+    "adapter_version": "aggregate_leg_v2_load_bounds"
+  },
+  "results": {
+    "optimal": {
+      "order": [
+        0,
+        1,
+        2
+      ],
+      "cost": 30000,
+      "algorithm": "held_karp (via brute_force)",
+      "solve_time_ms": 0.009775161743164062,
+      "driver_id": null,
+      "driver": "",
+      "driver_snapshot": null,
+      "driver_default_style": "normal",
+      "driving_style_override": null,
+      "effective_driving_style": "normal",
+      "style_source": "default",
+      "total_distance_m": 30000,
+      "total_distance_mi": 18.641182099494202,
+      "total_time_s": 4800,
+      "total_time_min": 80.0,
+      "return_to_start": true,
+      "ordered_locations": [
+        {
+          "address": "0",
+          "lat": 0,
+          "lng": 0
+        },
+        {
+          "address": "1",
+          "lat": 1,
+          "lng": 0
+        },
+        {
+          "address": "2",
+          "lat": 2,
+          "lng": 0
+        }
+      ],
+      "travel_time_s": 1200,
+      "unload_time_s": 3600,
+      "legs": [
+        {
+          "from": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "to": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "distance_m": 10000,
+          "distance_mi": 6.213727366498068,
+          "distance_km": 10.0,
+          "time_s": 400,
+          "time_min": 6.666666666666667,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 0.0,
+          "elevation_to_m": 10.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 13000.0,
+          "vehicle_weight_tonnes": 5.897,
+          "energy_kwh": 9.264261157730571,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9264261157730571,
+          "energy_per_mile": 1.4909383108626748,
+          "energy_breakdown": {
+            "propulsion": 7.708705602175016,
+            "base_aux": 0.5555555555555556,
+            "epto": 0.5555555555555556,
+            "hvac": 0.4444444444444444
+          }
+        },
+        {
+          "from": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "to": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "distance_m": 5000,
+          "distance_mi": 3.106863683249034,
+          "distance_km": 5.0,
+          "time_s": 200,
+          "time_min": 3.3333333333333335,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 10.0,
+          "elevation_to_m": 20.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 10000.0,
+          "vehicle_weight_tonnes": 4.536,
+          "energy_kwh": 4.981553341783969,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9963106683567938,
+          "energy_per_mile": 1.603406596255996,
+          "energy_breakdown": {
+            "propulsion": 4.203775564006191,
+            "base_aux": 0.2777777777777778,
+            "epto": 0.2777777777777778,
+            "hvac": 0.2222222222222222
+          }
+        },
+        {
+          "from": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "to": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "distance_m": 15000,
+          "distance_mi": 9.320591049747101,
+          "distance_km": 15.0,
+          "time_s": 600,
+          "time_min": 10.0,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 20.0,
+          "elevation_to_m": 0.0,
+          "elevation_gain_m": -20.0,
+          "vehicle_weight_lbs": 7000.0,
+          "vehicle_weight_tonnes": 3.175,
+          "energy_kwh": 11.80372042621562,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.7869146950810413,
+          "energy_per_mile": 1.2664164430405034,
+          "energy_breakdown": {
+            "propulsion": 9.470387092882286,
+            "base_aux": 0.8333333333333333,
+            "epto": 0.8333333333333333,
+            "hvac": 0.6666666666666666
+          },
+          "return_leg": true
+        }
+      ],
+      "total_energy_kwh": 26.04953492573016,
+      "avg_energy_per_km": 0.868317830857672,
+      "avg_energy_per_mile": 1.397418617912486,
+      "weight_params": {
+        "total_weight_lbs": 13000.0,
+        "base_weight_lbs": 7000.0,
+        "cargo_weight_lbs": 6000.0,
+        "weight_per_stop_lbs": 3000.0,
+        "num_delivery_stops": 2
+      },
+      "battery_capacity_kwh": 80.0,
+      "battery_remaining_kwh": 53.95,
+      "battery_remaining_pct": 67.4,
+      "battery_depleted": false,
+      "battery_reserve_pct": 20,
+      "battery_reserve_ok": true,
+      "eta_s": [
+        0,
+        400,
+        2400,
+        4800
+      ],
+      "battery_depletion": null,
+      "google_maps_url": "https://www.google.com/maps/dir/?api=1&origin=0,0&destination=0,0&waypoints=1,0|2,0"
+    },
+    "greedy": {
+      "order": [
+        0,
+        1,
+        2
+      ],
+      "cost": 30000,
+      "algorithm": "nearest_neighbor",
+      "solve_time_ms": 0.004291534423828125,
+      "driver_id": null,
+      "driver": "",
+      "driver_snapshot": null,
+      "driver_default_style": "normal",
+      "driving_style_override": null,
+      "effective_driving_style": "normal",
+      "style_source": "default",
+      "total_distance_m": 30000,
+      "total_distance_mi": 18.641182099494202,
+      "total_time_s": 4800,
+      "total_time_min": 80.0,
+      "return_to_start": true,
+      "ordered_locations": [
+        {
+          "address": "0",
+          "lat": 0,
+          "lng": 0
+        },
+        {
+          "address": "1",
+          "lat": 1,
+          "lng": 0
+        },
+        {
+          "address": "2",
+          "lat": 2,
+          "lng": 0
+        }
+      ],
+      "travel_time_s": 1200,
+      "unload_time_s": 3600,
+      "legs": [
+        {
+          "from": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "to": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "distance_m": 10000,
+          "distance_mi": 6.213727366498068,
+          "distance_km": 10.0,
+          "time_s": 400,
+          "time_min": 6.666666666666667,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 0.0,
+          "elevation_to_m": 10.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 13000.0,
+          "vehicle_weight_tonnes": 5.897,
+          "energy_kwh": 9.264261157730571,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9264261157730571,
+          "energy_per_mile": 1.4909383108626748,
+          "energy_breakdown": {
+            "propulsion": 7.708705602175016,
+            "base_aux": 0.5555555555555556,
+            "epto": 0.5555555555555556,
+            "hvac": 0.4444444444444444
+          }
+        },
+        {
+          "from": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "to": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "distance_m": 5000,
+          "distance_mi": 3.106863683249034,
+          "distance_km": 5.0,
+          "time_s": 200,
+          "time_min": 3.3333333333333335,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 10.0,
+          "elevation_to_m": 20.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 10000.0,
+          "vehicle_weight_tonnes": 4.536,
+          "energy_kwh": 4.981553341783969,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9963106683567938,
+          "energy_per_mile": 1.603406596255996,
+          "energy_breakdown": {
+            "propulsion": 4.203775564006191,
+            "base_aux": 0.2777777777777778,
+            "epto": 0.2777777777777778,
+            "hvac": 0.2222222222222222
+          }
+        },
+        {
+          "from": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "to": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "distance_m": 15000,
+          "distance_mi": 9.320591049747101,
+          "distance_km": 15.0,
+          "time_s": 600,
+          "time_min": 10.0,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 20.0,
+          "elevation_to_m": 0.0,
+          "elevation_gain_m": -20.0,
+          "vehicle_weight_lbs": 7000.0,
+          "vehicle_weight_tonnes": 3.175,
+          "energy_kwh": 11.80372042621562,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.7869146950810413,
+          "energy_per_mile": 1.2664164430405034,
+          "energy_breakdown": {
+            "propulsion": 9.470387092882286,
+            "base_aux": 0.8333333333333333,
+            "epto": 0.8333333333333333,
+            "hvac": 0.6666666666666666
+          },
+          "return_leg": true
+        }
+      ],
+      "total_energy_kwh": 26.04953492573016,
+      "avg_energy_per_km": 0.868317830857672,
+      "avg_energy_per_mile": 1.397418617912486,
+      "weight_params": {
+        "total_weight_lbs": 13000.0,
+        "base_weight_lbs": 7000.0,
+        "cargo_weight_lbs": 6000.0,
+        "weight_per_stop_lbs": 3000.0,
+        "num_delivery_stops": 2
+      },
+      "battery_capacity_kwh": 80.0,
+      "battery_remaining_kwh": 53.95,
+      "battery_remaining_pct": 67.4,
+      "battery_depleted": false,
+      "battery_reserve_pct": 20,
+      "battery_reserve_ok": true,
+      "eta_s": [
+        0,
+        400,
+        2400,
+        4800
+      ],
+      "battery_depletion": null,
+      "google_maps_url": "https://www.google.com/maps/dir/?api=1&origin=0,0&destination=0,0&waypoints=1,0|2,0"
+    },
+    "2opt": {
+      "order": [
+        0,
+        1,
+        2
+      ],
+      "cost": 30000,
+      "algorithm": "2-opt",
+      "solve_time_ms": 0.0050067901611328125,
+      "driver_id": null,
+      "driver": "",
+      "driver_snapshot": null,
+      "driver_default_style": "normal",
+      "driving_style_override": null,
+      "effective_driving_style": "normal",
+      "style_source": "default",
+      "total_distance_m": 30000,
+      "total_distance_mi": 18.641182099494202,
+      "total_time_s": 4800,
+      "total_time_min": 80.0,
+      "return_to_start": true,
+      "ordered_locations": [
+        {
+          "address": "0",
+          "lat": 0,
+          "lng": 0
+        },
+        {
+          "address": "1",
+          "lat": 1,
+          "lng": 0
+        },
+        {
+          "address": "2",
+          "lat": 2,
+          "lng": 0
+        }
+      ],
+      "travel_time_s": 1200,
+      "unload_time_s": 3600,
+      "legs": [
+        {
+          "from": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "to": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "distance_m": 10000,
+          "distance_mi": 6.213727366498068,
+          "distance_km": 10.0,
+          "time_s": 400,
+          "time_min": 6.666666666666667,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 0.0,
+          "elevation_to_m": 10.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 13000.0,
+          "vehicle_weight_tonnes": 5.897,
+          "energy_kwh": 9.264261157730571,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9264261157730571,
+          "energy_per_mile": 1.4909383108626748,
+          "energy_breakdown": {
+            "propulsion": 7.708705602175016,
+            "base_aux": 0.5555555555555556,
+            "epto": 0.5555555555555556,
+            "hvac": 0.4444444444444444
+          }
+        },
+        {
+          "from": {
+            "address": "1",
+            "lat": 1,
+            "lng": 0
+          },
+          "to": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "distance_m": 5000,
+          "distance_mi": 3.106863683249034,
+          "distance_km": 5.0,
+          "time_s": 200,
+          "time_min": 3.3333333333333335,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 10.0,
+          "elevation_to_m": 20.0,
+          "elevation_gain_m": 10.0,
+          "vehicle_weight_lbs": 10000.0,
+          "vehicle_weight_tonnes": 4.536,
+          "energy_kwh": 4.981553341783969,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.9963106683567938,
+          "energy_per_mile": 1.603406596255996,
+          "energy_breakdown": {
+            "propulsion": 4.203775564006191,
+            "base_aux": 0.2777777777777778,
+            "epto": 0.2777777777777778,
+            "hvac": 0.2222222222222222
+          }
+        },
+        {
+          "from": {
+            "address": "2",
+            "lat": 2,
+            "lng": 0
+          },
+          "to": {
+            "address": "0",
+            "lat": 0,
+            "lng": 0
+          },
+          "distance_m": 15000,
+          "distance_mi": 9.320591049747101,
+          "distance_km": 15.0,
+          "time_s": 600,
+          "time_min": 10.0,
+          "avg_speed_kmh": 90.0,
+          "avg_speed_mph": 55.92339,
+          "elevation_from_m": 20.0,
+          "elevation_to_m": 0.0,
+          "elevation_gain_m": -20.0,
+          "vehicle_weight_lbs": 7000.0,
+          "vehicle_weight_tonnes": 3.175,
+          "energy_kwh": 11.80372042621562,
+          "effective_driving_style": "normal",
+          "energy_per_km": 0.7869146950810413,
+          "energy_per_mile": 1.2664164430405034,
+          "energy_breakdown": {
+            "propulsion": 9.470387092882286,
+            "base_aux": 0.8333333333333333,
+            "epto": 0.8333333333333333,
+            "hvac": 0.6666666666666666
+          },
+          "return_leg": true
+        }
+      ],
+      "total_energy_kwh": 26.04953492573016,
+      "avg_energy_per_km": 0.868317830857672,
+      "avg_energy_per_mile": 1.397418617912486,
+      "weight_params": {
+        "total_weight_lbs": 13000.0,
+        "base_weight_lbs": 7000.0,
+        "cargo_weight_lbs": 6000.0,
+        "weight_per_stop_lbs": 3000.0,
+        "num_delivery_stops": 2
+      },
+      "battery_capacity_kwh": 80.0,
+      "battery_remaining_kwh": 53.95,
+      "battery_remaining_pct": 67.4,
+      "battery_depleted": false,
+      "battery_reserve_pct": 20,
+      "battery_reserve_ok": true,
+      "eta_s": [
+        0,
+        400,
+        2400,
+        4800
+      ],
+      "battery_depletion": null,
+      "google_maps_url": "https://www.google.com/maps/dir/?api=1&origin=0,0&destination=0,0&waypoints=1,0|2,0"
+    }
+  },
+  "comparison": {
+    "distance_saved_m": 0,
+    "distance_saved_mi": 0.0,
+    "distance_saved_percent": 0.0,
+    "time_saved_s": 0,
+    "time_saved_min": 0.0,
+    "time_saved_percent": 0.0,
+    "energy_saved_kwh": 0.0,
+    "energy_saved_percent": 0.0
+  },
+  "solver": {
+    "requested": "auto",
+    "effective": "held_karp",
+    "algorithms": [
+      "held_karp",
+      "nearest_neighbor",
+      "2opt"
+    ],
+    "fallback_baseline": "2opt",
+    "held_karp_estimate_ms": 0.001224,
+    "note": null,
+    "baseline_solver": "held_karp",
+    "baseline_label": "Held-Karp",
+    "baseline_exact": true
+  },
+  "energy_params": {
+    "temperature_c": 20.0,
+    "temperature_f": 68.0,
+    "vehicle_weight_tonnes": 5.896707822663316,
+    "vehicle_weight_lbs": 13000.0,
+    "has_climate_control": true,
+    "model": "city_nn"
+  },
+  "matrices": {
+    "distance": [
+      [
+        0,
+        10000,
+        15000
+      ],
+      [
+        10000,
+        0,
+        5000
+      ],
+      [
+        15000,
+        5000,
+        0
+      ]
+    ],
+    "time": [
+      [
+        0,
+        400,
+        600
+      ],
+      [
+        400,
+        0,
+        200
+      ],
+      [
+        600,
+        200,
+        0
+      ]
+    ]
+  },
+  "traffic": null,
+  "elevations": [
+    0.0,
+    10.0,
+    20.0
+  ],
+  "goals": {
+    "distance": "high",
+    "time": "off",
+    "energy": "off",
+    "balance": "off",
+    "battery_reserve_pct": 20,
+    "weights": {
+      "distance": 1.0,
+      "time": 0.0,
+      "energy": 0.0,
+      "balance": 0.0
+    }
+  },
+  "priority_stops": []
+}

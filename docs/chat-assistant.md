@@ -1,357 +1,80 @@
-# Chat assistant
+# Chat assistant and driver assignments
 
-**Code:** the "AI Chat" and "Driver memory" sections of [`route_optimizer_backend.py`](../route_optimizer_backend.py#L2443)
-(endpoint: [`ai_chat()`](../route_optimizer_backend.py#L4305)), and the UI in
-[`AIChatbot.jsx`](../route-optimizer-frontend/src/AIChatbot.jsx).
+The demo, backend replies, prompts and examples are English. User-supplied names and addresses are preserved. The assistant handles goals, form changes, solver advice, driver memory, truck limits and breakdowns. Its fast path handles known commands without an LLM key; other phrasings use the configured OpenAI-compatible extraction service. Extracted changes are validated against the operator's own evidence before application.
 
-The assistant tunes the optimizer in plain language. The operator describes the day ("battery
-is tight", "we're running late", "truck 2 broke down"). The assistant turns that into **one
-validated change at a time**: a form field, the optimization goals, or a priority stop. It also
-answers what a truck can handle, and simulates a breakdown on the current plan. The model only
-proposes; plain Python decides what is applied and writes every number in the reply. After a
-turn that changed something, the page re-solves and shows the plan before and after
-([below](#after-every-change-re-solve-and-compare)). What the goals and the breakdown re-plan
-do to the solver is in [planning.md](planning.md).
+## Driver workflow
 
-```
-operator utterance
-  ├─ 1. lexicon fast path      known phrasings ("temperature 30 C", "6 packs", "开空调", "re-optimize") → no model call
-  │      miss ↓                  talk of goals, limits or breakdowns always goes on to the model
-  ├─ 2. constrained extraction  GPT-4o-mini, strict JSON schema: an ordered list of steps (usually one)
-  └─ 3. deterministic validation, step by step in order
-         • schema + null coupling   exactly one typed value slot, matching the axis; ranges enforced
-         • evidence span            the quoted `evidence` must literally appear in the utterance (anti-hallucination)
-         • padding dropped          value-less changes, and fields restated as they already are, are discarded
-         • ambiguity flag / term    model flag OR bare place name with no state/ZIP → forces a question
-              ├─ apply change       one step, one axis; extra changes are queued and released per "yes"
-              ├─ ask a question     `pending` is echoed back by the client, so the session remembers it
-              ├─ recommend solver   which algorithm fits this problem size, and why
-              ├─ goals              the situation → goal levels; code turns levels into weights and explains them
-              ├─ limits             a truck's battery, payload and range, and whether today's routes fit
-              ├─ disruption         a breakdown on the current plan → an action the page runs (/api/replan)
-              ├─ memory             save / load / forget / list driver profiles
-              └─ out of scope       replies with the fixed capability list from code, not the model
-```
+Use these commands in order:
 
-| Stage | Code |
-|---|---|
-| Fields the assistant may change, with their ranges | [`AXES`](../route_optimizer_backend.py#L2479) |
-| What it says it can do | [`CAPABILITIES`](../route_optimizer_backend.py#L2534) |
-| 1. Lexicon | [`LEXICON`](../route_optimizer_backend.py#L3316), [`lexicon_fast_path()`](../route_optimizer_backend.py#L3460) |
-| 2. Extraction | [`EXTRACTION_SCHEMA`](../route_optimizer_backend.py#L3666), [`EXTRACTION_SYSTEM_PROMPT`](../route_optimizer_backend.py#L3674), [`call_extraction()`](../route_optimizer_backend.py#L3763) |
-| 3. Validation | [`validate_change()`](../route_optimizer_backend.py#L3803), [`validate_extraction()`](../route_optimizer_backend.py#L3965), [`route_outcome()`](../route_optimizer_backend.py#L4152) |
-| Running several steps | [`run_steps()`](../route_optimizer_backend.py#L4256) |
-| Goals, limits, breakdowns | [`outcome_goals()`](../route_optimizer_backend.py#L3105), [`outcome_limits()`](../route_optimizer_backend.py#L3181), [`outcome_disruption()`](../route_optimizer_backend.py#L3220) |
-| Building the reply | `outcome_apply / outcome_ask / outcome_recommend / outcome_memory / outcome_out_of_scope` |
-| Re-solving after a turn | `handleChatTurn` → `runChatResolve` / `runBreakdown` in `RouteOptimizer.jsx`; `onTurn` in `AIChatbot.jsx` |
-| Applying a change in the UI | [`applyChatChange`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L440) in `RouteOptimizer.jsx` |
+1. `Remember Wang as an aggressive driver.` saves Wang's usual driving style.
+2. `Assign Wang to Truck 2.` binds that saved driver to the existing truck. Truck 2 uses Aggressive unless a run override is set.
+3. `Use Eco for Truck 2 on this run.` overrides only this run; Wang's usual style remains Aggressive.
+4. `Restore driver default for Truck 2.` restores Aggressive.
 
-Fields (axes) and their limits: depot, stops (set / add / remove), vehicle count 1–10,
-battery packs 3–9, vehicle weight 10,000–19,500 lbs, temperature −10 to 40 °C, unload time
-5–120 min, climate control on/off, solver, priority stops (add / remove / set; each must be a
-stop already on the form), `goals` (set only by the goals intent) and `fleet` (set only by a
-driver recall).
+`Show saved drivers` lists profiles. Assignment targets may be existing truck IDs, exact vehicle names or an assigned driver's name. Unknown or ambiguous targets require clarification; no new truck is created implicitly. A driver may operate only one truck per run, so reassignment clears the previous binding. Truck packs, capacity and weight are preserved. `Assign Wang to Truck 2 and use Eco for Truck 2` applies the two operations in order.
 
-To apply every validated change in a single turn instead of one at a time, set
-`ONE_CHANGE_PER_TURN = False`. Replies are in English or Chinese, matching the operator's language.
+The Fleet Vehicles controls expose the same driver and run-style choices. `All trucks` is an explicit run override across the fleet. An unassigned truck defaults to Normal. The results show the driver, effective style and its source, and the comparison lists assignment and style changes. Changing a driver or style after solving triggers a new solve using the stored road matrices. A late response from an earlier solve cannot overwrite a newer driver configuration.
 
-**Which model.** The extraction step calls any OpenAI-compatible chat endpoint. By default that
-is OpenAI with `OPENAI_API_KEY`. To use the U-M GPT Toolkit, set `LLM_BASE_URL=https://api.toolkit.umgpt.umich.edu/v1`,
-`LLM_API_KEY` and, optionally, `LLM_MODEL` (default `gpt-4o-mini`) in `.env`. The Toolkit serves
-the same `gpt-4o-mini`, including the strict JSON-schema output the extraction relies on, and
-the prompt battery scores the same through it. Another model needs a re-run of `prompt_test.py`.
+Memory remains in `fleet_memory.json`; older profiles without a style read as Normal. Historical truck specification fields are retained but are never copied into a truck assignment. A plan stores each assigned driver's snapshot; later memory edits do not change saved plans. Reassign the driver to apply an updated usual style.
 
-Without a key in `.env`, the lexicon fast path still works. Everything else returns
-*out of scope* with the capability list.
+## Verified Eco suggestions
 
-## Several requests in one message
+After a solve, `/api/suggest` can test Eco run overrides when a truck is below its reserve or stops are unserved. It reuses the same locations, road matrices, departure/traffic settings, goals, driver snapshots and NN version. It first tests individual affected trucks, then a combined override when applicable.
 
-One message can ask for several actions in sequence. The model returns them as an ordered list
-of steps, and the server runs them in that order:
+An Eco suggestion must keep all previously served stops, satisfy the original reserve, and reduce unserved stops when that is the problem. It reports predicted energy, minimum battery percentage and finish-time changes. Any remaining unserved stops are disclosed. If no candidate qualifies, it does not promise a saving. Other existing candidates include changed goal weights, more battery packs and another truck.
 
-```
-"delete driver Han and Linus, then list all drivers"
-   -> Drivers Han, Linus deleted
-      2 drivers saved:
-      [Donghua] [Li]        one card per driver, with packs and weight when saved
-```
+Suggestions do not change the form automatically. `Yes` applies the tested override and re-solves; `No` discards it. A changed configuration or NN version invalidates a pending suggestion. A question such as `Would Eco help Truck 2?` does not change the run.
 
-- **A later step sees what an earlier one did.** The list runs after the deletion. "Use 3
-  trucks, then tell me which solver to use" gets advice for 3 trucks
-  ([`advance_form_state()`](../route_optimizer_backend.py#L4205) carries the form forward between steps).
-- **Most messages are still one step.** Several values in one sentence ("2 trucks with 6 packs")
-  form one step with several changes, and deleting several drivers is one step.
-- **One form change per message still holds.** If a second step would change the form again, it
-  is held behind a "yes / no" question, just as the second change of a single step is.
-- **A question stops the sequence.** If a step needs an answer (an ambiguous address, a queued
-  change, a solver-switch offer), the steps after it are not run, and the reply says so:
-  "The rest of your request is on hold until you answer — say it again afterwards."
-- **At most 5 steps** per message (`MAX_STEPS`).
-- Each step's reply goes on its own line, and every change from every step is applied to the
-  form in order.
+## Other supported operations
 
-## Optimizing in plain language
+- `Temperature 30 C`, `6 battery packs`, `turn off AC`, or `add a stop at ...` change form values.
+- `Battery is tight today`, `get everyone back sooner`, or `keep 20% battery in every truck` tune goals or reserve.
+- `Use live traffic` or `leave at 7:30` selects a departure. Traffic without a departure prompts for one.
+- `Which algorithm should I use?` explains the solver choice. `Re-optimize` reruns the plan.
+- `How far can Truck 2 go?` uses that truck's assigned style and specifications.
+- `Truck 2 broke down after its first stop` invokes the existing breakdown replanner. Driver styles remain attached to surviving trucks; a spare explicitly inherits the broken truck's effective style.
 
-The operator talks about the day; the assistant decides which settings move.
+## Natural driver requests with an LLM
 
-| The operator says | What happens |
-|---|---|
-| "battery is tight today" | goals: Energy → high, Distance → low |
-| "Battery is tight today — keep 20% in every truck" | Energy → high, and a 20% battery reserve |
-| "we're running late, get everyone back sooner" | Time → high, Balance → medium or high |
-| "drivers say the routes are unfair" | Balance → high |
-| "make sure no truck runs out of battery" | battery limit enforced (0% reserve) |
-| "how do the weights work?" | the current goals and weights, and the cost formula |
-| "deliver to Brea first" / "Cerritos is urgent" | Brea / Cerritos becomes a priority stop |
-| "what are the limits of a truck with 3 battery packs?" | 60 kWh, 6,559 lbs empty, 12,941 lbs payload, ~56–66 mi range at 20 °C, and whether today's longest route fits |
-| "truck 2 broke down after its first stop" | a breakdown re-plan: the stranded stops move to the other trucks |
-| "Wang's truck crashed an hour in, send a spare" | the same, 60 minutes after dispatch, with a spare truck allowed |
-| "re-optimize" | runs the optimizer (geocoding first if the stops changed) |
-| "we leave at 7:30" / "use live traffic" / "早上7点半出发" | traffic for that departure (07:30, or now); the plan is re-priced with Google's traffic prediction |
-| "plan with traffic" | asks when the trucks leave ("now" or a time) |
-| "drive in eco mode" / "take it easy" / "开得激进一点" | driving style eco / aggressive |
-| "drive in ludicrous mode" | rejected with the rule: driving style must be eco, normal or aggressive |
+The model can extract operations from expressions such as:
 
-The model picks a **level** per goal (off / low / medium / high, or raise / lower), from a
-closed enum. [`goal_weights()`](../route_optimizer_backend.py#L862) turns levels
-into weights, and the reply names each changed goal, what it does to the routes, and the new
-weights. The same gates as every other change apply, plus a few of their own:
+- `Please note that Wang usually drives aggressively.` saves a usual style.
+- `Put Wang behind the wheel of truck two today.` assigns Wang to Truck 2.
+- `Could you have Truck 2 take it easy on this run?` requests an Eco run override.
+- `Let Wang drive as usual today.` clears the override on Wang's assigned truck.
+- `Have every truck drive gently today.` requests Eco for the current fleet.
 
-- **Goal changes need the operator's words.** The `evidence` span must appear in the
-  message. A battery reserve above 0% also needs its number written in the message.
-- **A goal request filed as a form change still counts.** Late in a chat, "keep at least
-  20% battery in each truck" came back as a form change with empty battery-pack values,
-  and "we're running late" as priority stops nobody named, both answered with "I couldn't
-  verify that". When no form value survives, the model's goal update is used instead. A
-  reserve written out in the message (a percentage, a keep / reserve word, and a battery or
-  truck word, see [`reserve_from_words()`](../route_optimizer_backend.py#L3097)) is applied even
-  if the model left it out, or quoted words from earlier in the chat. A question about a
-  reserve ("what does a 20% reserve do?") only gets an explanation.
-- **A situation is never a solver switch.** "Get everyone back sooner" once came back as
-  "solver → nearest neighbor". A solver change now needs a solver word in its evidence:
-  solver, algorithm, Held-Karp, 2-opt, exact, optimal and the like.
-- **"I need a guaranteed optimal route for 12 stops"** names a problem size other than the
-  form's, so it is answered as a recommendation for that size. The solver is not pinned.
-- **A breakdown never guesses.** The truck must be named by its number (digits, a word or
-  an ordinal) or by its driver, and the moment by a stop count or a time. "A truck broke
-  down" asks which one. Stop 0 needs words like "leaving the depot", so "an hour in"
-  cannot turn into stop 0. A spare truck needs the word spare, backup or extra.
-- **Limits questions describe a hypothetical truck.** If the model returns "5 packs" as a
-  form change, it is folded back into the question and the form is left alone.
-- **Traffic takes its departure from the operator's words, not the model's.**
-  [`departure_in`](../route_optimizer_backend.py#L735) reads "7:30", "6pm", "leave at 7", "早上7点半", "now" or "live" from the
-  message. Whatever the model put in the slot ("on", a time), the change carries the time the
-  message says. A bare hour only counts after a word like "at" or "leave", so "2 trucks" and
-  "20 min" are not times. An impossible time ("25:00") is rejected rather than read as "now".
-  Traffic with no time asks "When do the trucks leave?", and the answer ("7:30", "now", "7") is
-  applied without a model call.
-- **A driving style must be named by its own words.** The evidence must contain a word for that
-  style ([`STYLE_WORD_RE`](../route_optimizer_backend.py#L2579): "eco", "gentle", "take it easy", "节能" → eco; "sporty", "hard",
-  "激进" → aggressive). "Ludicrous mode" is rejected with the rule "Driving style must be one of:
-  eco, normal, aggressive".
-- **Every reply shows where its values came from.** Each applied change shows the words it was
-  taken from ("from “we leave at 7:30”"), and each rejection shows its rule in full ("Skipped:
-  Driving style must be one of: eco, normal, aggressive"). The goals reply quotes them too.
-- **Talk of goals, limits or breakdowns skips the lexicon.** Otherwise "truck 2 broke down
-  after 2 stops" would set the fleet to 2 trucks, and "leave the battery at 20%" would ask
-  for 20 battery packs.
+The prompt includes the actual fleet, saved profiles and pending question. Each
+driver change has a typed `vehicle_ids` list and `value_text` (driver name or
+eco/normal/aggressive/default), supported by a quoted span of the user's message.
+The backend validates these fields directly; it does not feed the sentence back
+through the fixed command grammar. IDs must match named trucks, ordinals, exact
+truck names or, for style changes, a currently assigned driver. Unknown or ambiguous
+targets, pronoun-only references and conflicting styles require clarification.
+Negative instructions, hypothetical questions and advice requests do not mutate
+driver assignments or styles. Explicit temporary requests cannot be saved as a
+driver's usual style. The model cannot supply a replacement fleet or truck specs.
 
-## Suggestions after each solve
+The extraction schema separates persistent `memory_profiles[].driving_style`,
+`driver_assignment` and `vehicle_style`. Validated changes use the existing
+`driver_assignments` and `vehicle_style_overrides` frontend contract, preserving
+truck specifications, driver snapshots and automatic re-solving. Multiple changes
+use the existing pending-change flow; a later assignment retains earlier changes.
 
-After every solve the page asks [`POST /api/suggest`](api.md#post-apisuggest) whether the plan has a
-problem worth fixing ([`suggest_fix`](../route_optimizer_backend.py#L1832)). The assistant then offers a fix it has already tested,
-without being asked:
+## Configure the model connection
 
-```
-plan solved ─► most pressing problem? ─► try fixes in order, re-solving each with the same matrices
-                                            1. a goal weight   (Energy high, or Balance high)
-                                            2. battery packs   (enough for a 15% margin, and one more)
-                                            3. one more truck
-                                         ─► first fix that solves it ─► "… Apply it? (yes / no)"
-```
+Use the root [`.env.example`](../.env.example) as a template. Add `LLM_API_KEY`,
+`LLM_BASE_URL` and `LLM_MODEL` to the backend `.env`, then restart the backend.
+The base URL must omit `/chat/completions`; code appends it. The provider and model
+must support OpenAI-compatible Chat Completions with strict JSON Schema output.
+The default endpoint/model are OpenAI and `gpt-4o-mini`; another provider needs its
+own matching URL, model and key. This works with both `run_demo.py` and the normal
+launcher. Google credentials are separate.
 
-| Problem ([`plan_problem`](../route_optimizer_backend.py#L1694)) | When | Fixes tried |
-|---|---|---|
-| A truck runs out of battery, or misses its reserve | any route | Energy high → packs → +1 truck; fixed only if every truck keeps 15% |
-| Stops can't be served | a reserve leaves stops unserved | Energy high → +2 packs → 9 packs → +1 truck |
-| A thin battery | a truck finishes under 15%, no reserve set | Energy high → packs → +1 truck |
-| Uneven finish times | 2+ trucks back ≥ 1 h apart, and ≥ 25% of the longest day | Balance high; fixed only if the last truck is back ≥ 15 min sooner |
+No additional driver integration code is needed after configuring a compatible
+provider. `tests/test_driver_llm.py` checks the real chat handler, request schema,
+prompt context, driver validation, persistent memory and NN optimizer handoff with
+only the external model response mocked. It cannot verify a real provider's access,
+schema support or interpretation quality; those need a live-key integration check.
 
-- **Every fix is measured, not guessed.** Each candidate is a full re-solve
-  ([`optimize_payload`](../route_optimizer_backend.py#L1944)) with the plan's own matrices, so a suggestion makes no Google calls.
-  The message lists what was tried and the measured effect: "I tried Distance low · Energy high:
-  still short; 7 battery packs per truck: still short. 8 battery packs per truck fixes it: lowest
-  battery left 0% → 24% …". If nothing works, it says so and asks nothing.
-- **"Yes" applies it like any confirmed change.** The fix is the pending question's queued change.
-  Its evidence is the problem the plan showed, so the reply reads "from “The truck runs out of
-  battery about 23 mi after Marina Del Rey …”". The plan is then re-solved and compared as usual.
-- **It waits its turn.** A suggestion appears only when the chat is idle, never over a question the
-  operator still has to answer. While the panel is closed, a lightbulb marks the chat button. Each
-  suggestion is made once for a given set of settings, whether it was taken or turned down. It is
-  skipped after a simulated breakdown.
-- Replies from this path are labelled **suggestion**.
-
-## After every change: re-solve and compare
-
-When a plan is on screen and a turn changes something, the chat hands the turn to the page
-(`onTurn`). The page then:
-
-1. keeps the current plan on screen as the "before" and flashes the sidebar section that
-   changed;
-2. re-solves with the new settings. The distance and time matrices and elevations from
-   the last solve of the same locations are sent back (`precomputed`), so no Google calls
-   are made. If the stops changed, it geocodes first. A breakdown goes to `/api/replan`
-   instead;
-3. stores the result as a new **plan version** and opens the **What changed** panel above
-   the results. It shows what was said, the settings that changed, a Before | After | Δ
-   table (distance, last truck back, energy, lowest battery left, unserved stops) and
-   both plans' stop orders. Moved, re-assigned, pickup and breakdown stops are marked.
-   Any earlier version can be picked as the baseline;
-4. sends the measured effect back to the chat as a message, for example:
-   "Re-solved (v2). Distance 113.3 mi → 57.7 mi (−49.0%); … Can't be served: Marina Del Rey."
-
-While a "yes / no" question about a queued change is open, changes are collected, and the
-plan is re-solved once the question is answered. Without a plan on screen, the assistant
-only fills the form, as before.
-
-## Solver recommendation
-
-The assistant can advise which solver fits the problem size, and switch to it. Everything it
-claims (runtimes, limits, the recommended solver) is computed by `recommend_solver()` and
-`solver_table()`, never written by the model, so it cannot invent a number. The numbers and
-thresholds are explained in [solvers.md](solvers.md#how-apioptimize-decides-what-to-run).
-
-```
-"which algorithm should I use?"        → recommendation + comparison table + offer to switch
-"why not always use the optimal one?"  → the exponential-vs-O(n²) tradeoff, priced at your size
-"what solver am I using now?"          → current setting and what it resolves to
-```
-
-Bare solver questions with no numbers in them hit the lexicon and cost no model call. A
-hypothetical question ("if I had 22 stops and 3 trucks") goes to the model, which only extracts
-the numbers (with an evidence span). The advice itself is still computed.
-
-## Driver memory
-
-The memory keeps **driver profiles** by name, and they can be loaded back in a later session. It
-tracks drivers only: no licence plates and no vehicle names. A profile is the driver's name,
-optionally with the battery packs and weight of the truck that driver runs. When those are
-present, they feed the energy model when the driver is loaded.
-
-```
-"remember driver Li"
-   -> Saved 1 driver: Li
-
-"Wang runs 6 packs at 15000 lbs"
-   -> Saved 1 driver: Wang — 6 packs (120 kWh) · 15,000 lbs
-
-   ... later session ...
-
-"Wang and Li are driving today"
-   -> Loaded 2 drivers into the form   (sets the `fleet` axis: one vehicle per driver)
-```
-
-Four operations, all through `/api/chat`: **remember** (save or update), **recall** (load into
-the form), **forget** (delete), and **list** (show who is stored).
-
-Phrasing does not matter. "save driver Donghua", "can you save driver Donghua to the system?",
-"is it possible to add driver Sun with 5 packs?" and "能帮我记住司机东华吗" all save a driver. Save,
-add, store, register and create all mean *remember*. *Recall* is only for drivers who are already
-saved. If the model recognises a save request but returns no name, the reply asks for the name
-("I couldn't find a driver's name to save…") instead of guessing another operation.
-
-- **Recall** sets the form to one vehicle per recalled driver. A driver with packs and weight
-  brings them along. If a profile only has packs, the weight is derived from the packs, the same
-  way the form's pack selector does it. A name-only driver keeps whatever packs and weight that
-  vehicle slot already had. The driver's name then shows on the vehicle card and on that
-  vehicle's route in the results (`routes[].driver`).
-- **The same gates that protect form changes protect profiles.** Packs and weight go through the
-  form's range checks (3–9 packs, 10,000–19,500 lbs). The driver's name must appear in the message
-  as a whole word, so the model cannot invent a driver. When packs or weight are given, the model
-  must also quote one exact, unbroken phrase from the message for that driver, so it cannot move
-  one driver's numbers onto another. A name on its own needs no quote, so "add driver Linus and
-  Han" saves both.
-- **A driver is only deleted or loaded if you wrote their name.** "delete everything" or
-  "remove all drivers" deletes nobody; the assistant asks "Which driver should I delete?". Any
-  name the model adds that is not in the message is refused and listed as "not found in your
-  message". To wipe the whole memory, use `DELETE /api/memory`.
-- **An update merges** with what is stored, so "Wang runs 8 packs now" keeps the stored weight.
-  Up to 40 drivers can be stored.
-- **A saved driver's name, or words like "driver", "save" or "remember", disable the lexicon fast
-  path** for that message. "Wang runs 8 packs now" must update the *profile*, while "set battery
-  packs to 8" changes the *form*, and only the model can tell them apart. Without this, "add driver
-  Linus with 6 packs" would set the form's packs to 6. Names are matched as whole words, so a
-  driver called "Li" does not capture "climate".
-
-Code: [`do_remember()`](../route_optimizer_backend.py#L4493), [`do_recall()`](../route_optimizer_backend.py#L4525),
-[`do_forget()`](../route_optimizer_backend.py#L4558), [`validate_profile()`](../route_optimizer_backend.py#L4416).
-
-The memory is stored in one JSON file, `fleet_memory.json`, next to the server. It is gitignored
-because it is runtime state. Its shape is
-`{"drivers": {"<lowercased name>": {"name", "battery_packs"?, "weight_lbs"?}}}`. A file written by
-the earlier vehicle-and-plate version (keyed `"vehicles"`) is not carried over.
-
-- `GET /api/memory` → `{"status": "ok", "drivers": [...]}`
-- `DELETE /api/memory?name=Wang` removes one driver; with no `name`, it clears all of them.
-
-## `POST /api/chat`
-
-**Request**
-```json
-{ "message": "Use 2 trucks with 6 packs",
-  "history": [{"role": "user", "content": "..."}],
-  "form_state": {"depot": "...", "addresses": [], "vehicle_count": 1, "battery_packs": 4,
-                 "vehicle_weight_lbs": 13000, "temperature_c": 20, "unload_time_min": 30,
-                 "has_climate_control": true, "solver": "auto", "fleet": [...],
-                 "goals": {"distance": "high", "time": "off", "energy": "off", "balance": "off",
-                           "battery_reserve_pct": null},
-                 "priority_stops": [],
-                 "plan": {"kind": "fleet", "vehicles": [{"number": 1, "vehicle_index": 0, "name": "Vehicle 1",
-                          "driver": "Wang", "stops": 3, "energy_kwh": 102.7, "battery_pct": 0}]}},
-  "pending": null }
-```
-
-**Response**
-```json
-{ "status": "ok", "intent": "apply", "source": "model",
-  "message": "Applied: Vehicles → 2. Also apply: Battery packs → 6 packs? (yes / no)",
-  "changes": [{"axis": "vehicle_count", "op": "set", "value": 2, "evidence": "2 trucks", "label": "Vehicles → 2"}],
-  "pending": {"question": "Also apply: Battery packs → 6 packs? (yes / no)", "axis": null, "queued": [...]},
-  "capabilities": null, "rejected": [], "advice": null, "profiles": [] }
-```
-
-`plan` is a summary of the plan on screen: per truck, its stops and the energy its route
-needs. Breakdowns are checked against it, and the limits answer compares it with the battery.
-It is `null` before the first solve. The newer outcomes also carry:
-
-| Field | When |
-|---|---|
-| `action` | `{"type": "breakdown", "vehicle_index", "after_stop" or "at_minute", "spare_truck", "lang"}` for a breakdown; `{"type": "resolve"}` for "re-optimize". The page runs it |
-| `limits` | the `truck_limits()` result for a limits question: battery, payload, ranges per speed, plan check |
-| `goals_info` | `{before, after, weights_before, weights_after, evidence}` for a goals change |
-
-`intent` is one of `apply`, `ask`, `recommend`, `memory`, `goals`, `limits`, `disruption` or
-`out_of_scope`. `source` is `lexicon`,
-`model` or `session`. `advice` is filled for `recommend`, and `profiles` for `memory`. For a
-multi-step message, `intent` is that of the last step run, `message` has one line per step, and
-`changes` holds every step's changes in order. The client applies everything in `changes`
-whatever the `intent`. That includes the `fleet` change a driver load produces, which before
-this fix was shown as "Loaded" but never applied.
-
-## Regression scripts
-
-These run against a live server on :5001 and need a chat model key (`OPENAI_API_KEY` or `LLM_API_KEY`):
-
-- [`prompt_test.py`](../prompt_test.py): the prompt battery, 121 cases in 14 suites (26 in Chinese).
-  Suite N covers traffic and driving style. Suite O runs cases late in a conversation, with the
-  demo's history or a pending question, where some misreadings only show up. A case is
-  `(message, expected intent[, form state[, {"history", "pending"}]])`. Results are in
-  `prompt_test_results.txt`.
-- [`r4_test.py`](../r4_test.py): the R4 test set. 50 requests for objective weights, traffic and
-  driving style (25 English, 25 Chinese, 10 adversarial). For each case it records the intent, the
-  parameters extracted, whether every value is traceable to the message, and whether the route
-  metrics move the requested way. The metrics are solved on the saved Piedmont SC scenario: energy
-  weighted → fewer kWh, eco → fewer kWh than normal, a reserve kept on every route, and so on.
-  `--live` also prices each traffic departure with Google on the Anaheim demo. Results are in
-  `r4_test_results.txt` and `r4_test_results_live.txt`.
-- [`prompt_demo.py`](../prompt_demo.py): ten representative prompts, each with the full reply. Results are in `prompt_demo_results.txt`.
+Offline regression coverage is in `tests/test_planning.py`, `tests/test_nn_drivers.py` and frontend tests. `prompt_test.py`, `prompt_demo.py` and `r4_test.py` exercise a running backend and may require an LLM key. Historical `*_results.txt` files describe older runs and are not evidence for the current NN or English-only behavior.

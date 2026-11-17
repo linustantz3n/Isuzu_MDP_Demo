@@ -119,7 +119,7 @@ Settings are identical for every run:
 | OR-Tools strategy | PATH_CHEAPEST_ARC first solution + GUIDED_LOCAL_SEARCH |
 | OR-Tools time limit | Code default: max(5, min(30, 2 × nodes)) s, which is 22–30 s here |
 | Stop cap per truck | ceil(stops ÷ K), for every algorithm |
-| Energy model | Model E regression; 13,000 lb loaded, 7,000 lb empty, 20 °C |
+| Energy model | City NN; 13,000 lb loaded, 7,000 lb empty, 20 °C |
 | Battery limit | Off (battery feasibility is tested under R2) |
 
 ## Pass criteria

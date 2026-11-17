@@ -42,7 +42,7 @@ There are four goals. Each is set to **off, low, medium or high**, which count a
 |---|---|---|
 | Distance | its driving distance | high |
 | Time | Google's typical driving time | off |
-| Energy | its Model E energy at the truck's mid-load weight, so speed, climbs and load count | off |
+| Energy | its City NN energy at the truck's mid-load weight, so speed, climbs and load count | off |
 | Balance | nothing per leg; the **latest truck's finish time** is priced instead (2+ trucks) | off |
 
 Each leg's cost is a weighted mix, with every term divided by the average leg so that
@@ -63,7 +63,7 @@ balance   = OR-Tools global span cost on the finish times,   priced so "high" co
 - **The single-truck solvers** (Held-Karp, 2-opt, nearest neighbor) minimise the same
   matrix. So do the routes' `cost` fields, which are now in objective units rather than
   metres.
-- **Energy is still reported exactly**, leg by leg, with the weight dropping at each
+- **Energy is re-evaluated after solving**, leg by leg, with the weight dropping at each
   stop. The goal only decides which route wins.
 
 The assistant picks the levels; the operator never types a number. "Battery is tight
@@ -79,8 +79,9 @@ or set to `null` / "not enforced" so the battery is only reported.
 
 - **Fleet (2+ trucks): enforced.** Each truck gets an energy limit of
   `packs × 20 kWh × (1 − reserve)`. The route energy for the limit is priced at the truck's
-  *full* gross weight and never credits regen, so the limit errs on the safe side; the
-  reported energy is the exact, unloading one. The per-truck stop cap becomes soft, so a
+  maximum NN prediction over each arc's feasible load interval, including interior
+  activation boundaries; the
+  reported energy is the NN prediction with unloading. The per-truck stop cap becomes soft, so a
   big-battery truck can take extra stops. A stop that fits no truck is left out and listed
   in `unserved` rather than silently dropped.
 - **One truck: checked, not enforced.** It has to visit every stop. The result carries
@@ -147,7 +148,7 @@ of a truck with 3 battery packs?". Every number is computed:
 | Battery | 3 × 20 = 60 kWh (minus the reserve, if one is set) |
 | Empty weight | 7,000 + (3 − 4) × 440.9 = 6,559 lbs |
 | Payload | 19,500 − 6,559 = 12,941 lbs |
-| Range | Model E on a flat road at 40 / 60 / 90 km/h, empty and fully loaded: about 56–66 mi in mixed driving |
+| Range | City NN on a flat road at 40 / 60 / 90 km/h, empty and fully loaded, using the selected truck’s effective style |
 | Today's routes | the longest route's energy from the last solve, against the usable battery, and the fewest packs that would cover it |
 
 ## How a chat change reaches the plan

@@ -433,6 +433,8 @@ def solve_vrp_constrained(
     optional: bool = False,
     drop_penalty: int = 10 ** 9,
     time_limit_s: int = 10,
+    vehicle_costs: list = None,
+    vehicle_times: list = None,
 ) -> dict:
     """
     OR-Tools VRP with the constraints the planner needs beyond solve_vrp_ortools.
@@ -481,7 +483,13 @@ def solve_vrp_constrained(
     def cost_cb(from_index, to_index):
         return int(cost[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
 
-    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cost_cb))
+    if vehicle_costs is not None:
+        if len(vehicle_costs) != num_vehicles:
+            raise ValueError('One cost matrix per vehicle is required')
+        for v, mat in enumerate(vehicle_costs):
+            routing.SetArcCostEvaluatorOfVehicle(routing.RegisterTransitCallback(_arc_callback(manager, mat)), v)
+    else:
+        routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cost_cb))
 
     if max_stops is not None:
         def stop_cb(from_index):
@@ -498,7 +506,7 @@ def solve_vrp_constrained(
                 stop_idx, 0, [int(c) for c in max_stops], True, 'StopCount')
 
     time_dim = None
-    if time_matrix is not None:
+    if time_matrix is not None or vehicle_times is not None:
         service = service_s or [0] * n
 
         def time_cb(from_index, to_index):
@@ -506,7 +514,14 @@ def solve_vrp_constrained(
             return int(time_matrix[a][b] + service[a])
 
         horizon = 7 * 24 * 3600
-        routing.AddDimension(routing.RegisterTransitCallback(time_cb), 0, horizon, False, 'Time')
+        if vehicle_times is not None:
+            if len(vehicle_times) != num_vehicles:
+                raise ValueError('One time matrix per vehicle is required')
+            timed = [[[int(t + service[i]) for t in row] for i, row in enumerate(mat)] for mat in vehicle_times]
+            indices = [routing.RegisterTransitCallback(_arc_callback(manager, mat)) for mat in timed]
+            routing.AddDimensionWithVehicleTransits(indices, 0, horizon, False, 'Time')
+        else:
+            routing.AddDimension(routing.RegisterTransitCallback(time_cb), 0, horizon, False, 'Time')
         time_dim = routing.GetDimensionOrDie('Time')
         for v in range(num_vehicles):
             t0 = int((start_times or [0] * num_vehicles)[v])

@@ -1,221 +1,44 @@
-# Energy model
+# City NN energy model
 
-**Code:** [`calculate_energy_consumption()`](../energy.py) in `energy.py` (shared by the backend and `benchmark/`).
-It is called once per route leg (one stop to the next) from `optimize_route()`:
+The planner, truck limits, charging and incident detours, benchmark, and battery-drain simulation use one frozen neural network: `energy_nn_results_city.json`. There is no runtime model selector or fallback energy predictor. Missing or malformed weights return `503 model_unavailable`; an unsupported `energy_params.model` returns `400`.
 
-- single-vehicle routes: [delivery legs](../route_optimizer_backend.py#L2125), [return leg](../route_optimizer_backend.py#L2182)
-- fleet routes (OR-Tools): [all legs](../route_optimizer_backend.py#L1004)
+## Inference
 
-The model is called **Model E**. It is a polynomial regression for energy per kilometre of an
-Isuzu N-Series EV. The fit statistics quoted in the code are R² = 0.9997, MAPE = 3.46% and test
-RMSE = 0.38 kWh, with a target range of 0.85–1.3 kWh/mile. Model E extends an earlier "Model D"
-with two air-density interaction terms (v²·T and v²·altitude). Aerodynamic drag scales with
-ρ·v², and air density ρ falls as temperature and altitude rise.
+`energy_model/inference.py` loads the frozen `energy_nn_v1` ensemble. Each member has 12 normalized inputs, a 32-unit ReLU layer, and one linear output. Members are averaged, then propulsion energy is floored at zero. The artifact is validated for input order, shapes and finite parameters. A request pins the loaded weights for its entire calculation.
 
-> This repository holds only the fitted coefficients. The training data and the fitting
-> notebook are not here.
+The ten physical inputs represent distance, average speed, temperature, load, aerodynamic speed squared, temperature and altitude interactions, weighted ascent/descent, and positive acceleration work. Two indicator inputs distinguish Eco and Normal; both are zero for Aggressive.
 
----
+Google supplies distance, duration and endpoint elevations, not second-by-second telemetry. `aggregate.py` constructs deterministic synthetic acceleration, cruise, coast and braking traces using seed 42, rescaling to match the supplied leg distance and duration. Elevation varies along travelled distance between endpoints. `features.py` and `traces.py` compute the NN inputs. Cached features include style, distance, duration, endpoint elevations and temperature; weight-dependent features are scaled linearly. The cache does not reuse another style's features.
 
-## Formula
-
-For one leg:
+Total predicted energy is:
 
 ```
-g        = Δh / d                                       road grade, metres per km
-
-e_per_km = β0 + β1·v + β2·T + β3·W + β4·Δh + β5·v²
-         + β6·(W·g) + β7·(v·g) + β8·(v²·T) + β9·(v²·h)
-         + HVAC                                          0.092 if climate control is on, else 0
-
-E_leg    = e_per_km · d                                  kWh
+max(0, ensemble propulsion prediction)
+  + driving_hours * (5 kW base auxiliary + 5 kW ePTO + HVAC)
 ```
 
-A route's energy is the sum of `E_leg` over its legs. That sum includes the return to the
-depot, because the UI always sends closed routes.
+HVAC contributes 4 kW when enabled and zero when disabled. The response breakdown is `propulsion`, `base_aux`, `epto` and `hvac`, all in kWh. Unloading adds service time but no driving energy in this demo.
 
-### Inputs
+## Driver defaults and run overrides
 
-| Symbol | Meaning | Unit | Where the value comes from |
-|---|---|---|---|
-| d | Driving distance of the leg | km | Google Routes API route matrix ([`get_distance_matrix`](../route_optimizer_backend.py)), metres ÷ 1000 |
-| v | Average speed over the leg | km/h | d ÷ Google's typical driving duration ([`estimate_average_speed`](../route_optimizer_backend.py#L340)). No live traffic |
-| T | Ambient temperature | °C | UI slider, `energy_params.temperature_c` (default 20). Same value for every leg |
-| W | Gross vehicle weight on this leg | tonnes | Vehicle `weight_lbs` ÷ 2204.62, reduced as cargo is delivered (see [Weight model](#weight-model)) |
-| Δh | Elevation change, end minus start (+ = uphill) | m | Google Elevation API at the two stop coordinates ([`get_elevation_data`](../route_optimizer_backend.py#L186)) |
-| h | Elevation at the start of the leg | m above sea level | Same call |
-| HVAC | Climate-control overhead | kWh/km | 0.092 when `has_climate_control` is true. Added on top of the regression, not fitted |
+Saved driver profiles contain a stable `id`, `name` and usual `driving_style`: `eco`, `normal` or `aggressive`. A vehicle's effective style is its explicit `driving_style_override`, otherwise the assigned driver's snapshotted usual style, otherwise Normal. A run override never updates driver memory. Moving a driver clears the old binding and clears overrides on the changed assignments. Battery packs, capacity and vehicle weight stay attached to the truck.
 
-### Coefficients
-
-Units: distance in km, speed in km/h, temperature in °C, weight in tonnes, elevation in m, grade in m/km.
-
-| Coefficient | Term | Value | Physical reading |
-|---|---|---|---|
-| β0 | intercept | 5.7142142481e-01 | Base consumption |
-| β1 | v | −1.0081493644e-02 | Linear speed term. Together with β5 it puts the lowest consumption at about 41 km/h (at 20 °C, 200 m) |
-| β2 | T | 1.4087882356e-04 | Temperature |
-| β3 | W | 1.8176062830e-02 | Rolling resistance and mass |
-| β4 | Δh | 1.7585256876e-05 | Elevation change |
-| β5 | v² | 1.2923132040e-04 | Aerodynamic drag |
-| β6 | W·g | 2.8886974460e-03 | Climbing a grade while heavy |
-| β7 | v·g | −9.9890433238e-06 | Speed–grade interaction |
-| β8 | v²·T | −2.6120414024e-07 | Drag falls as air warms (lower density) |
-| β9 | v²·h | −8.6411314209e-09 | Drag falls with altitude (lower density) |
-
-### Per-term output
-
-Every leg in the `/api/optimize` response includes `energy_breakdown`. It gives each term's
-contribution in kWh for that leg, and the terms add up to the leg's `energy_kwh`:
-
-```
-intercept_kwh, speed_kwh, temperature_kwh, weight_kwh, altitude_diff_kwh, speed_sq_kwh,
-weight_grade_kwh, speed_grade_kwh, aero_temp_kwh, aero_alt_kwh, climate_control_kwh
-```
-
-The function also returns `energy_per_km`, `energy_per_mile`, `kwh_per_mile` and `miles_per_kwh`.
-
-### Worked example
-
-A 10 km flat leg at 48 km/h and 20 °C, with a 13,000 lbs (5.90 t) truck starting at 200 m elevation and HVAC on:
-
-| Term | kWh |
-|---|---|
-| intercept | 5.714 |
-| speed (β1·v) | −4.839 |
-| speed² (β5·v²) | 2.978 |
-| weight (β3·W) | 1.072 |
-| HVAC | 0.920 |
-| aero × temperature | −0.120 |
-| aero × altitude | −0.040 |
-| temperature | 0.028 |
-| grade terms, Δh | 0 (flat) |
-| **Total** | **5.71 kWh = 0.571 kWh/km = 0.92 kWh/mile** |
-
-How the output moves with each input. These are model outputs on a 10 km flat leg at 200 m with
-HVAC on, not measurements:
-
-| Vary | Values → kWh/mile |
-|---|---|
-| Speed (13,000 lbs, 20 °C) | 25 km/h → 0.96 · 40 → 0.91 · 60 → 0.98 · 90 → 1.38 · 105 → 1.71 |
-| Temperature (60 km/h, 13,000 lbs) | −10 °C → 1.02 · 20 °C → 0.98 · 40 °C → 0.95 |
-| Weight (60 km/h, 20 °C) | 10,000 lbs → 0.94 · 19,500 lbs → 1.07 |
-
----
-
-## Weight model
-
-**Code:** [vehicle config](../route_optimizer_backend.py#L2021) and [leg weights](../route_optimizer_backend.py#L2125) for single-vehicle routes; [per-vehicle config](../route_optimizer_backend.py#L1054) for fleet routes.
-
-- Each vehicle's `weight_lbs` is its **gross weight leaving the depot**: truck, batteries and cargo
-  together. The form's range is 10,000–19,500 lbs.
-- The **empty-truck weight** depends on the pack count:
-  `7,000 lbs + (packs − 4) × 440.9 lbs`, since one pack is 200 kg (440.9 lbs). This is
-  `vehicle_base_weight_lbs()` inside `optimize_route()`.
-- **Cargo** = max(0, gross − empty), split evenly across the route's delivery stops.
-- Leg *i* (i = 0 is the leg leaving the depot) is driven at `gross − i × cargo_per_stop`.
-- The **return leg** to the depot is driven at the empty-truck weight.
-- In the UI, changing the pack count also resets the weight field to
-  `13,000 − 4 × 440.9 + packs × 440.9` lbs. That is 13,000 lbs at 4 packs, plus 440.9 lbs for each
-  extra pack ([`updateVehicle`](../route-optimizer-frontend/src/RouteOptimizer.jsx#L93)).
-  You can still edit the weight by hand afterwards.
-
-## Battery
-
-- Capacity = packs × 20 kWh. The UI allows 3–9 packs, so 60–180 kWh. The default is 4 packs = 80 kWh.
-- Every route reports `battery_remaining_kwh` (capacity − route energy, floored at 0),
-  `battery_remaining_pct`, and `battery_depleted` (true when energy > capacity). The
-  single-vehicle routes check against vehicle 1's battery
-  ([`battery_fields()`](../route_optimizer_backend.py#L1068)). The UI shows the fleet bar
-  orange below 20% and red when depleted.
-- When a route needs more than the battery holds, `battery_depletion` says where it runs out
-  ([`battery_depletion()`](../route_optimizer_backend.py#L1081)): the leg, and how far into it.
-  The model gives one energy total per leg, so the energy is spread evenly along the leg and
-  the point is approximate. The map marks it with a red **0%** marker on the drawn road (click
-  it for the distances, the time after dispatch and the energy needed), and the route's card
-  says "runs out ~24.0 mi after Marina Del Rey, 22.3 mi before Brea". With a fleet, only the
-  fleet's trucks are marked, not the single-truck comparison route.
-- A **battery reserve** (an optimization goal, 0–50%) is enforced for fleets: no truck may
-  plan more than `capacity × (1 − reserve)`. With one truck it is checked and flagged, not
-  enforced. See [planning.md](planning.md#battery-reserve).
-- The model has no charging stops or state-of-charge curve.
-
-## Other inputs and what they affect
-
-| Input | Default | Affects |
-|---|---|---|
-| `temperature_c` | 20 °C | Energy (T terms) |
-| `has_climate_control` | on | Energy (+0.092 kWh/km) |
-| `unload_time_min` | 30 min per stop | Route **time** only. Energy is not affected, and HVAC while parked is not counted |
-| `driving_style` | normal | Cruising speed on fast legs, and energy on every leg (below) |
-| `traffic` | off | Travel times, and through them every leg's average speed and energy (below) |
-| `energy_params.total_weight_lbs` | 19,500 | **Unused.** Weight always comes from the `vehicles` array, or 13,000 lbs when none is sent |
-| `energy_params.base_weight_lbs` | 7,000 | Only the *displayed* weight on the single-vehicle return leg. The energy on that leg uses the pack-based empty weight |
-
-## Driving style and traffic
-
-**Driving style** ([`DRIVING_STYLES`](../route_optimizer_backend.py#L702), [`styled_matrices`](../route_optimizer_backend.py#L712)) is assumed, not fitted:
-
-| Style | Cruising legs (average over 50 km/h) | Every leg's energy |
-|---|---|---|
-| eco | speed × 0.90 (time ÷ 0.90) | × 0.95: gentle acceleration |
-| normal | unchanged | unchanged |
-| aggressive | speed × 1.10 | × 1.10: hard acceleration |
-
-The cruise factor applies only above 50 km/h because Model E only sees a leg's average speed, and
-its energy per km is lowest near 40 km/h. At 5.9 t, 20 °C, HVAC on, 10% slower changes energy by
-+1.6% at 30 km/h, −1.4% at 50, −9.2% at 80 and −13.4% at 100 km/h. So slowing a city leg down would
-*raise* its energy, which is not what eco driving does. City savings come from gentler acceleration,
-which the average speed does not capture, hence the separate energy factor. With both, eco is below
-normal and aggressive above it on every leg. The factor applies only to a leg that uses energy, so
-regen on a steep downhill is left alone. The style is applied to the time matrix once per solve, so
-the solvers, ETAs, battery checks and the truck-limits answer all see the same speeds.
-
-**Traffic** ([`get_distance_matrix`](../route_optimizer_backend.py#L72), [`departure_info`](../route_optimizer_backend.py#L785)): with a departure time, the
-travel times are the Routes API's traffic-aware durations for that moment (`routingPreference: TRAFFIC_AWARE`).
-The traffic data package (`traffic_source`, see the README) is a second source of travel times that
-overrides this one.
-A clock time means the next time the depot's clock reads it, in the depot's time zone from the
-Google Time Zone API. Traffic changes each leg's average speed, so it changes energy too. On the
-Anaheim demo, a 7:30 departure made the day 32% longer and used 14% less energy than typical times,
-because the trucks crawl through the morning rush. Without a departure time the times are Google's
-typical ones.
-
----
+Style controls synthetic acceleration, braking, coasting and speed variation. For legs averaging above 50 km/h, cruise-time assumptions also scale duration by `1 / 0.9` for Eco or `1 / 1.1` for Aggressive. Normal uses the supplied duration. These are simulation assumptions. There is no fixed percentage energy saving or penalty: the NN evaluates each resulting trace. Raw traffic matrices are retained in responses and reapplied once for each vehicle.
 
 ## How energy relates to the solvers
 
-**By default the solvers never see energy.** They minimize distance, and energy is then
-calculated leg by leg on whatever route the solver returned. "Optimal" here means
-shortest distance, which is not necessarily lowest energy. For example, a route that
-climbs early while fully loaded can be short but costly.
+Every truck gets its own objective cost, time and energy-bound matrices. Energy objectives evaluate each truck at its midpoint load; objective normalization uses common fleet scales so more efficient trucks keep their relative advantage. Routes are evaluated again after solving, with cargo unloading after each delivery, using the same style and weights. Different profiles can change stop assignment, order, travel time and battery feasibility; they need not produce a different route on every input.
 
-**With the Energy goal on** ([planning.md](planning.md#optimization-goals)), the solvers
-minimise an energy-weighted cost.
-[`energy_matrix_kwh()`](../energy.py) makes one
-`calculate_energy_consumption` call per ordered pair of stops. It uses one representative
-weight, halfway between loaded and empty, because a fixed matrix cannot know where in the
-route a leg will fall. Negative (downhill) energy is floored at 0 in the cost, so regen is
-not rewarded. The reported energy is still the exact leg-by-leg value with the real,
-dropping weight.
+Fleet battery constraints use a maximum over the feasible load interval for each arc. The frozen network is piecewise affine in load. Evaluating both load endpoints and every first-layer activation boundary across all ensemble members gives its maximum, including an interior peak. Bounds round up to Wh. A normal completed return uses empty weight. Breakdown rescue and routes that may carry undelivered cargo use an interval for the return too. The final fleet route receives a second battery/reserve check.
 
-**With a battery reserve**, each fleet truck also gets an energy limit. It is checked with
-[`energy_upper_bound_matrix_wh()`](../energy.py): per arc, the larger of the energy at the truck's
-full gross weight and at its empty weight (more weight means more regen downhill, so the heavier
-end is not always the costlier one), floored at 0 and rounded up to whole Wh, so the limit errs
-on the safe side. Arcs back to the depot are priced empty in a normal plan; in a breakdown re-plan
-they are not, since a truck may still carry cargo home.
+This bounds **predictions of this frozen NN**, not measured consumption. Single-truck TSP alternatives retain their existing report-and-flag behavior; the reserve is enforced by the fleet VRP. Infeasible fleet stops are explicitly reported as unserved.
 
-## Caveats in the model as coded
+## Weight model
 
-- **Δh enters per km.** `β4·Δh` is added to the per-km value and then multiplied by distance,
-  so its total effect grows with leg length (β4·Δh·d). The grade terms (β6, β7) already carry the
-  per-km slope. This is how the model is specified; check it if that was not intended.
-- **Elevation is sampled only at the stops**, not along the road. Hills between two stops at
-  similar heights cancel out.
-- **Energy can be negative on steep downhill legs.** For example, −200 m over 5 km at 19,500 lbs
-  gives −1.9 kWh. Nothing clamps it, so it behaves like unlimited regenerative braking.
-- **If the Elevation API call fails, every elevation silently becomes 0** (a flat world).
-- **Speed is an average** (distance ÷ typical duration), so stop-and-go driving is not modelled.
-- **Which vehicle the data came from:** the UI header says "Mercedes eActros Energy Model", while
-  the code says Model E for the Isuzu N-Series EV. Worth confirming with whoever fitted it.
+The default truck leaves at 13,000 lb, with four 20 kWh battery packs. Empty weight is 7,000 lb with four packs; adding/removing a pack changes empty weight by 200 kg (440.924 lb). Cargo is gross minus empty weight, spread evenly across the truck's assigned deliveries. A driver assignment never copies historical profile pack/weight fields into the truck.
+
+## Versioning and limitations
+
+Every optimize response includes `energy_model` with name, model version, SHA-256 and adapter version, plus resolved vehicles and driver snapshots. Send that metadata back as `expected_energy_model` on dependent requests; stale models are rejected instead of mixing old legs with new weights. Saved versions preserve their resolved driver defaults even if driver memory changes later.
+
+The synthetic traces and driver distributions are modeling assumptions. Endpoint elevation does not capture every hill; the cruise factors do not model road safety limits; predicted Eco savings are not guaranteed. No measured vehicle accuracy or real-world battery guarantee is claimed. Charging/incident detours use the original leg's effective style and the returned road duration. The existing traffic playback and battery-drain demo remain simulations, not telemetry validation.

@@ -76,7 +76,7 @@ function SocChart({ truck, reserve }) {
 
   return (
     <div className="bg-slate-900 rounded-xl p-5 border border-slate-800">
-      <h3 className="text-sm font-semibold text-white">Battery after each leg · Truck {truck.vehicle}</h3>
+      <h3 className="text-sm font-semibold text-white">Battery after each leg · Truck {truck.vehicle} · {truck.effective_driving_style}</h3>
       <p className="text-slate-500 text-xs mt-0.5 mb-3">
         State of charge (%) on arrival at each stop. Dashed line: the {reserve}% reserve.
       </p>
@@ -105,7 +105,7 @@ function EventLog({ truck, locations }) {
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
       <div className="px-4 pt-4 pb-2">
-        <h3 className="text-sm font-semibold text-white">Decisions at each stop · Truck {truck.vehicle}</h3>
+        <h3 className="text-sm font-semibold text-white">Decisions at each stop · Truck {truck.vehicle} · {truck.effective_driving_style}</h3>
         <p className="text-slate-500 text-xs mt-0.5">
           After every delivery the truck predicts what the rest of its route needs (at the worst drain it has seen)
           and compares it with its battery above the reserve.
@@ -160,6 +160,7 @@ export default function BenchmarkSimulation() {
   const [scenarios, setScenarios] = useState([]);
   const [scenarioId, setScenarioId] = useState('');
   const [k, setK] = useState('4');
+  const [vehicleStyles, setVehicleStyles] = useState([]);
   const [batteryKwh, setBatteryKwh] = useState('110');
   const [reserve, setReserve] = useState('20');
   const [drain, setDrain] = useState(1.3);
@@ -195,6 +196,7 @@ export default function BenchmarkSimulation() {
         body: JSON.stringify({
           scenario_id: scenarioId,
           num_vehicles: Number(k),
+          vehicle_styles: Array.from({ length: Number(k) }, (_, i) => vehicleStyles[i] || 'normal'),
           energy_params: { battery_kwh: Number(batteryKwh), battery_reserve_pct: Number(reserve) },
           drain: { factor: drain, event: useEvent ? { after_stop: Number(eventAfter), factor: eventDrain } : null },
           ortools_time_limit_s: 3,
@@ -227,6 +229,17 @@ export default function BenchmarkSimulation() {
       {/* ── Sidebar ──────────────────────────────────────── */}
       <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0">
         <div className="flex-1 overflow-y-auto p-5 space-y-6">
+          <section>
+            <h3 className={SECTION_TITLE}>City NN · truck driving styles</h3>
+            {Array.from({ length: Math.min(25, Math.max(1, Number(k) || 1)) }, (_, i) => <label key={i} className="block text-xs text-slate-400 mb-2">
+              Truck {i + 1}
+              <select aria-label={`Simulation Truck ${i + 1} style`} className={INPUT} value={vehicleStyles[i] || 'normal'}
+                onChange={e => setVehicleStyles(prev => { const next = [...prev]; next[i] = e.target.value; return next; })}>
+                {['eco', 'normal', 'aggressive'].map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </label>)}
+            <p className="text-xs text-slate-500">Energy is simulated from City NN predictions, multiplied by the drain factor.</p>
+          </section>
           <section>
             <h3 className={SECTION_TITLE}>Scenario</h3>
             <select value={scenarioId} onChange={e => setScenarioId(e.target.value)}

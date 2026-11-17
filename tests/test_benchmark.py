@@ -176,7 +176,7 @@ def test_energy_matches_model_and_is_direction_dependent():
         altitude_diff_m=problem.elevation_m[j] - problem.elevation_m[i],
         altitude_m=problem.elevation_m[i], has_climate_control=True)["energy_kwh"]
     assert up == pytest.approx(expected)
-    # Model E has a positive weight x grade term, so climbing costs more than the same arc descending
+    # This uphill fixture produces higher NN energy than its reverse downhill arc
     elev = list(problem.elevation_m)
     elev[j] = elev[i] + 100
     climb = leg_energy_kwh(problem.dist, problem.time, elev, i, j, w, params)

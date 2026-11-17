@@ -26,14 +26,22 @@ const INTENT_STYLE = {
 };
 
 // Shown under the greeting; one click sends it.
-const SUGGESTIONS = [
+const SAVED_DEMO = process.env.REACT_APP_SAVED_DEMO === 'true';
+const SUGGESTIONS = SAVED_DEMO ? [
+  'Show saved drivers',
+  'Assign Wang to Truck 2',
+  'Use Eco for Truck 2 on this run',
+  'Restore driver default for Truck 2',
+  'Remember Taylor as a normal driver',
+  'Re-optimize',
+] : [
   'Battery is tight today — keep 20% in every truck',
   'We\'re running late, get everyone back sooner',
   'What are the limits of a truck with 3 battery packs?',
   'Truck 2 broke down after its first stop',
   'Cerritos is urgent — deliver there first',
   'Use live traffic — we leave at 7:30',
-  'Drive in eco mode',
+  'Use Eco for Truck 1 on this run',
   'How do the weights work?',
 ];
 
@@ -125,6 +133,7 @@ function ProfileCards({ profiles }) {
         <div key={i} className="flex items-center gap-1.5 px-2 py-1 bg-slate-900/70 border border-slate-700 rounded text-xs">
           <User className="w-3.5 h-3.5 text-teal-400 flex-shrink-0" />
           <span className="font-semibold text-slate-200">{p.name}</span>
+          <span className="text-teal-300">{p.driving_style || 'normal'} driver</span>
           {p.battery_packs != null && (
             <span className="text-slate-400">{p.battery_packs}p · {p.battery_packs * 20}kWh</span>
           )}
@@ -144,9 +153,7 @@ function AdviceTable({ advice }) {
   return (
     <div className="mt-2 border border-slate-700/80 rounded-lg overflow-hidden">
       <div className="px-2 py-1 bg-slate-800/80 text-[11px] text-slate-500 uppercase tracking-wider">
-        {advice.lang === 'zh'
-          ? `${advice.num_stops} 个站 · ${advice.num_vehicles} 辆车${advice.hypothetical ? '（假设）' : ''}`
-          : `${advice.num_stops} stops · ${advice.num_vehicles} vehicle${advice.num_vehicles !== 1 ? 's' : ''}${advice.hypothetical ? ' (hypothetical)' : ''}`}
+        `${advice.num_stops} stops · ${advice.num_vehicles} vehicle${advice.num_vehicles !== 1 ? 's' : ''}${advice.hypothetical ? ' (hypothetical)' : ''}`}
       </div>
       <table className="w-full text-xs">
         <tbody>
@@ -170,7 +177,7 @@ function AdviceTable({ advice }) {
   );
 }
 
-export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChange, proactive }) {
+export default function AIChatbot({ onProfilesChanged, formState, onApplyChange, onTurn, onDockChange, proactive }) {
   const [open, setOpen] = useState(false);
   // A suggestion arrived while the panel was closed.
   const [unread, setUnread] = useState(false);
@@ -181,7 +188,7 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content: "Hi! Tell me about the day and I'll tune the optimizer — I pick the goal weights for you, explain what a truck can handle, and re-plan when a truck breaks down. After each change I re-solve and show you what moved. I can still fill the form too (stops, trucks, packs, temperature…).",
+      content: SAVED_DEMO ? "Welcome to the saved-data demo. Wang usually drives Aggressive, Alex Eco, and Jordan Normal. Assign them to trucks or set a run-only style below. The real City NN optimizer re-solves using cached Anaheim road data. These commands work without an LLM key." : "Hi! Tell me about the day and I'll tune the optimizer — I pick the goal weights for you, explain what a truck can handle, and re-plan when a truck breaks down. After each change I re-solve and show you what moved. You can also save a driver’s usual style, assign them to a truck, or override one truck’s style for this run.",
       meta: { suggestions: true },
     },
   ]);
@@ -212,6 +219,10 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
   }, [input, open, expanded]);
+
+  useEffect(() => {
+    if (pending?.suggestion && pending.plan_context !== formState.plan_context) setPending(null);
+  }, [formState.plan_context, pending]);
 
   // A problem the page found in the plan, with a fix it tested. Shown once the
   // chat is idle, and never over a question the operator still has to answer.
@@ -263,6 +274,7 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
       const data = await res.json();
 
       if (data.status === 'ok') {
+        if (data.intent === 'memory' || data.profiles?.length) onProfilesChanged?.();
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: data.message,
@@ -301,7 +313,7 @@ export default function AIChatbot({ formState, onApplyChange, onTurn, onDockChan
         if (onTurn && !waiting && (d.changes.length || data.action)) {
           const turn = {
             changes: d.changes, action: data.action || null, text: d.texts.join(' · '),
-            lang: data.action?.lang || (/[\u4e00-\u9fff]/.test(userMsg.content) ? 'zh' : 'en'),
+            lang: 'en',
           };
           deferred.current = { changes: [], texts: [] };
           setResolving(true);

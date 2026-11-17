@@ -154,8 +154,11 @@ export function settingChanges(before, after) {
   const vb = before.vehicles, va = after.vehicles;
   if (vb.length !== va.length) out.push(`Trucks ${vb.length} → ${va.length}`);
   va.forEach((v, i) => {
-    const o = vb[i];
+    const o = vb.find(x => x.id === v.id) || vb[i];
     if (!o) return;
+    if ((o.driver_id || '') !== (v.driver_id || '')) out.push(`${v.name}: driver ${o.driver || 'unassigned'} → ${v.driver || 'unassigned'}`);
+    const style = x => x.driving_style_override || x.driver_snapshot?.driving_style || x.driver_default_style || 'normal';
+    if (style(o) !== style(v) || o.driving_style_override !== v.driving_style_override) out.push(`${v.name}: ${style(o)} → ${style(v)} (${v.driving_style_override ? 'run override' : 'driver default'})`);
     if (o.battery_packs !== v.battery_packs) out.push(`${v.name}: ${o.battery_packs} → ${v.battery_packs} packs`);
     else if (o.weight_lbs !== v.weight_lbs) out.push(`${v.name}: ${o.weight_lbs.toLocaleString()} → ${v.weight_lbs.toLocaleString()} lbs`);
   });
@@ -163,9 +166,6 @@ export function settingChanges(before, after) {
   if (eb.temperature_c !== ea.temperature_c) out.push(`Temperature ${eb.temperature_c} → ${ea.temperature_c} °C`);
   if (eb.unload_time_min !== ea.unload_time_min) out.push(`Unload ${eb.unload_time_min} → ${ea.unload_time_min} min`);
   if (eb.has_climate_control !== ea.has_climate_control) out.push(`HVAC ${ea.has_climate_control ? 'on' : 'off'}`);
-  if ((eb.driving_style || 'normal') !== (ea.driving_style || 'normal')) {
-    out.push(`Driving ${eb.driving_style || 'normal'} → ${ea.driving_style || 'normal'}`);
-  }
   if ((before.traffic ?? null) !== (after.traffic ?? null)) {
     out.push(`Traffic: ${trafficLabel(before.traffic)} → ${trafficLabel(after.traffic)}`);
   }
@@ -183,41 +183,17 @@ export function weightBar(goals) {
 }
 
 // The chat's plain-language summary of what a re-solve changed.
-export function impactText(before, after, { lang = 'en', versionLabel = '', cleared = false } = {}) {
-  const zh = lang === 'zh';
-  if (!before || !after) return zh ? '已重新求解。' : 'Re-solved.';
+export function impactText(before, after, { versionLabel = '', cleared = false } = {}) {
+  if (!before || !after) return 'Re-solved.';
   const rows = metricRows(before, after).filter(r => !r.same);
   const moved = movedStops(before, after);
-  const changedTrucks = after.routes
-    .filter(r => r.stops.some(s => moved.has(s.key)))
-    .map(r => r.label);
-  const names = {
-    distance: zh ? '距离' : 'distance', time: zh ? '收工时间' : 'last truck back',
-    energy: zh ? '电量' : 'energy', battery: zh ? '最低剩余电量' : 'lowest battery left',
-    unserved: zh ? '无法配送的站点' : 'unserved stops',
-  };
-  const parts = rows.map(r => `${names[r.id]} ${r.fmt(r.b)} → ${r.fmt(r.a)} (${r.delta})`);
-  let text = zh ? `已重新求解${versionLabel ? `（${versionLabel}）` : ''}。` : `Re-solved${versionLabel ? ` (${versionLabel})` : ''}. `;
-  if (!parts.length && !changedTrucks.length) {
-    text += zh ? '路线没有变化——新的设置在这里不改变最优方案。'
-      : 'The routes came out the same — the new settings do not change the best plan here.';
-  } else {
-    if (parts.length) {
-      const joined = parts.join(zh ? '；' : '; ');
-      text += zh ? `${joined}。` : `${joined.charAt(0).toUpperCase()}${joined.slice(1)}.`;
-    }
-    if (changedTrucks.length) {
-      text += zh ? ` 站点顺序有变化：${changedTrucks.join('、')}。` : ` Stop order changed for ${changedTrucks.join(', ')}.`;
-    }
-    if (after.unserved.length && after.unserved.length !== before.unserved.length) {
-      const list = after.unserved.map(shortPlace).join(', ');
-      text += zh ? ` 送不了：${list}。` : ` Can't be served: ${list}.`;
-    }
-  }
-  if (cleared) {
-    text += zh ? ' （之前模拟的抛锚已清除，这是从早上重新规划的方案。）'
-      : ' (The simulated breakdown was cleared — this re-plans the day from the start.)';
-  }
-  text += zh ? ' 对比见结果上方的「变化对比」。' : ' See "What changed" above the results.';
-  return text;
+  const trucks = after.routes.filter(r => r.stops.some(s => moved.has(s.key))).map(r => r.label);
+  const names = { distance: 'distance', time: 'last truck back', energy: 'energy', battery: 'lowest battery left', unserved: 'unserved stops' };
+  let text = `Re-solved${versionLabel ? ` (${versionLabel})` : ''}. `;
+  const parts = rows.sort((a, b) => (a.id === 'energy' ? -1 : b.id === 'energy' ? 1 : 0)).map(r => `${names[r.id]} ${r.fmt(r.b)} → ${r.fmt(r.a)} (${r.delta})`);
+  text += parts.length ? parts.join('; ').replace(/^./, c => c.toUpperCase()) + '.' : 'The routes came out the same.';
+  if (trucks.length) text += ` Stop order changed for ${trucks.join(', ')}.`;
+  if (after.unserved.length) text += ` Can't be served: ${after.unserved.map(shortPlace).join(', ')}.`;
+  if (cleared) text += ' (The simulated breakdown was cleared — this re-plans the day from the start.)';
+  return text + ' See "What changed" above the results.';
 }

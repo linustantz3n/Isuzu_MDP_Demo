@@ -109,9 +109,9 @@ export default function GoalsPanel({ goals, onChange, priorityStops, onRemovePri
         </div>
       </div>
 
-      {/* Driving style: assumed speed and energy factors */}
+      {/* Explicit run overrides for every truck */}
       <div className="flex items-center gap-2 mt-2">
-        <label className="text-xs text-slate-400 flex items-center gap-1.5 w-[5.5rem] flex-shrink-0"><Gauge className="w-3 h-3" /> Driving</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1.5 w-[5.5rem] flex-shrink-0"><Gauge className="w-3 h-3" /> All trucks</label>
         <div className="flex flex-1 bg-slate-800 border border-slate-700 rounded-md p-0.5">
           {DRIVING_STYLES.map(st => (
             <button

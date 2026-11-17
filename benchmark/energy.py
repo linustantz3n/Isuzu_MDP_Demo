@@ -1,5 +1,5 @@
 """
-Energy for benchmark routes, using the production Model E regression.
+Energy for benchmark routes, using the shared City NN predictor.
 
 Two views of the same model:
 
@@ -18,6 +18,7 @@ the scenario's elevations (flat terrain if a scenario has none).
 
 from energy import (
     DEFAULT_BATTERY_RESERVE_PCT,
+    validate_energy_params, validate_style,
     battery_limit_wh,
     calculate_energy_consumption,
     energy_upper_bound_matrix_wh,
@@ -28,6 +29,8 @@ LBS_PER_TONNE = 2204.62
 
 # Same defaults as the production /api/optimize fleet path
 DEFAULT_ENERGY_PARAMS = {
+    "model": "city_nn",
+    "driving_style": "normal",
     "temperature_c": 20.0,
     "loaded_weight_lbs": 13000.0,
     "base_weight_lbs": 7000.0,
@@ -42,8 +45,10 @@ DEFAULT_ENERGY_PARAMS = {
 
 
 def resolve_params(params: dict = None) -> dict:
+    validate_energy_params(params)
     merged = dict(DEFAULT_ENERGY_PARAMS)
     merged.update({k: v for k, v in (params or {}).items() if k in DEFAULT_ENERGY_PARAMS and v is not None})
+    validate_style(merged["driving_style"])
     return merged
 
 
@@ -68,6 +73,7 @@ def leg_energy_kwh(dist, time, elevation_m, i, j, weight_lbs, params) -> float:
         altitude_diff_m=_elev(elevation_m, j) - _elev(elevation_m, i),
         altitude_m=_elev(elevation_m, i),
         has_climate_control=params["has_climate_control"],
+        driving_style=params["driving_style"],
     )["energy_kwh"]
 
 
@@ -88,6 +94,7 @@ def battery_limit(dist, time, elevation_m, params: dict):
         base_weight_lbs=params["base_weight_lbs"],
         temperature_c=params["temperature_c"],
         has_climate_control=params["has_climate_control"],
+        driving_style=params["driving_style"],
     )
     return bound, battery_limit_wh(params["battery_kwh"], params["battery_reserve_pct"])
 

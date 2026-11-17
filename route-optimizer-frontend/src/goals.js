@@ -14,7 +14,7 @@ export const DEFAULT_GOALS = {
 export const GOAL_META = {
   distance: { label: 'Distance', color: '#38bdf8', hint: 'fewest total miles' },
   time: { label: 'Time', color: '#a78bfa', hint: 'fastest roads, by typical driving time' },
-  energy: { label: 'Energy', color: '#facc15', hint: 'Model E kWh: speed, climbs, load on board' },
+  energy: { label: 'Energy', color: '#facc15', hint: 'City NN kWh: driver style, speed, climbs and load on board' },
   balance: { label: 'Balance', color: '#34d399', hint: 'latest truck back sooner (2+ trucks)' },
 };
 
@@ -41,13 +41,12 @@ export function reserveLabel(r) {
   return r === 0 ? 'never run flat' : `keep ${r}%`;
 }
 
-// How the drivers drive. Mirrors STYLE_CRUISE_FACTOR / STYLE_ENERGY_FACTOR in the
-// backend: assumed factors, not fitted.
+// Styles control synthetic driving traces and cruise-time assumptions.
 export const DRIVING_STYLES = ['eco', 'normal', 'aggressive'];
 export const STYLE_META = {
-  eco: { label: 'Eco', hint: 'Cruises 10% slower on legs over 50 km/h, accelerates gently (−5% energy). Assumed.' },
-  normal: { label: 'Normal', hint: 'As the energy model was fitted.' },
-  aggressive: { label: 'Aggressive', hint: 'Cruises 10% faster on legs over 50 km/h, accelerates hard (+10% energy). Assumed.' },
+  eco: { label: 'Eco', hint: 'Gentler synthetic acceleration; cruise speed 10% lower above 50 km/h. City NN predicts energy for each leg.' },
+  normal: { label: 'Normal', hint: 'Normal synthetic driving profile using the supplied road times.' },
+  aggressive: { label: 'Aggressive', hint: 'Harder synthetic acceleration; cruise speed 10% higher above 50 km/h. City NN predicts energy for each leg.' },
 };
 
 // Traffic: null = Google's typical times, 'now' = live traffic leaving now,

@@ -1,42 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, DirectionsRenderer, Marker, InfoWindow } from '@react-google-maps/api';
+import { GoogleMap, useJsApiLoader, PolylineF, Marker, InfoWindow } from '@react-google-maps/api';
 import { VEHICLE_COLORS, MAP_STYLES } from './RouteMap';
+import { fetchRoadRoute } from './roadRoutes';
 
 const MAP_CONTAINER_STYLE = { width: '100%', height: '420px' };
 
 export const truckColor = (idx) => VEHICLE_COLORS[idx % VEHICLE_COLORS.length];
-
-// Road geometry for a stop sequence never changes, so keep it for the session:
-// collapsing and re-expanding an algorithm (or two algorithms sharing a truck
-// route) costs no extra Directions API calls.
-const directionsCache = new Map();
-
-function fetchDirections(route, locations) {
-  const pts = route.map(i => ({ lat: locations[i].lat, lng: locations[i].lng }));
-  const key = pts.map(p => `${p.lat},${p.lng}`).join(';');
-  if (!directionsCache.has(key)) {
-    const service = new window.google.maps.DirectionsService();
-    const request = new Promise((resolve) => {
-      service.route(
-        {
-          origin: pts[0],
-          destination: pts[pts.length - 1],
-          waypoints: pts.slice(1, -1).map(location => ({ location, stopover: true })),
-          travelMode: window.google.maps.TravelMode.DRIVING,
-          optimizeWaypoints: false, // keep the algorithm's order
-        },
-        (result, status) => {
-          if (status === 'OK') return resolve(result);
-          console.warn(`DirectionsService failed: ${status}`);
-          directionsCache.delete(key); // allow a retry next time
-          resolve(null);
-        }
-      );
-    });
-    directionsCache.set(key, request);
-  }
-  return directionsCache.get(key);
-}
 
 // `slots` gives each route its truck number / color slot (0-based). It defaults to the
 // route's position; the comparison view passes matched slots so the same truck shares a
@@ -50,6 +19,8 @@ export default function BenchmarkRouteMap({ routes, locations, slots }) {
   const mapRef = useRef(null);
   const [directions, setDirections] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [errors, setErrors] = useState([]);
+  const [retry, setRetry] = useState(0);
   const [visible, setVisible] = useState(() => new Set(routes.map((_, i) => i)));
   const [selectedMarker, setSelectedMarker] = useState(null);
 
@@ -64,13 +35,17 @@ export default function BenchmarkRouteMap({ routes, locations, slots }) {
     if (!isLoaded) return;
     let cancelled = false;
     setLoading(true);
-    Promise.all(routes.map(r => fetchDirections(r, locations))).then(results => {
+    setDirections([]);
+    setErrors([]);
+    setVisible(new Set(routes.map((_, i) => i)));
+    Promise.all(routes.map(r => fetchRoadRoute(r.map(i => locations[i])).catch(error => ({ error: error.message })))).then(results => {
       if (cancelled) return;
-      setDirections(results);
+      setDirections(results.map(r => r.error ? null : r));
+      setErrors(results.flatMap((r, i) => r.error ? [`Truck ${(slots ? slots[i] : i) + 1}: ${r.error}`] : []));
       setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [isLoaded, routes, locations]);
+  }, [isLoaded, routes, locations, retry, slots]);
 
   const toggle = (idx) => {
     const next = new Set(visible);
@@ -128,6 +103,10 @@ export default function BenchmarkRouteMap({ routes, locations, slots }) {
         {loading && <span className="text-xs text-slate-500 animate-pulse">Loading routes...</span>}
       </div>
 
+      {errors.length > 0 && <div role="alert" className="p-3 text-xs text-amber-300">
+        {errors.map((message, i) => <p key={i}>{message}</p>)}
+        <button className="underline mt-1" onClick={() => setRetry(n => n + 1)}>Retry road routes</button>
+      </div>}
       {!isLoaded ? (
         <div style={MAP_CONTAINER_STYLE} className="flex items-center justify-center bg-slate-900 text-slate-500 text-sm">
           Loading Google Maps...
@@ -140,16 +119,9 @@ export default function BenchmarkRouteMap({ routes, locations, slots }) {
           onLoad={(map) => { mapRef.current = map; fitTo(routes.map((_, i) => i)); }}
           options={{ styles: MAP_STYLES, streetViewControl: false, mapTypeControl: false, gestureHandling: 'greedy' }}
         >
-          {directions.map((result, idx) => result && visible.has(idx) && (
-            <DirectionsRenderer
-              key={idx}
-              directions={result}
-              options={{
-                suppressMarkers: true,
-                suppressFitBounds: true,
-                polylineOptions: { strokeColor: truckColor(slotOf(idx)), strokeOpacity: 0.9, strokeWeight: 5, zIndex: 2 + idx },
-              }}
-            />
+          {directions.map((geometry, idx) => geometry && visible.has(idx) && (
+            <PolylineF key={idx} path={geometry.path}
+              options={{ strokeColor: truckColor(slotOf(idx)), strokeOpacity: 0.9, strokeWeight: 5, zIndex: 2 + idx }} />
           ))}
 
           <Marker

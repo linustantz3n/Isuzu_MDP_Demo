@@ -2,6 +2,7 @@
 Benchmark runner: every algorithm x every fleet size on one saved scenario.
 """
 
+from energy import energy_session, energy_metadata, styled_matrices
 import json
 import os
 import time
@@ -65,6 +66,7 @@ def fixed_plan_view(scenario_id: str, num_vehicles: int) -> dict:
     }
 
 
+@energy_session
 def run_benchmark(
     scenario_id: str,
     max_vehicles: int = 3,
@@ -89,6 +91,7 @@ def run_benchmark(
     objective = parse_objective(objective)
     energy_params = resolve_params(energy_params)
     scenario = load_scenario(scenario_id)
+    scenario = {**scenario, "time_s": styled_matrices({"distance": scenario["distance_m"], "time": scenario["time_s"]}, energy_params["driving_style"])["time"]}
     elevation_m = scenario.get("elevation_m")
     # Arc costs do not depend on K, so build the matrix once for the whole run
     energy_kwh = static_energy_matrix_kwh(scenario["distance_m"], scenario["time_s"], elevation_m, energy_params)
@@ -177,6 +180,7 @@ def run_benchmark(
         "preserve_stop_order": bool(preserve_stop_order),
         "objective": {**objective, "label": describe(objective)},
         "energy": {**energy_params, "has_elevation": bool(elevation_m)},
+        "energy_model": energy_metadata(),
         "algorithms": [a.to_dict() for a in algorithms],
         "rows": rows,
         "headline": headline(rows),

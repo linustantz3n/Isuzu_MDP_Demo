@@ -31,7 +31,8 @@ trace, so the three can be compared.
 import argparse
 import math
 
-from energy import energy_upper_bound_matrix_wh
+from energy import energy_upper_bound_matrix_wh, energy_session, energy_metadata, styled_matrices, validate_style
+from solvers import solve_vrp_constrained, BatteryLimitError
 from solvers import replan_route
 
 from .algorithms import solve_ortools
@@ -162,6 +163,7 @@ def _check(ctx, node, battery, remaining, dropped, served, n, per_stop,
         ctx.dist, ctx.time, ctx.elevation_m,
         loaded_weight_lbs=weight_now, base_weight_lbs=weight_home,
         temperature_c=p["temperature_c"], has_climate_control=p["has_climate_control"],
+        driving_style=p["driving_style"], empty_return=False,
     )
     scaled = [[math.ceil(v * estimate) for v in row] for row in bound]
     path = [node, *remaining, 0]
@@ -190,6 +192,7 @@ def _check(ctx, node, battery, remaining, dropped, served, n, per_stop,
     }
 
 
+@energy_session
 def simulate(
     scenario_id: str,
     num_vehicles: int,
@@ -198,6 +201,7 @@ def simulate(
     objective: dict = None,
     ortools_time_limit_s: int = None,
     replan_time_limit_s: int = None,
+    vehicle_styles: list = None,
 ) -> dict:
     """Plan a battery-limited fleet, then drive it with extra drain, replanning at every stop."""
     params = resolve_params(energy_params)
@@ -211,28 +215,44 @@ def simulate(
         raise ValueError(f"Fleet size must be between 1 and {num_stops}")
 
     dist, time_s, elevation_m = scenario["distance_m"], scenario["time_s"], scenario.get("elevation_m")
-    energy_kwh = static_energy_matrix_kwh(dist, time_s, elevation_m, params)
-    cost = build_cost_matrix(objective, dist, time_s, energy_kwh)
-    bound, limit = battery_limit(dist, time_s, elevation_m, params)
-    problem = Problem(
-        scenario_id=scenario_id, locations=scenario["locations"], dist=dist, time=time_s,
-        num_vehicles=int(num_vehicles), ortools_time_limit_s=ortools_time_limit_s, cost=cost,
-        elevation_m=elevation_m, energy_params=params, objective=objective,
-        energy_bound_wh=bound, energy_limit_wh=limit,
-    )
-    plan = solve_ortools(problem)  # BatteryLimitError if even the model's own numbers don't fit
-
-    ctx = _Context(scenario, params, cost)
+    k = int(num_vehicles)
+    styles = vehicle_styles if vehicle_styles is not None else [params['driving_style']] * k
+    if not isinstance(styles, list) or len(styles) != k:
+        raise ValueError('vehicle_styles must contain one style per truck')
+    styles = [validate_style(st) for st in styles]
+    per_vehicle = [dict(params, driving_style=style) for style in styles]
+    times = [styled_matrices({'distance': dist, 'time': time_s}, style)['time'] for style in styles]
+    energies = [static_energy_matrix_kwh(dist, t, elevation_m, p) for t, p in zip(times, per_vehicle)]
+    from .objective import _mean_arc
+    norms = {'distance': _mean_arc(dist), 'time': sum(_mean_arc(t) for t in times) / k,
+             'energy': sum(_mean_arc(e) for e in energies) / k}
+    costs = [build_cost_matrix(objective, dist, t, e, norms) for t, e in zip(times, energies)]
+    bounds_limits = [battery_limit(dist, t, elevation_m, p) for t, p in zip(times, per_vehicle)]
+    bounds, limits = zip(*bounds_limits)
+    try:
+        result = solve_vrp_constrained(costs[0], k,
+            vehicle_costs=[[[int(round(v)) for v in row] for row in mat] for mat in costs],
+            max_stops=[math.ceil(num_stops / k)] * k, energy=list(bounds), energy_caps=list(limits),
+            time_limit_s=ortools_time_limit_s or 5)
+    except Exception as exc:
+        raise BatteryLimitError('No initial plan fits the NN battery limits') from exc
+    plan = result['routes']
     no_drain = {"factor": 1.0, "event": None}
     trucks = []
     for v, route in enumerate(plan):
+        p = per_vehicle[v]
+        ctx = _Context({**scenario, 'time_s': times[v]}, p, costs[v])
+        used = route_energy_kwh(route, dist, times[v], elevation_m, p)
+        if used * 1000 > limits[v] + 1e-6:
+            raise BatteryLimitError('NN battery recheck failed for the initial simulation plan')
         driven = _drive(ctx, route, drain, replan=True, replan_time_limit_s=replan_time_limit_s)
         blind = _drive(ctx, route, drain, replan=False)
         planned = _drive(ctx, route, no_drain, replan=False)
         trucks.append({
             "vehicle": v + 1,
             "planned_route": route,
-            "planned_energy_kwh": round(route_energy_kwh(route, dist, time_s, elevation_m, params), 3),
+            "planned_energy_kwh": round(used, 3),
+            "effective_driving_style": styles[v],
             "replans": sum(e["action"] != "continue" for e in driven["events"]),
             **driven,
             "planned": {k: planned[k] for k in ("soc_trace", "final_soc_pct", "min_soc_pct")},
@@ -246,6 +266,8 @@ def simulate(
         "num_vehicles": int(num_vehicles),
         "objective": {**objective, "label": describe(objective)},
         "energy": {**params, "has_elevation": bool(elevation_m)},
+        "energy_model": energy_metadata(),
+        "vehicle_styles": styles,
         "drain": drain,
         "trucks": trucks,
         "summary": {
@@ -296,6 +318,7 @@ def main():
     parser.add_argument("--vehicles", type=int, default=2, help="Fleet size")
     parser.add_argument("--battery-kwh", type=float, default=80.0, help="Per-truck battery")
     parser.add_argument("--reserve", type=float, help="Battery share every truck must keep (default 20)")
+    parser.add_argument("--style", choices=("eco", "normal", "aggressive"), default="normal")
     parser.add_argument("--drain", type=float, default=DEFAULT_DRAIN_FACTOR,
                         help="Actual energy as a multiple of the model's (1.3 = 30%% more)")
     parser.add_argument("--event-after", type=int, metavar="N", help="Change the drain after each truck's Nth stop")
@@ -309,7 +332,7 @@ def main():
             parser.error("--event-after needs --event-drain")
         drain["event"] = {"after_stop": args.event_after, "factor": args.event_drain}
     result = simulate(args.scenario_id, args.vehicles,
-                      energy_params={"battery_kwh": args.battery_kwh, "battery_reserve_pct": args.reserve},
+                      energy_params={"driving_style": args.style, "battery_kwh": args.battery_kwh, "battery_reserve_pct": args.reserve},
                       drain=drain, ortools_time_limit_s=args.ortools_time_limit)
     print_report(result)
 

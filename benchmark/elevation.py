@@ -1,6 +1,6 @@
 """
 Add elevations to saved scenarios so the benchmark can score and optimize
-energy (the uphill/downhill terms of the Model E regression).
+energy (the elevation gain and loss features of City NN).
 
 Fetches once from the Google Elevation API and writes `elevation_m` into the
 scenario file. Matrices and everything else in the file are left untouched,
