@@ -1,5 +1,17 @@
 # Isuzu BEV Fleet Route Optimizer
 
+> [!IMPORTANT]
+> **Just cloned or pulled, and it doesn't work?** Some files the app needs are not in GitHub on purpose. Check these first:
+>
+> | Missing | Why it's not in Git | Symptom | Fix |
+> |---|---|---|---|
+> | Traffic data folder `poc_route_planning_v1/` | Licensed for this project only; this repo is public | Traffic plans fail with `No such file or directory: …/poc_route_planning_v1/forecasts/….parquet`; **Simulate Drive** never appears | Get `poc_route_planning_v1.zip` from a teammate through a private channel (never commit it) and unzip it into the repo root, or set `POC_TRAFFIC_DIR` in `.env` to where it lives |
+> | Backend `.env` | Holds API keys | Geocoding, Google routes, elevation or the chat assistant fail | Copy [`.env.example`](.env.example) to `.env` and fill in your keys |
+> | Frontend `route-optimizer-frontend/.env` | Holds the browser API key | Blank map or a Google Maps error | Add `REACT_APP_GOOGLE_MAPS_API_KEY=...`, then restart `npm start` |
+> | `venv/` and `node_modules/` | Built per machine | `ModuleNotFoundError: ortools`, `react-scripts: not found` | `pip install -r requirements.txt` inside the venv; `npm install` in `route-optimizer-frontend/` |
+>
+> Also check that you're on the right branch (`git branch`) and that you pulled the latest commits (`git pull`). Run the tests with `venv/bin/python -m pytest tests`, not a bare `pytest` from the repo root, which uses the wrong Python and also collects `r4_test.py`. Full setup is under [Running it](#running-it) and [Traffic data](#traffic-data-optional).
+
 Route planning for battery-electric Isuzu delivery trucks. You give it a depot, delivery stops
 and the truck setup. It orders the stops for one truck using Held-Karp (exact), 2-opt or nearest
 neighbor. With more than one truck, it also splits the stops across the fleet with Google

@@ -33,6 +33,7 @@ from solvers import (
     solve_tsp_2opt,
     solve_vrp_constrained,
     BatteryLimitError,
+    replan_route as replan_route_mid_drive,
 )
 from energy import (
     calculate_energy_consumption,
@@ -1903,6 +1904,141 @@ def replan_breakdown(ctx: dict, vehicles_config: list, plan: list, event: dict, 
     return {'nothing': False, 'fleet': fleet_out, 'message': message}
 
 
+# ---- rolling replan (drive simulation, every few minutes) ------------------------
+#
+# The drive simulation calls this on a timer while the trucks keep driving.
+# Each truck is locked to the stop it is driving to (or unloading at): that
+# leg never changes, and the truck's remaining stops are re-sequenced from
+# there with the traffic forecast issued at the tick time. Cargo is already on
+# the truck, so stops never move between trucks here (a breakdown does that).
+#
+# A new order is adopted only if it beats the current one by REPLAN_MIN_GAIN
+# on the goals' cost (no flip-flopping between near-ties), or if the current
+# order no longer fits the battery. A truck whose remaining stops cannot all
+# fit its battery comes back with `alert` set: the simulation pauses for that.
+
+REPLAN_MIN_GAIN = 0.02     # adopt a new order only if it is at least 2% cheaper
+REPLAN_EXACT_MAX = 7       # up to this many remaining stops, try every order
+
+
+def _route_cost(order, cost):
+    return sum(cost[a][b] for a, b in zip(order, order[1:]))
+
+
+def _route_energy_ok(order, energy_wh, cap_wh):
+    return cap_wh is None or sum(energy_wh[a][b] for a, b in zip(order, order[1:])) <= cap_wh
+
+
+@energy_session
+def replan_tick(locations: list, elevations: list, vehicles_config: list, trucks: list, goals: dict,
+                energy_params: dict, departure_time: str, now_s: float, priority=(),
+                traffic_source: str = 'forecast', time_limit_s: int = 1) -> dict:
+    """Re-sequence each truck's remaining stops at sim time `now_s` (seconds
+    after `departure_time`). See the notes above.
+
+    trucks: [{vehicle_index, locked_leg, from_node, start_s, remaining: [node],
+              used_kwh, cargo_per_stop_lbs}]
+      from_node    the stop the truck is driving to or unloading at (locked)
+      start_s      when it will leave from_node, in sim seconds after departure
+      used_kwh     energy used by the time it leaves from_node
+    Returns {"issued_at", "trucks": [{vehicle_index, locked_leg, changed,
+             alert, order, dropped, legs, saved_time_s, saved_distance_m}]}
+    """
+    import pandas as pd
+    reserve = goals.get('battery_reserve_pct')
+    issued = pd.Timestamp(departure_time) + pd.Timedelta(seconds=float(now_s))
+    issued_at = issued.floor('5min').strftime('%Y-%m-%dT%H:%M')
+
+    # Only the nodes still in play: the depot, each truck's locked stop and its remaining stops
+    nodes = sorted({0} | {int(t['from_node']) for t in trucks} | {int(s) for t in trucks for s in t['remaining']})
+    index = {node: k for k, node in enumerate(nodes)}
+    raw = traffic_data.travel_matrices([locations[i] for i in nodes], traffic_source, issued_at)
+    sub_elev = [elevations[i] for i in nodes] if elevations else None
+    ctx = {'matrices': raw, 'raw_matrices': raw, 'elevations': sub_elev, 'locations': [locations[i] for i in nodes],
+           'temperature_c': float(energy_params.get('temperature_c', 20.0)),
+           'has_climate_control': bool(energy_params.get('has_climate_control', True)),
+           'unload_s': float(energy_params.get('unload_time_min', 30.0)) * 60,
+           'driving_style': normalize_style(energy_params.get('driving_style'))}
+    vehicles_config = resolve_vehicles(vehicles_config, load_memory()['drivers'])
+    prio = tuple(index[p] for p in priority if p in index)
+
+    out = []
+    for t in trucks:
+        v = int(t['vehicle_index'])
+        vcfg = vehicles_config[v]
+        vctx = vehicle_context(ctx, vcfg)
+        num = vehicle_numbers(vcfg)
+        start, remaining = index[int(t['from_node'])], [index[int(s)] for s in t['remaining']]
+        cps = float(t.get('cargo_per_stop_lbs') or 0.0)
+        weight = num['base'] + cps * len(remaining)
+        D, T = vctx['matrices']['distance'], vctx['matrices']['time']
+        energy_kwh = energy_matrix_kwh(D, T, sub_elev, (num['base'] + weight) / 2, ctx['temperature_c'],
+                                       ctx['has_climate_control'], vctx['driving_style']) \
+            if goal_weights(goals)['energy'] else None
+        cost = objective_matrix(vctx['matrices'], energy_kwh, goals, 1, prio)['cost']
+        cap_wh = None
+        energy_wh = None
+        if reserve is not None:
+            energy_wh = energy_upper_bound_matrix_wh(D, T, sub_elev, weight, num['base'], ctx['temperature_c'],
+                                                     ctx['has_climate_control'], vctx['driving_style'])
+            cap_wh = battery_limit_wh(num['battery_kwh'], reserve) - float(t.get('used_kwh') or 0.0) * 1000
+
+        current = [start, *remaining, 0]
+        result = {'vehicle_index': v, 'locked_leg': t.get('locked_leg'), 'changed': False, 'alert': None,
+                  'order': [nodes[k] for k in current], 'dropped': [], 'legs': [],
+                  'saved_time_s': 0, 'saved_distance_m': 0}
+        current_ok = _route_energy_ok(current, energy_wh, cap_wh)
+        best, dropped = current, []
+        if len(remaining) <= REPLAN_EXACT_MAX:
+            feasible = [[start, *p, 0] for p in permutations(remaining)
+                        if _route_energy_ok([start, *p, 0], energy_wh, cap_wh)]
+            if feasible:
+                best = min(feasible, key=lambda o: (_route_cost(o, cost), o != current))
+        if not _route_energy_ok(best, energy_wh, cap_wh) or len(remaining) > REPLAN_EXACT_MAX:
+            try:
+                sol = replan_route_mid_drive(cost, start, 0, remaining,
+                                             energy_wh if energy_wh is not None else [[0] * len(nodes) for _ in nodes],
+                                             int(cap_wh) if cap_wh is not None else 10 ** 12, time_limit_s=time_limit_s)
+                best, dropped = sol['route'], sol['dropped']
+            except BatteryLimitError:
+                result['alert'] = 'battery'
+                result['message'] = f"{vehicle_label(vcfg, v)} can't get back to the depot above its {reserve:g}% reserve, even directly."
+                out.append(result)
+                continue
+
+        if dropped:
+            result['alert'] = 'unserved'
+            result['message'] = (f"{vehicle_label(vcfg, v)} no longer has the battery for "
+                                 + ', '.join(short_place(locations[nodes[k]]) for k in dropped) + '.')
+        gain_ok = _route_cost(best, cost) <= _route_cost(current, cost) * (1 - REPLAN_MIN_GAIN)
+        if best != current and (gain_ok or not current_ok or dropped):
+            result['changed'] = True
+            result['order'] = [nodes[k] for k in best]
+            result['dropped'] = [nodes[k] for k in dropped]
+            result['saved_time_s'] = round(sum(T[a][b] for a, b in zip(current, current[1:]))
+                                           - sum(T[a][b] for a, b in zip(best, best[1:])))
+            result['saved_distance_m'] = round(sum(D[a][b] for a, b in zip(current, current[1:]))
+                                               - sum(D[a][b] for a, b in zip(best, best[1:])))
+            # The new legs as the simulation drives them: road path, forecast time,
+            # measured (ground-truth) time from when the truck leaves, and energy.
+            kinds = ['start'] + ['stop'] * (len(best) - 2) + ['depot']
+            delta = [0.0] + [-cps] * (len(best) - 2) + [0.0]
+            ev = evaluate_route(best, kinds, delta, vctx, weight)
+            leave = (pd.Timestamp(departure_time) + pd.Timedelta(seconds=float(t['start_s']))).strftime('%Y-%m-%dT%H:%M:%S')
+            measured = traffic_data.drive_on_ground_truth(raw['paths'], best, leave, ctx['unload_s'], False)
+            for k, (a, b) in enumerate(zip(best, best[1:])):
+                result['legs'].append({
+                    'from_node': nodes[a], 'to_node': nodes[b],
+                    'to': {'lat': locations[nodes[b]]['lat'], 'lng': locations[nodes[b]]['lng']},
+                    'to_label': 'Depot' if nodes[b] == 0 else short_place(locations[nodes[b]]),
+                    'path': traffic_data.path_coordinates(raw['paths'][(a, b)]),
+                    'planned_s': T[a][b], 'measured_s': measured[k],
+                    'distance_m': D[a][b], 'energy_kwh': ev['legs'][k]['energy_kwh'],
+                })
+        out.append(result)
+    return {'issued_at': issued_at, 'trucks': out}
+
+
 # ---- truck limits ------------------------------------------------------------
 
 LIMITS_TEXT = {'head': {'en': 'A {packs}-pack truck carries {kwh:.0f} kWh{usable}. Empty it weighs {empty:,.0f} lbs, so it can take up to {payload:,.0f} lbs of cargo before the {gross:,.0f} lbs limit.'}, 'usable': {'en': ' ({usable:.0f} kWh usable with a {r}% reserve)'}, 'range': {'en': ' At {temp:.0f} °C with climate control {hvac}, mixed driving uses {lo:.2f}–{hi:.2f} kWh/mi (empty → {w:,.0f} lbs), so it reaches about {rlo:.0f}–{rhi:.0f} miles per charge.'}, 'plan_ok': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — this truck covers it{kept} with {left:.0f}% of the battery to spare."}, 'kept': {'en': ', keeps the {r}% reserve,'}, 'plan_short': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — {short:.1f} kWh more than this truck can use. It needs at least {min_packs} packs, or a shorter route."}, 'plan_none': {'en': " Today's longest route ({veh}) needs {need:.1f} kWh — more than even 9 packs can cover; split it across more trucks."}, 'on': {'en': 'on'}, 'off': {'en': 'off'}}
@@ -2666,6 +2802,60 @@ def replan_route():
     if out['nothing']:
         return jsonify({'status': 'ok', 'nothing': True, 'message': out['message']})
     return jsonify({'status': 'ok', 'nothing': False, 'message': out['message'], 'results': {'ortools_fleet': out['fleet']}})
+
+
+@app.route('/api/replan_tick', methods=['POST'])
+@energy_request
+def replan_tick_endpoint():
+    """
+    Drive simulation: rolling replan while the trucks keep driving (every 5
+    simulated minutes). Each truck keeps the leg it is on; its remaining stops
+    are re-sequenced with the traffic forecast issued at the tick time.
+
+    Request body:
+    {
+        "locations": [...], "vehicles": [...], "energy_params": {...}, "goals": {...},
+        "priority_stops": [...],
+        "elevations": [...],                    from the plan's solve
+        "departure_time": "2025-11-12T08:00",   the plan's traffic-data departure
+        "now_s": 900,                           sim seconds after departure
+        "trucks": [{"vehicle_index": 0, "locked_leg": 2, "from_node": 3, "start_s": 1500,
+                    "remaining": [5, 1], "used_kwh": 12.4, "cargo_per_stop_lbs": 1200}]
+    }
+    Returns: {"status": "ok", "issued_at": "...", "trucks": [...]} — see replan_tick().
+    """
+    data = request.json or {}
+    locations = data.get('locations') or []
+    vehicles_config = data.get('vehicles') or []
+    trucks = data.get('trucks')
+    departure_time = data.get('departure_time')
+    n = len(locations)
+    if n < 2 or not vehicles_config or not isinstance(trucks, list) or not departure_time:
+        return jsonify({'status': 'error', 'message': 'Need locations, vehicles, departure_time and trucks'}), 400
+    try:
+        now_s = float(data.get('now_s'))
+    except (TypeError, ValueError):
+        return jsonify({'status': 'error', 'message': 'now_s must be a number'}), 400
+    for t in trucks:
+        nodes = [t.get('from_node'), *(t.get('remaining') or [])]
+        if not isinstance(t.get('vehicle_index'), int) or not 0 <= t['vehicle_index'] < len(vehicles_config) \
+                or any(not isinstance(i, int) or not 0 < i < n for i in nodes) \
+                or not isinstance(t.get('start_s'), (int, float)):
+            return jsonify({'status': 'error', 'message': 'Malformed truck state'}), 400
+    elevations = data.get('elevations')
+    if not isinstance(elevations, list) or len(elevations) != n:
+        elevations = None
+    try:
+        out = replan_tick(locations, elevations, vehicles_config, trucks, normalize_goals(data.get('goals')),
+                          data.get('energy_params') or {}, departure_time, now_s,
+                          priority=[int(i) for i in data.get('priority_stops') or [] if isinstance(i, int)])
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+    except ModelUnavailable as e:
+        return unavailable_model(e)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+    return jsonify({'status': 'ok', **out})
 
 
 @app.route('/api/suggest', methods=['POST'])

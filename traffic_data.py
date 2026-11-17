@@ -255,6 +255,17 @@ def drive_on_ground_truth(paths: dict, order: list, departure_time: str,
     return leg_times
 
 
+def path_coordinates(edges: list) -> list:
+    """Map points ({lat, lng}) along a path of network edges, for drawing and driving it."""
+    geometry = load_network().geometry
+    points = []
+    for edge in edges:
+        for p in geometry.get(edge, ()):
+            if not points or points[-1] != p:
+                points.append(p)
+    return points
+
+
 def _distance_to_line_m(point: dict, line: list) -> float:
     """Shortest distance in metres from a point to a polyline (local flat projection)."""
     def xy(p):

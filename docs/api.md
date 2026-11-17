@@ -17,6 +17,7 @@ to `http://localhost:5001/api`.
 | `/api/suggest` | POST | Check a solved plan for a problem and test fixes for it |
 | `/api/replan_incidents` | POST | `{legs, num_accidents}` → crash hotspots on the route and reroutes for every on/off combination (stop order kept) |
 | `/api/reroute_from` | POST | `{position, destination, accidents}` → reroute for a truck already driving |
+| `/api/replan_tick` | POST | Drive simulation rolling replan (every 5 sim minutes): each truck keeps the leg it is on; its remaining stops are re-sequenced with the traffic forecast issued at the tick time. A new order is adopted only if it is ≥ 2% cheaper on the goals, and `alert` is set when stops no longer fit the battery. See `replan_tick()` |
 | `/api/plan_charging` | POST | `{vehicles: [{vehicle_id, battery_kwh, reserve_pct?, legs}], energy_params}` → one charging stop per truck that would end below its reserve |
 | `/api/chat` | POST | Chat assistant. See [chat-assistant.md](chat-assistant.md) |
 | `/api/memory` | GET / DELETE | Saved driver profiles. See [chat-assistant.md](chat-assistant.md#driver-memory) |
