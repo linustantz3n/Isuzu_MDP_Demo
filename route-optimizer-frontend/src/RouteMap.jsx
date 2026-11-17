@@ -68,7 +68,9 @@ export function stopSequence(results) {
 // chargingPlans: /api/plan_charging plans (charging stop, detour and reserve point per vehicle)
 // drive: {runId, speed} while the drive simulation runs (measured traffic), else null. It drives
 //   the fleet's trucks when there is a fleet, otherwise the Held-Karp route.
-export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd }) {
+// replanContext: {request, inputs, locations} of the plan on screen, for the drive
+//   simulation's rolling replan (/api/replan_tick); null turns rolling replans off.
+export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd, replanContext = null }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -94,14 +96,29 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
       if (!actual || !dirLegs || dirLegs.length !== actual.length) return null;
       const stops = route.ordered_locations;
       const atDepot = (k) => k + 1 >= stops.length || (k + 1 === stops.length - 1 && route.order?.[k + 1] === 0);
-      return dirLegs.map((leg, k) => ({
-        path: activeLegs.find(l => l.leg_index === offset + k)?.original.path
-          || leg.path,
-        durationS: actual[k],
-        plannedS: route.legs[k]?.time_s ?? actual[k],
-        to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
-        toLabel: atDepot(k) ? 'Depot' : `Stop ${k + 1}`,
-      }));
+      return dirLegs.map((leg, k) => {
+        const active = activeLegs.find(l => l.leg_index === offset + k);
+        return {
+          path: active?.original.path || leg.path,
+          durationS: actual[k],
+          plannedS: route.legs[k]?.time_s ?? actual[k],
+          energyKwh: route.legs[k]?.energy_kwh ?? 0,
+          to: { lat: stops[(k + 1) % stops.length].lat, lng: stops[(k + 1) % stops.length].lng },
+          toLabel: atDepot(k) ? 'Depot' : `Stop ${k + 1}`,
+          // The detour /api/replan_incidents already found for this leg's active accidents
+          reroute: active && active.method !== 'clear' && active.rerouted?.path ? {
+            path: active.rerouted.path, method: active.method,
+            originalS: active.original.time_s, reroutedS: active.rerouted.time_s,
+            originalM: active.original.distance_m, reroutedM: active.rerouted.distance_m,
+          } : null,
+        };
+      });
+    };
+    // Node indices the legs run between, ending back at the start (the depot)
+    const nodesOf = (route, legs) => {
+      const order = [...(route.order || [])];
+      if (order.length === legs.length) order.push(order[0]);
+      return order.length === legs.length + 1 ? order : null;
     };
     const accidentsOn = (offset, n) => (replan ? replan.accidents : [])
       .filter(a => activeAccidents.includes(a.id) && a.leg_index >= offset && a.leg_index < offset + n)
@@ -122,6 +139,9 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
           legs,
           accidents: accidentsOn(offset, route.legs.length),
           unloadS: unloadOf(route, route.num_delivery_stops),
+          order: nodesOf(route, legs),
+          vehicleIndex: route.vehicle_index ?? idx,
+          cargoPerStopLbs: route.vehicle_config?.weight_per_stop_lbs || 0,
         });
         offset += route.legs.length;
       }
@@ -131,7 +151,9 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
     const legs = roadLegs(routeDirections.find(r => r.label === 'Held-Karp'), hk, 0);
     if (!legs) return null;
     return [{ id: 'hk', label: 'The truck', color: SINGLE_COLOR, legs,
-              accidents: accidentsOn(0, legs.length), unloadS: unloadOf(hk, hk.ordered_locations.length - 1) }];
+              accidents: accidentsOn(0, legs.length), unloadS: unloadOf(hk, hk.ordered_locations.length - 1),
+              order: nodesOf(hk, legs), vehicleIndex: 0,
+              cargoPerStopLbs: hk.weight_params?.weight_per_stop_lbs || 0 }];
   }, [results, routeDirections, activeLegs, replan, activeAccidents]);
   const driveDeparture = results?.ortools_fleet?.routes?.[0]?.traffic?.departure_time
     || results?.optimal?.traffic?.departure_time;
@@ -522,6 +544,7 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
               speed={drive.speed}
               overlay={overlay}
               onEnd={onDriveEnd}
+              replanContext={replanContext}
             />
           )}
 

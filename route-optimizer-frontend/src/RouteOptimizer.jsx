@@ -1,6 +1,6 @@
 import VehicleDriverControls from './VehicleDriverControls';
 import { assignDriver, applyStyleOverrides, effectiveStyle } from './driverState';
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, Star, AlertTriangle, TriangleAlert, ArrowLeftRight, RotateCcw, Play, Square, User } from 'lucide-react';
 import RouteMap from './RouteMap';
 import SchematicRouteMap from './SchematicRouteMap';
@@ -411,6 +411,14 @@ function RouteOptimizer() {
   };
 
   const currentVersion = versions[versions.length - 1];
+  // What the drive simulation's rolling replan re-solves with: the request and inputs of
+  // the plan on screen. Only plans timed on traffic data have a departure to replan from.
+  const shownVersion = versions.find(v => v.results === results);
+  const driveReplanContext = useMemo(() => (
+    shownVersion?.request?.departure_time && shownVersion.inputs?.elevations
+      ? { request: shownVersion.request, inputs: shownVersion.inputs, locations: shownVersion.locations }
+      : null
+  ), [shownVersion]);
   // The plan a breakdown is simulated on: the latest one that is not itself a breakdown.
   const cleanVersion = [...versions].reverse().find(v => !v.results.ortools_fleet?.disruption);
 
@@ -1679,7 +1687,7 @@ function RouteOptimizer() {
                         ) : (
                           <button
                             onClick={() => setDrive({ runId: Date.now(), speed: SIM_SPEEDS[1] })}
-                            title={`Drive ${fleet ? 'every truck\'s route' : 'the route'} on the measured traffic; you'll be asked to reroute at active accidents`}
+                            title={`Drive ${fleet ? 'every truck\'s route' : 'the route'} on the measured traffic; trucks detour around active accidents and replan every 5 min while driving`}
                             className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg text-xs font-medium transition-colors"
                           >
                             <Play className="w-3 h-3" /> Simulate Drive
@@ -1805,6 +1813,7 @@ function RouteOptimizer() {
                 activeLegs={activeLegs}
                 chargingPlans={chargingPlans ? Object.values(chargingPlans) : []}
                 drive={drive}
+                replanContext={driveReplanContext}
               />}
 
               {/* Charts */}
