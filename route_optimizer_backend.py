@@ -1937,12 +1937,18 @@ def replan_tick(locations: list, elevations: list, vehicles_config: list, trucks
     after `departure_time`). See the notes above.
 
     trucks: [{vehicle_index, locked_leg, from_node, start_s, remaining: [node],
-              used_kwh, cargo_per_stop_lbs}]
-      from_node    the stop the truck is driving to or unloading at (locked)
-      start_s      when it will leave from_node, in sim seconds after departure
-      used_kwh     energy used by the time it leaves from_node
+              used_kwh, cargo_per_stop_lbs, drain_estimate}]
+      from_node       the stop the truck is driving to or unloading at (locked)
+      start_s         when it will leave from_node, in sim seconds after departure
+      used_kwh        energy used by the time it leaves from_node
+      drain_estimate  actual / model energy seen so far (default 1.0); the
+                      battery check scales the upper-bound arcs by it, as the
+                      battery-drain simulation does (benchmark/simulate.py _check)
     Returns {"issued_at", "trucks": [{vehicle_index, locked_leg, changed,
-             alert, order, dropped, legs, saved_time_s, saved_distance_m}]}
+             alert, order, dropped, legs, saved_time_s, saved_distance_m,
+             drain_estimate, need_kwh, budget_kwh}]}
+      need_kwh / budget_kwh  the current order's scaled energy need and the
+                             battery above the reserve (None without a reserve)
     """
     import pandas as pd
     reserve = goals.get('battery_reserve_pct')
@@ -1976,17 +1982,21 @@ def replan_tick(locations: list, elevations: list, vehicles_config: list, trucks
                                        ctx['has_climate_control'], vctx['driving_style']) \
             if goal_weights(goals)['energy'] else None
         cost = objective_matrix(vctx['matrices'], energy_kwh, goals, 1, prio)['cost']
+        drain = float(t.get('drain_estimate') or 1.0)
         cap_wh = None
         energy_wh = None
         if reserve is not None:
-            energy_wh = energy_upper_bound_matrix_wh(D, T, sub_elev, weight, num['base'], ctx['temperature_c'],
-                                                     ctx['has_climate_control'], vctx['driving_style'])
+            bound = energy_upper_bound_matrix_wh(D, T, sub_elev, weight, num['base'], ctx['temperature_c'],
+                                                 ctx['has_climate_control'], vctx['driving_style'])
+            energy_wh = [[math.ceil(e * drain) for e in row] for row in bound]
             cap_wh = battery_limit_wh(num['battery_kwh'], reserve) - float(t.get('used_kwh') or 0.0) * 1000
 
         current = [start, *remaining, 0]
         result = {'vehicle_index': v, 'locked_leg': t.get('locked_leg'), 'changed': False, 'alert': None,
                   'order': [nodes[k] for k in current], 'dropped': [], 'legs': [],
-                  'saved_time_s': 0, 'saved_distance_m': 0}
+                  'saved_time_s': 0, 'saved_distance_m': 0, 'drain_estimate': round(drain, 3),
+                  'need_kwh': round(_route_cost(current, energy_wh) / 1000, 2) if energy_wh is not None else None,
+                  'budget_kwh': round(cap_wh / 1000, 2) if cap_wh is not None else None}
         current_ok = _route_energy_ok(current, energy_wh, cap_wh)
         best, dropped = current, []
         if len(remaining) <= REPLAN_EXACT_MAX:
@@ -2820,7 +2830,8 @@ def replan_tick_endpoint():
         "departure_time": "2025-11-12T08:00",   the plan's traffic-data departure
         "now_s": 900,                           sim seconds after departure
         "trucks": [{"vehicle_index": 0, "locked_leg": 2, "from_node": 3, "start_s": 1500,
-                    "remaining": [5, 1], "used_kwh": 12.4, "cargo_per_stop_lbs": 1200}]
+                    "remaining": [5, 1], "used_kwh": 12.4, "cargo_per_stop_lbs": 1200,
+                    "drain_estimate": 1.3}]                 drain_estimate optional, default 1.0
     }
     Returns: {"status": "ok", "issued_at": "...", "trucks": [...]} — see replan_tick().
     """
@@ -2840,7 +2851,9 @@ def replan_tick_endpoint():
         nodes = [t.get('from_node'), *(t.get('remaining') or [])]
         if not isinstance(t.get('vehicle_index'), int) or not 0 <= t['vehicle_index'] < len(vehicles_config) \
                 or any(not isinstance(i, int) or not 0 < i < n for i in nodes) \
-                or not isinstance(t.get('start_s'), (int, float)):
+                or not isinstance(t.get('start_s'), (int, float)) \
+                or not (t.get('drain_estimate') is None
+                        or (isinstance(t['drain_estimate'], (int, float)) and t['drain_estimate'] > 0)):
             return jsonify({'status': 'error', 'message': 'Malformed truck state'}), 400
     elevations = data.get('elevations')
     if not isinstance(elevations, list) or len(elevations) != n:

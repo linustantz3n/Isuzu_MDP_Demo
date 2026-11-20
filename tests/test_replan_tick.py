@@ -38,9 +38,12 @@ def tick(trucks, goals=TIME_GOALS, now_s=900):
                           '2025-11-12T07:30', now_s)
 
 
-def state(remaining, from_node=1, used_kwh=0.0, cps=0.0, v=0):
-    return {'vehicle_index': v, 'locked_leg': 0, 'from_node': from_node, 'start_s': 1200,
-            'remaining': remaining, 'used_kwh': used_kwh, 'cargo_per_stop_lbs': cps}
+def state(remaining, from_node=1, used_kwh=0.0, cps=0.0, v=0, drain=None):
+    s = {'vehicle_index': v, 'locked_leg': 0, 'from_node': from_node, 'start_s': 1200,
+         'remaining': remaining, 'used_kwh': used_kwh, 'cargo_per_stop_lbs': cps}
+    if drain is not None:
+        s['drain_estimate'] = drain
+    return s
 
 
 def test_reorders_remaining_stops_and_keeps_the_locked_stop_first(traffic):
@@ -102,6 +105,28 @@ def test_no_way_home_above_reserve_is_a_battery_alert(traffic):
     assert t['alert'] == 'battery' and not t['changed'] and 'reserve' in t['message']
 
 
+def test_extra_drain_drops_a_stop_that_fits_at_model_energy(traffic):
+    full, home = _bounds([5])
+    cap = be.battery_limit_wh(80, 20)
+    used = (cap - full * 1.1) / 1000                # fits at 1.0x with 10% to spare
+    goals = {**TIME_GOALS, 'battery_reserve_pct': 20}
+    plain = tick([state([5], used_kwh=used)], goals=goals)['trucks'][0]
+    assert plain['alert'] is None and not plain['changed']
+    drained = tick([state([5], used_kwh=used, drain=1.5)], goals=goals)['trucks'][0]
+    assert drained['alert'] == 'unserved' and drained['dropped'] == [5] and drained['order'] == [1, 0]
+
+
+def test_reports_drain_need_and_budget(traffic):
+    full, _ = _bounds([5])
+    goals = {**TIME_GOALS, 'battery_reserve_pct': 20}
+    t = tick([state([5], used_kwh=10.0, drain=1.25)], goals=goals)['trucks'][0]
+    assert t['drain_estimate'] == 1.25
+    assert t['need_kwh'] == pytest.approx(full * 1.25 / 1000, abs=0.02)
+    assert t['budget_kwh'] == pytest.approx(be.battery_limit_wh(80, 20) / 1000 - 10.0, abs=0.01)
+    plain = tick([state([5])])['trucks'][0]          # no reserve: no battery check
+    assert plain['drain_estimate'] == 1.0 and plain['need_kwh'] is None and plain['budget_kwh'] is None
+
+
 def test_endpoint_validates_the_truck_state(traffic):
     client = be.app.test_client()
     body = {'locations': LOCS, 'vehicles': VEHICLES, 'departure_time': '2025-11-12T07:30', 'now_s': 600,
@@ -109,7 +134,8 @@ def test_endpoint_validates_the_truck_state(traffic):
             'trucks': [state([4, 2, 3])]}
     ok = client.post('/api/replan_tick', json=body).get_json()
     assert ok['status'] == 'ok' and ok['trucks'][0]['changed']
-    for bad in ({**state([4]), 'from_node': 0}, {**state([4]), 'remaining': [99]}, {**state([4]), 'vehicle_index': 5}):
+    for bad in ({**state([4]), 'from_node': 0}, {**state([4]), 'remaining': [99]}, {**state([4]), 'vehicle_index': 5},
+                state([4], drain=0), state([4], drain='high')):
         r = client.post('/api/replan_tick', json={**body, 'trucks': [bad]})
         assert r.status_code == 400
     assert client.post('/api/replan_tick', json={**body, 'now_s': 'soon'}).status_code == 400

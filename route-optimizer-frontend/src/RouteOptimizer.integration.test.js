@@ -69,3 +69,37 @@ test('UI and chat re-solve using driver snapshots and reject an older response',
   expect(wang.driving_style).toBe('aggressive');
   delete global.fetch;
 });
+
+test('the Simulation tab solves the shared stops on measured traffic; the Solver cannot pick it', async () => {
+  const requests = [];
+  global.fetch = jest.fn(async (url, options) => {
+    const body = options?.body ? JSON.parse(options.body) : null;
+    if (url.endsWith('/memory')) return jsonResponse({ status: 'ok', drivers: [] });
+    if (url.endsWith('/geocode')) return jsonResponse({ status: 'ok', result: locations[0] });
+    if (url.endsWith('/geocode_batch')) return jsonResponse({ status: 'ok', results: locations.slice(1) });
+    if (url.endsWith('/optimize')) { requests.push(body); return solveResponse(body); }
+    throw new Error(`Unexpected request: ${url}`);
+  });
+  Element.prototype.scrollTo = jest.fn();
+  render(<RouteOptimizer />);
+  expect(screen.queryByRole('option', { name: 'Measured traffic (hindsight)' })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Simulation' }));
+  // The same inputs show on both tabs; edit the Simulation tab's copy
+  const last = (list) => list[list.length - 1];
+  fireEvent.change(last(screen.getAllByPlaceholderText('e.g. 1400 S Douglass Rd, Anaheim, CA')), { target: { value: 'Depot' } });
+  fireEvent.change(last(screen.getAllByPlaceholderText('Stop 1')), { target: { value: 'A' } });
+  fireEvent.change(last(screen.getAllByPlaceholderText('Stop 2')), { target: { value: 'B' } });
+  expect(screen.getAllByPlaceholderText('Stop 1')[0]).toHaveValue('A');      // shared with the Solver tab
+  fireEvent.click(last(screen.getAllByRole('button', { name: 'Validate Addresses' })));
+  const optimize = screen.getByRole('button', { name: 'Optimize on Measured Traffic' });
+  await waitFor(() => expect(optimize).toBeEnabled());
+  fireEvent.change(screen.getByLabelText('Simulation departure'), { target: { value: '08:15' } });
+  fireEvent.click(optimize);
+  await waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0]).toMatchObject({ traffic_source: 'ground_truth', departure_time: '2025-11-12T08:15' });
+  expect(requests[0].precomputed).toBeUndefined();
+  // The Solver tab has no plan of its own yet
+  expect(screen.queryByText('Optimization Results')).not.toBeInTheDocument();
+  delete global.fetch;
+});

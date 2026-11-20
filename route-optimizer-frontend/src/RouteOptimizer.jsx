@@ -1,14 +1,13 @@
 import VehicleDriverControls from './VehicleDriverControls';
 import { assignDriver, applyStyleOverrides, effectiveStyle } from './driverState';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, Star, AlertTriangle, TriangleAlert, ArrowLeftRight, RotateCcw, Play, Square, User } from 'lucide-react';
+import { MapPin, Plus, Trash2, Route, Navigation, Loader2, AlertCircle, CheckCircle, Download, Home, Truck, Zap, Clock, TrendingDown, BarChart3, Activity, Star, AlertTriangle, ArrowLeftRight, User } from 'lucide-react';
 import RouteMap from './RouteMap';
 import SchematicRouteMap from './SchematicRouteMap';
-import { SIM_SPEEDS } from './DriveSimulation';
 import FleetCharts from './FleetCharts';
 import AIChatbot from './AIChatbot';
 import BenchmarkPanel from './BenchmarkPanel';
-import BenchmarkSimulation from './BenchmarkSimulation';
+import SimulationPanel, { incidentLegs } from './SimulationPanel';
 import GoalsPanel from './GoalsPanel';
 import PlanComparison from './PlanComparison';
 import { DEFAULT_GOALS, goalsSummary, trafficLabel } from './goals';
@@ -32,13 +31,6 @@ const NUM_ACCIDENTS = 3;
 // Key of /api/replan_incidents scenarios: active accident ids, sorted and comma-joined
 const scenarioKey = (ids) => [...ids].sort((a, b) => a - b).join(',');
 
-// Legs searched for crash hotspots: Held-Karp's, or with a fleet every vehicle's legs together,
-// each tagged with its vehicle and the input index of both ends (fleet stops keep input numbering)
-const incidentLegs = (results) => (results.ortools_fleet
-  ? results.ortools_fleet.routes.flatMap(route => route.legs.map((leg, k) => ({
-    ...leg, vehicle_id: route.vehicle_id, from_idx: route.order[k], to_idx: route.order[k + 1],
-  })))
-  : results.optimal.legs);
 
 const DEMO_ADDRESSES = [
   'Detroit, MI',
@@ -59,8 +51,8 @@ const TRAFFIC_SOURCES = [
   ['google', 'Google (typical, no traffic)'],
   ['forecast', 'Traffic forecast at departure'],
   ['historical', 'Historical traffic (same time, other day)'],
-  ['ground_truth', 'Measured traffic (hindsight)'],
 ];
+// Measured traffic (hindsight) is not a planning source: the Simulation tab solves and drives on it.
 const TRAFFIC_DAYS = [
   ['2025-11-12', 'Wed Nov 12'],
   ['2025-11-18', 'Tue Nov 18'],
@@ -108,6 +100,12 @@ function RouteOptimizer() {
   // Drive simulation on measured traffic (the fleet's trucks, or the Held-Karp route without a fleet):
   // {runId, speed}, or null when off
   const [drive, setDrive] = useState(null);
+  // The Simulation tab's own plan, solved on measured traffic: {results, request, inputs, locations}
+  const [simPlan, setSimPlan] = useState(null);
+  const [simTraffic, setSimTraffic] = useState({ day: '2025-11-12', time: '07:30' });
+  const [simLoading, setSimLoading] = useState(false);
+  const [simError, setSimError] = useState(null);
+  const simSequence = useRef(0);
   const [chargingPlans, setChargingPlans] = useState(null);  // /api/plan_charging plans by vehicle_id
   const [planningCharging, setPlanningCharging] = useState(false);
   const [chargingError, setChargingError] = useState(null);
@@ -152,6 +150,7 @@ function RouteOptimizer() {
       solveSequence.current += 1;
       setSavedDemo(data);
       setVersions([]);
+      setSimPlan(null);
       setReplan(null);
       setChargingPlans(null);
       setStale(null);
@@ -337,8 +336,11 @@ function RouteOptimizer() {
 
   // One solve. Sends back the matrices of the last solve of these same
   // locations, so a re-solve after a chat change makes no Google calls.
-  const callOptimize = async (locations, previous, generation = ++solveSequence.current) => {
-    if (generation !== solveSequence.current) { const err = new Error('Configuration changed'); err.superseded = true; throw err; }
+  // trafficSetting / sequence: the Simulation tab solves on measured traffic with its own counter.
+  const callOptimize = async (locations, previous, generation = ++solveSequence.current,
+                              trafficSetting = trafficData, sequence = solveSequence) => {
+    const td = trafficSetting;
+    if (generation !== sequence.current) { const err = new Error('Configuration changed'); err.superseded = true; throw err; }
     const body = {
       locations,
       mode: 'distance',
@@ -350,19 +352,19 @@ function RouteOptimizer() {
       goals,
       priority_stops: priorityIndices(),
       traffic: traffic ? { departure: traffic } : null,
-      traffic_source: trafficData.source,
-      departure_time: trafficData.source === 'google' ? undefined : `${trafficData.day}T${trafficData.time}`,
+      traffic_source: td.source,
+      departure_time: td.source === 'google' ? undefined : `${td.day}T${td.time}`,
     };
     // Kept with the version (without the matrices), so the suggestion check can
     // re-solve the same request with a fix.
     if (SAVED_DEMO) body.fleet_time_limit_s = 2;
     const request = { ...body };
-    if (savedDemo && !traffic && trafficData.source === 'google' && locationsKey(savedDemo.locations) === locationsKey(locations)) body.precomputed = savedDemo.precomputed;
+    if (savedDemo && !traffic && td.source === 'google' && locationsKey(savedDemo.locations) === locationsKey(locations)) body.precomputed = savedDemo.precomputed;
     // Matrices fetched for other traffic settings are not reused.
     if (previous?.inputs && locationsKey(previous.locations) === locationsKey(locations)
         && (previous.inputs.traffic?.departure ?? null) === traffic
-        && (previous.inputs.traffic_source || 'google') === trafficData.source
-        && (trafficData.source === 'google' || previous.inputs.departure_time === `${trafficData.day}T${trafficData.time}`)) {
+        && (previous.inputs.traffic_source || 'google') === td.source
+        && (td.source === 'google' || previous.inputs.departure_time === `${td.day}T${td.time}`)) {
       body.precomputed = previous.inputs;
     }
     const response = await fetch(`${API_BASE}/optimize`, {
@@ -371,7 +373,7 @@ function RouteOptimizer() {
       body: JSON.stringify(body)
     });
     const data = await response.json();
-    if (generation !== solveSequence.current) {
+    if (generation !== sequence.current) {
       const error = new Error('A newer configuration superseded this solve'); error.superseded = true; throw error;
     }
     if (data.status === 'error') throw new Error(data.message);
@@ -382,8 +384,8 @@ function RouteOptimizer() {
       results: { ...data.results, solver: data.solver, goals: data.goals, priority_stops: data.priority_stops || [],
                  traffic: data.traffic || null, vehicles: data.vehicles || vehicles, energy_model: data.energy_model },
       inputs: { distance: data.matrices.distance, time: data.matrices.time, elevations: data.elevations,
-                traffic: data.traffic || null, traffic_source: trafficData.source,
-                departure_time: trafficData.source === 'google' ? null : `${trafficData.day}T${trafficData.time}` },
+                traffic: data.traffic || null, traffic_source: td.source,
+                departure_time: td.source === 'google' ? null : `${td.day}T${td.time}` },
       request,
     };
   };
@@ -401,9 +403,6 @@ function RouteOptimizer() {
     if (request?.vehicles) setVehicles(request.vehicles);
     setLastLocations(locations);
     setStale(null);
-    setReplan(null);
-    setReplanError(null);
-    setDrive(null);
     setChargingPlans(null);
     setChargingError(null);
     if (prev) mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -411,14 +410,38 @@ function RouteOptimizer() {
   };
 
   const currentVersion = versions[versions.length - 1];
-  // What the drive simulation's rolling replan re-solves with: the request and inputs of
-  // the plan on screen. Only plans timed on traffic data have a departure to replan from.
-  const shownVersion = versions.find(v => v.results === results);
+  // What the drive simulation's rolling replan re-solves with: the request and inputs of the
+  // Simulation tab's plan (solved on measured traffic, so it always has a departure).
   const driveReplanContext = useMemo(() => (
-    shownVersion?.request?.departure_time && shownVersion.inputs?.elevations
-      ? { request: shownVersion.request, inputs: shownVersion.inputs, locations: shownVersion.locations }
+    simPlan?.request?.departure_time && simPlan.inputs?.elevations
+      ? { request: simPlan.request, inputs: simPlan.inputs, locations: simPlan.locations }
       : null
-  ), [shownVersion]);
+  ), [simPlan]);
+
+  // Simulation tab: solve the shared stops and fleet on measured traffic (hindsight), then drive it.
+  // Matrices are always fetched fresh: measured leg times only come back with a fresh solve.
+  const optimizeSimulation = async () => {
+    if (validatedLocations.length < 2 || (useDepot && !validatedDepot)) {
+      setSimError('Validate the addresses first');
+      return;
+    }
+    setSimLoading(true);
+    setSimError(null);
+    try {
+      const locs = useDepot ? [validatedDepot, ...validatedLocations] : validatedLocations;
+      const out = await callOptimize(locs, null, ++simSequence.current,
+                                     { source: 'ground_truth', ...simTraffic }, simSequence);
+      setSimPlan({ ...out, locations: locs });
+      setReplan(null);
+      setReplanError(null);
+      setActiveAccidents([]);
+      setDrive(null);
+    } catch (err) {
+      if (!err.superseded) setSimError(err.message || 'Failed to optimize');
+    } finally {
+      setSimLoading(false);
+    }
+  };
   // The plan a breakdown is simulated on: the latest one that is not itself a breakdown.
   const cleanVersion = [...versions].reverse().find(v => !v.results.ortools_fleet?.disruption);
 
@@ -462,10 +485,10 @@ function RouteOptimizer() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          legs: incidentLegs(results),
+          legs: incidentLegs(simPlan.results),
           num_accidents: NUM_ACCIDENTS,
-          energy_params: energyParams,
-          expected_energy_model: results.energy_model
+          energy_params: simPlan.request.energy_params,
+          expected_energy_model: simPlan.results.energy_model
         })
       });
 
@@ -855,8 +878,260 @@ function RouteOptimizer() {
   const TABS = [
     { id: 'solver', label: 'Solver', icon: Route },
     { id: 'benchmark', label: 'Benchmark', icon: BarChart3 },
-    { id: 'simulate', label: 'Drive Sim', icon: Activity },
+    { id: 'simulate', label: 'Simulation', icon: Activity },
   ];
+
+  // Plan inputs shared by the Solver and Simulation tabs: same state, edited on either tab
+  const planSetup = (
+    <>
+      <GoalsPanel
+        goals={goals}
+        onChange={updateGoalsByHand}
+        priorityStops={priorityStops}
+        onRemovePriority={togglePriority}
+        setBy={goalsSetBy}
+        hot={flash.goals}
+        vehicleCount={vehicles.length}
+        traffic={traffic}
+        onTrafficChange={(t) => { setTraffic(t); if (results) setStale('Traffic changed — click Optimize Routes to re-solve.'); }}
+        drivingStyle={vehicles.every(v => effectiveStyle(v) === effectiveStyle(vehicles[0])) ? effectiveStyle(vehicles[0]) : 'mixed'}
+        onStyleChange={st => changeDriverConfig(vehicles.map(v => ({ ...v, driving_style_override: st })), `All trucks → ${st} for this run`)}
+      />
+
+      <div className="border-t border-slate-800" />
+
+      {/* Vehicle Parameters */}
+      <section>
+        <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest mb-3">Vehicle Parameters</h3>
+
+        {/* Depot input */}
+        <div className="mb-4">
+          <div className="flex items-center gap-2 mb-1.5">
+            <Home className="w-3.5 h-3.5 text-slate-500" />
+            <label className="text-xs text-slate-400">Depot Address</label>
+            {isDepotValidated() && <CheckCircle className="w-3 h-3 text-green-400 ml-auto" />}
+          </div>
+          <input
+            type="text"
+            value={depot}
+            onChange={(e) => updateDepot(e.target.value)}
+            placeholder="e.g. 1400 S Douglass Rd, Anaheim, CA"
+            className={`w-full px-3 py-2 bg-slate-800 border ${isDepotValidated() ? 'border-green-500/60 bg-green-500/5' : 'border-slate-700'} rounded-lg text-sm text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent transition-colors`}
+          />
+        </div>
+
+        {/* Ambient conditions */}
+        <div className={`space-y-3 mb-4 rounded-lg transition-shadow duration-500 ${flash.conditions ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-xs text-slate-400">Ambient Temperature</label>
+              <span className="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded">
+                {energyParams.temperature_c}°C / {(energyParams.temperature_c * 9/5 + 32).toFixed(0)}°F
+              </span>
+            </div>
+            <input
+              type="range" min="-10" max="40"
+              value={energyParams.temperature_c}
+              onChange={(e) => setEnergyParams({...energyParams, temperature_c: parseInt(e.target.value)})}
+              className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-[#C8002F]"
+            />
+            <div className="flex justify-between text-[10px] text-slate-600 mt-1">
+              <span>−10°C</span><span>40°C</span>
+            </div>
+          </div>
+
+          {/* Unload Time per Stop */}
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-xs text-slate-400">Unload Time / Stop</label>
+              <span className="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded">
+                {energyParams.unload_time_min} min
+              </span>
+            </div>
+            <input
+              type="range" min="5" max="120" step="5"
+              value={energyParams.unload_time_min}
+              onChange={(e) => setEnergyParams({...energyParams, unload_time_min: parseInt(e.target.value)})}
+              className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-[#C8002F]"
+            />
+            <div className="flex justify-between text-[10px] text-slate-600 mt-1">
+              <span>5 min</span><span>120 min</span>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <label className="text-xs text-slate-400">Climate Control (HVAC)</label>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={energyParams.has_climate_control}
+                onChange={(e) => setEnergyParams({...energyParams, has_climate_control: e.target.checked})}
+                className="sr-only peer"
+              />
+              <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#C8002F]"></div>
+            </label>
+          </div>
+        </div>
+
+        <p className="text-[10px] text-slate-600 leading-relaxed">
+          City NN · synthetic driving traces · each truck uses its effective driving style and unloading weight
+        </p>
+        <div className="mt-2 p-2 bg-slate-900 rounded-lg border border-slate-800">
+          <p className="text-[9px] text-slate-500 mb-1 font-semibold uppercase tracking-wider">Calculated with:</p>
+          <p className="text-[9px] text-slate-400 font-mono leading-relaxed break-all">
+            Energy = City NN propulsion + auxiliary energy over driving time
+          </p>
+          <p className="text-[9px] text-slate-600 mt-1 leading-relaxed">
+            Synthetic acceleration, speed, elevation, temperature and load features. Predictions are estimates; Eco savings are checked by replanning.
+          </p>
+        </div>
+      </section>
+
+      <div className="border-t border-slate-800" />
+
+      {/* Fleet Vehicles */}
+      <section className={`rounded-lg transition-shadow duration-500 ${flash.vehicles ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Fleet Vehicles</h3>
+          <button
+            onClick={addVehicle}
+            className="text-xs text-[#C8002F] hover:text-red-400 transition-colors flex items-center gap-1"
+          >
+            <Plus className="w-3 h-3" /> Add
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          {vehicles.map((v) => (
+            <div key={v.id} className="bg-slate-800 border border-slate-700 rounded-lg p-3">
+              <div className="flex items-center justify-between mb-2">
+                <input
+                  type="text"
+                  value={v.name}
+                  onChange={(e) => updateVehicle(v.id, 'name', e.target.value)}
+                  className="text-xs font-semibold text-slate-300 bg-transparent border-none outline-none w-full"
+                />
+                {vehicles.length > 1 && (
+                  <button onClick={() => removeVehicle(v.id)} className="text-slate-600 hover:text-red-400 flex-shrink-0 ml-1">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+              <VehicleDriverControls vehicle={v} drivers={drivers}
+                onAssign={driver => changeDriverConfig(assignDriver(vehicles, v.id, driver), `${v.name}: driver ${driver?.name || 'unassigned'}`)}
+                onOverride={style => changeDriverConfig(applyStyleOverrides(vehicles, [{ vehicle_id: v.id, driving_style_override: style }]), `${v.name}: ${style || 'driver default'}`)} />
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-[10px] text-slate-500 block mb-1">Battery Packs</label>
+                  <select
+                    value={v.battery_packs}
+                    onChange={(e) => updateVehicle(v.id, 'battery_packs', parseInt(e.target.value))}
+                    className="w-full px-2 py-1 bg-slate-700 border border-slate-600 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
+                  >
+                    {[3,4,5,6,7,8,9].map(p => (
+                      <option key={p} value={p}>{p} packs · {p*20} kWh</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-500 block mb-1">Weight (lbs)</label>
+                  <input
+                    type="number" min="10000" max="19500" step="100"
+                    value={v.weight_lbs}
+                    onChange={(e) => updateVehicle(v.id, 'weight_lbs', parseInt(e.target.value) || 13000)}
+                    className="w-full px-2 py-1 bg-slate-700 border border-slate-600 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
+                  />
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
+  );
+  // Delivery Stops
+  const planStops = (
+    <section className={`rounded-lg transition-shadow duration-500 ${flash.stops ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Delivery Stops</h3>
+        <div className="flex items-center gap-3">
+          <button
+            disabled={SAVED_DEMO}
+            onClick={() => loadDemoAddresses('/demo_stops_traffic_area.txt')}
+            title="Stops inside the traffic data area (Cerritos – Stanton)"
+            className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+          >
+            <Download className="w-3 h-3" /> Demo 0
+          </button>
+          <button
+            onClick={() => loadDemoAddresses('/demo_stops.txt')}
+            title="Anaheim depot with stops across LA / Orange County"
+            className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+          >
+            <Download className="w-3 h-3" /> Demo 1
+          </button>
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        {addresses.map((address, index) => (
+          <div key={index} className="flex gap-1">
+            <div className="flex-1 relative">
+              <input
+                type="text"
+                value={address}
+                onChange={(e) => updateAddress(index, e.target.value)}
+                placeholder={`Stop ${index + 1}`}
+                className={`w-full px-3 py-2 pr-7 text-sm bg-slate-800 border ${
+                  isAddressValidated(index) && validatedLocations.length > 0
+                    ? 'border-green-500/60 bg-green-500/5'
+                    : 'border-slate-700'
+                } rounded-lg text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent transition-colors`}
+              />
+              {isAddressValidated(index) && validatedLocations.length > 0 && (
+                <CheckCircle className="w-3 h-3 text-green-400 absolute right-2.5 top-1/2 -translate-y-1/2" />
+              )}
+            </div>
+            <button
+              onClick={() => togglePriority(address)}
+              disabled={!address.trim()}
+              title={priorityStops.includes(address.trim()) ? 'Priority stop — served first on its truck' : 'Mark as priority'}
+              className={`px-1 transition-colors ${priorityStops.includes(address.trim()) ? 'text-amber-400' : 'text-slate-700 hover:text-amber-400'} disabled:opacity-30`}
+            >
+              <Star className="w-3.5 h-3.5" fill={priorityStops.includes(address.trim()) ? 'currentColor' : 'none'} />
+            </button>
+            {addresses.length > 2 && (
+              <button
+                onClick={() => removeAddress(index)}
+                className="px-1.5 text-slate-700 hover:text-red-400 transition-colors rounded"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <button
+        onClick={addAddress}
+        className="w-full mt-2 py-1.5 border border-dashed border-slate-700 hover:border-slate-500 text-slate-600 hover:text-slate-400 rounded-lg transition-colors flex items-center justify-center gap-1 text-xs"
+      >
+        <Plus className="w-3.5 h-3.5" /> Add Stop
+      </button>
+    </section>
+  );
+  const validateButton = (
+    <button
+      onClick={validateAddresses}
+      disabled={validating || addresses.filter(a => a.trim()).length < 2 || !depot.trim()}
+      className="w-full py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-sm font-medium rounded-lg border border-slate-700 hover:border-slate-600 transition-all flex items-center justify-center gap-2"
+    >
+      {validating
+        ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Validating...</>
+        : <><CheckCircle className="w-3.5 h-3.5" /> Validate Addresses</>
+      }
+    </button>
+  );
 
   return (
     <div className="h-screen flex flex-col bg-slate-950">
@@ -905,9 +1180,34 @@ function RouteOptimizer() {
         <BenchmarkPanel />
       </div>
 
-      {/* ── Drive simulation tab ── */}
+      {/* ── Simulation tab: drive the plan, crash hotspots, battery drain what-if ── */}
       <div className={`flex flex-1 min-h-0 ${activeTab === 'simulate' ? '' : 'hidden'}`}>
-        <BenchmarkSimulation />
+        <SimulationPanel
+          results={simPlan?.results || null}
+          locations={simPlan?.locations || null}
+          planSetup={activeTab === 'simulate' ? planSetup : null}
+          planStops={activeTab === 'simulate' ? planStops : null}
+          validateButton={activeTab === 'simulate' ? validateButton : null}
+          trafficDays={TRAFFIC_DAYS}
+          simTraffic={simTraffic}
+          setSimTraffic={setSimTraffic}
+          onOptimize={optimizeSimulation}
+          optimizing={simLoading}
+          optimizeError={simError}
+          canOptimize={validatedLocations.length >= 2 && (!useDepot || !!validatedDepot)}
+          replan={replan}
+          replanning={replanning}
+          replanError={replanError}
+          activeAccidents={activeAccidents}
+          activeLegs={activeLegs}
+          onFindHotspots={findHotspots}
+          onToggleAccident={toggleAccident}
+          onResetIncidents={() => { setReplan(null); setActiveAccidents([]); setDrive(null); }}
+          drive={drive}
+          setDrive={setDrive}
+          replanContext={driveReplanContext}
+          active={activeTab === 'simulate'}
+        />
       </div>
 
       {/* ── Body ───────────────────────────────────────────── */}
@@ -917,169 +1217,7 @@ function RouteOptimizer() {
         <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col flex-shrink-0">
           <div className="flex-1 overflow-y-auto p-5 space-y-6">
 
-            <GoalsPanel
-              goals={goals}
-              onChange={updateGoalsByHand}
-              priorityStops={priorityStops}
-              onRemovePriority={togglePriority}
-              setBy={goalsSetBy}
-              hot={flash.goals}
-              vehicleCount={vehicles.length}
-              traffic={traffic}
-              onTrafficChange={(t) => { setTraffic(t); if (results) setStale('Traffic changed — click Optimize Routes to re-solve.'); }}
-              drivingStyle={vehicles.every(v => effectiveStyle(v) === effectiveStyle(vehicles[0])) ? effectiveStyle(vehicles[0]) : 'mixed'}
-              onStyleChange={st => changeDriverConfig(vehicles.map(v => ({ ...v, driving_style_override: st })), `All trucks → ${st} for this run`)}
-            />
-
-            <div className="border-t border-slate-800" />
-
-            {/* Vehicle Parameters */}
-            <section>
-              <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest mb-3">Vehicle Parameters</h3>
-
-              {/* Depot input */}
-              <div className="mb-4">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <Home className="w-3.5 h-3.5 text-slate-500" />
-                  <label className="text-xs text-slate-400">Depot Address</label>
-                  {isDepotValidated() && <CheckCircle className="w-3 h-3 text-green-400 ml-auto" />}
-                </div>
-                <input
-                  type="text"
-                  value={depot}
-                  onChange={(e) => updateDepot(e.target.value)}
-                  placeholder="e.g. 1400 S Douglass Rd, Anaheim, CA"
-                  className={`w-full px-3 py-2 bg-slate-800 border ${isDepotValidated() ? 'border-green-500/60 bg-green-500/5' : 'border-slate-700'} rounded-lg text-sm text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent transition-colors`}
-                />
-              </div>
-
-              {/* Ambient conditions */}
-              <div className={`space-y-3 mb-4 rounded-lg transition-shadow duration-500 ${flash.conditions ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
-                <div>
-                  <div className="flex justify-between items-center mb-1.5">
-                    <label className="text-xs text-slate-400">Ambient Temperature</label>
-                    <span className="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded">
-                      {energyParams.temperature_c}°C / {(energyParams.temperature_c * 9/5 + 32).toFixed(0)}°F
-                    </span>
-                  </div>
-                  <input
-                    type="range" min="-10" max="40"
-                    value={energyParams.temperature_c}
-                    onChange={(e) => setEnergyParams({...energyParams, temperature_c: parseInt(e.target.value)})}
-                    className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-[#C8002F]"
-                  />
-                  <div className="flex justify-between text-[10px] text-slate-600 mt-1">
-                    <span>−10°C</span><span>40°C</span>
-                  </div>
-                </div>
-
-                {/* Unload Time per Stop */}
-                <div>
-                  <div className="flex justify-between items-center mb-1.5">
-                    <label className="text-xs text-slate-400">Unload Time / Stop</label>
-                    <span className="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded">
-                      {energyParams.unload_time_min} min
-                    </span>
-                  </div>
-                  <input
-                    type="range" min="5" max="120" step="5"
-                    value={energyParams.unload_time_min}
-                    onChange={(e) => setEnergyParams({...energyParams, unload_time_min: parseInt(e.target.value)})}
-                    className="w-full h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer accent-[#C8002F]"
-                  />
-                  <div className="flex justify-between text-[10px] text-slate-600 mt-1">
-                    <span>5 min</span><span>120 min</span>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <label className="text-xs text-slate-400">Climate Control (HVAC)</label>
-                  <label className="relative inline-flex items-center cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={energyParams.has_climate_control}
-                      onChange={(e) => setEnergyParams({...energyParams, has_climate_control: e.target.checked})}
-                      className="sr-only peer"
-                    />
-                    <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#C8002F]"></div>
-                  </label>
-                </div>
-              </div>
-
-              <p className="text-[10px] text-slate-600 leading-relaxed">
-                City NN · synthetic driving traces · each truck uses its effective driving style and unloading weight
-              </p>
-              <div className="mt-2 p-2 bg-slate-900 rounded-lg border border-slate-800">
-                <p className="text-[9px] text-slate-500 mb-1 font-semibold uppercase tracking-wider">Calculated with:</p>
-                <p className="text-[9px] text-slate-400 font-mono leading-relaxed break-all">
-                  Energy = City NN propulsion + auxiliary energy over driving time
-                </p>
-                <p className="text-[9px] text-slate-600 mt-1 leading-relaxed">
-                  Synthetic acceleration, speed, elevation, temperature and load features. Predictions are estimates; Eco savings are checked by replanning.
-                </p>
-              </div>
-            </section>
-
-            <div className="border-t border-slate-800" />
-
-            {/* Fleet Vehicles */}
-            <section className={`rounded-lg transition-shadow duration-500 ${flash.vehicles ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Fleet Vehicles</h3>
-                <button
-                  onClick={addVehicle}
-                  className="text-xs text-[#C8002F] hover:text-red-400 transition-colors flex items-center gap-1"
-                >
-                  <Plus className="w-3 h-3" /> Add
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                {vehicles.map((v) => (
-                  <div key={v.id} className="bg-slate-800 border border-slate-700 rounded-lg p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <input
-                        type="text"
-                        value={v.name}
-                        onChange={(e) => updateVehicle(v.id, 'name', e.target.value)}
-                        className="text-xs font-semibold text-slate-300 bg-transparent border-none outline-none w-full"
-                      />
-                      {vehicles.length > 1 && (
-                        <button onClick={() => removeVehicle(v.id)} className="text-slate-600 hover:text-red-400 flex-shrink-0 ml-1">
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
-                    <VehicleDriverControls vehicle={v} drivers={drivers}
-                      onAssign={driver => changeDriverConfig(assignDriver(vehicles, v.id, driver), `${v.name}: driver ${driver?.name || 'unassigned'}`)}
-                      onOverride={style => changeDriverConfig(applyStyleOverrides(vehicles, [{ vehicle_id: v.id, driving_style_override: style }]), `${v.name}: ${style || 'driver default'}`)} />
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <label className="text-[10px] text-slate-500 block mb-1">Battery Packs</label>
-                        <select
-                          value={v.battery_packs}
-                          onChange={(e) => updateVehicle(v.id, 'battery_packs', parseInt(e.target.value))}
-                          className="w-full px-2 py-1 bg-slate-700 border border-slate-600 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
-                        >
-                          {[3,4,5,6,7,8,9].map(p => (
-                            <option key={p} value={p}>{p} packs · {p*20} kWh</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] text-slate-500 block mb-1">Weight (lbs)</label>
-                        <input
-                          type="number" min="10000" max="19500" step="100"
-                          value={v.weight_lbs}
-                          onChange={(e) => updateVehicle(v.id, 'weight_lbs', parseInt(e.target.value) || 13000)}
-                          className="w-full px-2 py-1 bg-slate-700 border border-slate-600 rounded text-xs text-white text-center focus:ring-1 focus:ring-[#C8002F] focus:border-transparent"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
+            {planSetup}
 
             <div className="border-t border-slate-800" />
 
@@ -1119,75 +1257,7 @@ function RouteOptimizer() {
 
             <div className="border-t border-slate-800" />
 
-            {/* Delivery Stops */}
-            <section className={`rounded-lg transition-shadow duration-500 ${flash.stops ? 'ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-500/10 p-2 -m-2' : ''}`}>
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Delivery Stops</h3>
-                <div className="flex items-center gap-3">
-                  <button
-                    disabled={SAVED_DEMO}
-                    onClick={() => loadDemoAddresses('/demo_stops_traffic_area.txt')}
-                    title="Stops inside the traffic data area (Cerritos – Stanton)"
-                    className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
-                  >
-                    <Download className="w-3 h-3" /> Demo 0
-                  </button>
-                  <button
-                    onClick={() => loadDemoAddresses('/demo_stops.txt')}
-                    title="Anaheim depot with stops across LA / Orange County"
-                    className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
-                  >
-                    <Download className="w-3 h-3" /> Demo 1
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-1.5">
-                {addresses.map((address, index) => (
-                  <div key={index} className="flex gap-1">
-                    <div className="flex-1 relative">
-                      <input
-                        type="text"
-                        value={address}
-                        onChange={(e) => updateAddress(index, e.target.value)}
-                        placeholder={`Stop ${index + 1}`}
-                        className={`w-full px-3 py-2 pr-7 text-sm bg-slate-800 border ${
-                          isAddressValidated(index) && validatedLocations.length > 0
-                            ? 'border-green-500/60 bg-green-500/5'
-                            : 'border-slate-700'
-                        } rounded-lg text-white placeholder-slate-600 focus:ring-1 focus:ring-[#C8002F] focus:border-transparent transition-colors`}
-                      />
-                      {isAddressValidated(index) && validatedLocations.length > 0 && (
-                        <CheckCircle className="w-3 h-3 text-green-400 absolute right-2.5 top-1/2 -translate-y-1/2" />
-                      )}
-                    </div>
-                    <button
-                      onClick={() => togglePriority(address)}
-                      disabled={!address.trim()}
-                      title={priorityStops.includes(address.trim()) ? 'Priority stop — served first on its truck' : 'Mark as priority'}
-                      className={`px-1 transition-colors ${priorityStops.includes(address.trim()) ? 'text-amber-400' : 'text-slate-700 hover:text-amber-400'} disabled:opacity-30`}
-                    >
-                      <Star className="w-3.5 h-3.5" fill={priorityStops.includes(address.trim()) ? 'currentColor' : 'none'} />
-                    </button>
-                    {addresses.length > 2 && (
-                      <button
-                        onClick={() => removeAddress(index)}
-                        className="px-1.5 text-slate-700 hover:text-red-400 transition-colors rounded"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-
-              <button
-                onClick={addAddress}
-                className="w-full mt-2 py-1.5 border border-dashed border-slate-700 hover:border-slate-500 text-slate-600 hover:text-slate-400 rounded-lg transition-colors flex items-center justify-center gap-1 text-xs"
-              >
-                <Plus className="w-3.5 h-3.5" /> Add Stop
-              </button>
-            </section>
+            {planStops}
           </div>
 
           {/* Sidebar footer — action buttons */}
@@ -1212,16 +1282,7 @@ function RouteOptimizer() {
               </div>
             )}
 
-            <button
-              onClick={validateAddresses}
-              disabled={validating || addresses.filter(a => a.trim()).length < 2 || !depot.trim()}
-              className="w-full py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-sm font-medium rounded-lg border border-slate-700 hover:border-slate-600 transition-all flex items-center justify-center gap-2"
-            >
-              {validating
-                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Validating...</>
-                : <><CheckCircle className="w-3.5 h-3.5" /> Validate Addresses</>
-              }
-            </button>
+            {validateButton}
 
             <button
               onClick={optimizeRoute}
@@ -1631,189 +1692,11 @@ function RouteOptimizer() {
                 </div>
               </div>
 
-              {/* Incident replanning — on the fleet's routes when there is one, else Held-Karp's */}
-              {hk.legs.length > 0 && (() => {
-                const n = hk.ordered_locations.length;
-                const legs = incidentLegs(results);
-                const stopLabel = (i) => (i === 0 || i === n ? 'Depot' : `Stop ${i}`);
-                const stopName = (idx) => (idx === 0 ? 'Depot' : `Stop ${idx}`);
-                const legLabel = (i) => (fleet
-                  ? `V${legs[i].vehicle_id} · ${stopName(legs[i].from_idx)} → ${stopName(legs[i].to_idx)}`
-                  : `${stopLabel(i)} → ${stopLabel(i + 1)}`);
-                const diffClass = (d) => (d > 0 ? 'text-red-400' : 'text-green-400');
-                const sign = (d) => (d > 0 ? '+' : '−');
-                // After replanning = planned total + change on the rerouted legs
-                const change = (field, legsOf = activeLegs) => legsOf.reduce((sum, leg) => sum + leg.rerouted[field] - leg.original[field], 0);
-                const visitOrder = fleet
-                  ? fleet.routes.map(r => `V${r.vehicle_id}: ${r.order.map(i => (i === 0 ? 'D' : i)).join(' → ')}`).join('  ·  ')
-                  : [...Array(n).keys(), ...(hk.return_to_start ? [n] : [])]
-                    .map(i => (i === 0 || i === n ? 'D' : i)).join(' → ');
-                // Fleet time is the makespan: the last vehicle back, each delayed by its own reroutes
-                const planned = fleet
-                  ? { distance: fleet.total_distance_m, time: fleet.makespan_s, energy: fleet.total_energy_kwh, scope: 'all vehicles', timeScope: 'makespan' }
-                  : { distance: hk.total_distance_m, time: hk.total_time_s, energy: hk.total_energy_kwh, scope: 'whole route', timeScope: 'whole route' };
-                const timeAfter = fleet
-                  ? Math.max(...fleet.routes.map(r => r.total_time_s + change('time_s', activeLegs.filter(l => l.vehicle_id === r.vehicle_id))))
-                  : planned.time + change('time_s');
-                const years = replan && [
-                  Math.min(...replan.accidents.map(a => a.years[0])),
-                  Math.max(...replan.accidents.map(a => a.years[1])),
-                ];
-                return (
-                  <div className="bg-slate-900 border border-red-500/25 rounded-xl p-4">
-                    <div className="flex items-center gap-2">
-                      <TriangleAlert className="w-4 h-4 text-red-400" />
-                      <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Incident Replanning</span>
-                      <span className="text-[10px] text-slate-600">historical crash hotspots · delivery order fixed</span>
-                      <div className="ml-auto flex gap-2">
-                        {/* Drive simulation: needs traffic data (measured leg times) for every route it drives */}
-                        {(fleet ? fleet.routes.length > 0 && fleet.routes.every(r => r.traffic) : hk.traffic) && (drive ? (
-                          <>
-                            <select
-                              value={drive.speed}
-                              onChange={(e) => setDrive({ ...drive, speed: Number(e.target.value) })}
-                              className="px-2 py-1.5 bg-slate-800 border border-slate-700 text-slate-300 rounded-lg text-xs"
-                              title="Simulation speed"
-                            >
-                              {SIM_SPEEDS.map(s => <option key={s} value={s}>{s}× speed</option>)}
-                            </select>
-                            <button
-                              onClick={() => setDrive(null)}
-                              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
-                            >
-                              <Square className="w-3 h-3" /> Stop Drive
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            onClick={() => setDrive({ runId: Date.now(), speed: SIM_SPEEDS[1] })}
-                            title={`Drive ${fleet ? 'every truck\'s route' : 'the route'} on the measured traffic; trucks detour around active accidents and replan every 5 min while driving`}
-                            className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/10 hover:bg-green-500/20 border border-green-500/30 text-green-400 rounded-lg text-xs font-medium transition-colors"
-                          >
-                            <Play className="w-3 h-3" /> Simulate Drive
-                          </button>
-                        ))}
-                        {replan && (
-                          <button
-                            onClick={() => { setReplan(null); setActiveAccidents([]); setDrive(null); }}
-                            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
-                          >
-                            <RotateCcw className="w-3 h-3" /> Reset
-                          </button>
-                        )}
-                        <button
-                          title={SAVED_DEMO ? 'Requires live Google Maps credentials' : undefined}
-                          onClick={findHotspots}
-                          disabled={SAVED_DEMO || replanning || replan !== null}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed border border-red-500/30 text-red-400 rounded-lg text-xs font-medium transition-colors"
-                        >
-                          {replanning
-                            ? <><Loader2 className="w-3 h-3 animate-spin" /> Finding hotspots...</>
-                            : <><TriangleAlert className="w-3 h-3" /> Find Crash Hotspots</>
-                          }
-                        </button>
-                      </div>
-                    </div>
-
-                    {replanError && (
-                      <p className="mt-3 text-xs text-red-400">{replanError}</p>
-                    )}
-
-                    {replan && (
-                      <div className="mt-4 space-y-3">
-                        <p className="text-xs text-slate-400">
-                          {fleet ? "The fleet routes'" : "The route's"} {replan.accidents.length} worst fatal-crash hotspot{replan.accidents.length === 1 ? '' : 's'} ({replan.data_source}, {years[0]}–{years[1]})
-                          {replan.accidents.length < replan.num_requested && (
-                            <span className="text-slate-600"> — only {replan.accidents.length} avoidable hotspot{replan.accidents.length === 1 ? '' : 's'} on this route</span>
-                          )}.
-                          {' '}Switch one on to simulate an accident there.
-                        </p>
-                        <p className="text-xs text-slate-500">
-                          Stop order preserved (trucks are already loaded):{' '}
-                          <span className="text-slate-300 font-mono">{visitOrder}</span>
-                          {' '}— only the roads between affected stops change.
-                        </p>
-
-                        {/* Accident list */}
-                        <div className="space-y-1.5">
-                          {replan.accidents.map(a => (
-                            <div key={a.id} className="flex items-center gap-2.5 text-xs">
-                              <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
-                                <input
-                                  type="checkbox"
-                                  checked={activeAccidents.includes(a.id)}
-                                  onChange={() => toggleAccident(a.id)}
-                                  disabled={drive !== null}
-                                  title={drive ? 'Stop the drive simulation to change accidents' : undefined}
-                                  className="sr-only peer"
-                                />
-                                <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-500"></div>
-                              </label>
-                              <span className={`flex-shrink-0 w-5 h-5 rounded-full text-white text-[11px] font-bold flex items-center justify-center ${activeAccidents.includes(a.id) ? 'bg-red-500' : 'bg-slate-600'}`}>{a.id}</span>
-                              <span className="text-white font-medium">{a.road || 'Unnamed road'}</span>
-                              <span className="text-slate-500">on {legLabel(a.leg_index)}</span>
-                              <span className="ml-auto text-slate-400">
-                                {a.crash_count} fatal crash{a.crash_count === 1 ? '' : 'es'} within 1 km
-                                <span className="text-slate-600"> ({a.years[0] === a.years[1] ? a.years[0] : `${a.years[0]}–${a.years[1]}`})</span>
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-
-                        {/* Rerouted legs */}
-                        <div className="space-y-1 border-t border-slate-800 pt-3">
-                          {activeLegs.length === 0 && (
-                            <p className="text-xs text-slate-600">No active accidents — route unchanged.</p>
-                          )}
-                          {activeLegs.map(leg => {
-                            const d = leg.rerouted.time_s - leg.original.time_s;
-                            return (
-                              <div key={leg.leg_index} className="flex items-center gap-2 text-xs">
-                                <span className="text-slate-300">{legLabel(leg.leg_index)}</span>
-                                <span className="text-slate-600">avoids #{leg.accident_ids.join(', #')} via {leg.method === 'alternative' ? 'Google alternative route' : 'forced detour'}</span>
-                                <span className={`ml-auto font-semibold ${diffClass(d)}`}>{sign(d)}{Math.round(Math.abs(d) / 60)} min</span>
-                              </div>
-                            );
-                          })}
-                        </div>
-
-                        {/* Whole-route (or whole-fleet) before/after */}
-                        {activeLegs.length > 0 && <div className="grid grid-cols-3 gap-3">
-                          {[
-                            ['Distance', planned.scope, MapPin, planned.distance, planned.distance + change('distance_m'), formatDistance,
-                              (d) => `${sign(d)}${formatDistance(Math.abs(d))}`],
-                            // Round (not floor like formatTime) so before/after match the diff
-                            ['Time', planned.timeScope, Clock, planned.time, timeAfter,
-                              (s) => { const m = Math.round(s / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m} min`; },
-                              (d) => `${sign(d)}${Math.round(Math.abs(d) / 60)} min`],
-                            ['Energy', planned.scope, Zap, planned.energy, planned.energy + change('energy_kwh'), (e) => `${e.toFixed(1)} kWh`,
-                              (d) => `${sign(d)}${Math.abs(d).toFixed(1)} kWh`],
-                          ].filter(([, , , before]) => before != null).map(([label, scope, Icon, before, after, fmt, fmtDiff]) => (
-                            <div key={label} className="bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2.5">
-                              <p className="text-[10px] text-slate-500 flex items-center gap-1.5 mb-1"><Icon className="w-3 h-3" />{label} · {scope}</p>
-                              <p className="text-sm text-white font-semibold">
-                                <span className="text-slate-500 line-through font-normal">{fmt(before)}</span> → {fmt(after)}
-                              </p>
-                              <p className={`text-[11px] font-semibold mt-0.5 ${diffClass(after - before)}`}>{fmtDiff(after - before)}</p>
-                            </div>
-                          ))}
-                        </div>}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-
               {/* Map */}
               {SAVED_DEMO ? <SchematicRouteMap results={results} locations={lastLocations} /> : <RouteMap
                 results={results}
                 locations={lastLocations}
-                replan={replan}
-                activeAccidents={activeAccidents}
-                activeLegs={activeLegs}
                 chargingPlans={chargingPlans ? Object.values(chargingPlans) : []}
-                drive={drive}
-                replanContext={driveReplanContext}
               />}
 
               {/* Charts */}

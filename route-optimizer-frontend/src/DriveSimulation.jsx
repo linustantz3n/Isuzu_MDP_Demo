@@ -16,6 +16,10 @@ import { API_BASE } from './api';
 //     are re-sequenced in the background (/api/replan_tick). A truck is locked to the
 //     stop it is driving to; the result is applied only if it arrives before the truck
 //     leaves that stop, otherwise it is logged as too late.
+//   • Battery drain (what-if): every leg uses the energy model's kWh times a drain
+//     factor, which can jump after a truck's Nth delivery. Each replan sends the
+//     drained energy used so far and the drain seen so far, so /api/replan_tick checks
+//     the rest of the route against the battery at that drain (reorder, else drop stops).
 // The whole simulation pauses only for big events: a crash with no way around, or a
 // replan that finds stops no longer fit a truck's battery.
 
@@ -27,6 +31,7 @@ export const AUTO_DETOUR_MAX_S = 600;       // take detours up to 10 min longer 
 const JOIN_M = 60;                          // a truck this close to a precomputed detour can join it
 const ACCIDENT_ON_PATH_M = 80;              // an accident this close to a replanned leg lies on it
 const TOAST_MS = 7000;                      // real milliseconds a notification stays up
+export const DEFAULT_RESERVE_PCT = 20;      // reserve the battery is checked against when the plan sets none
 const LOG_SHOWN = 6;
 // Truck seen from above, pointing north (cab ahead of the box); rotated to its heading
 const TRUCK_PATH = 'M -4,-2 L 4,-2 L 4,10 L -4,10 Z M -3.5,-9 L 3.5,-9 L 3.5,-3.5 L -3.5,-3.5 Z';
@@ -96,6 +101,48 @@ const fmtCountdown = (s) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 };
 
+// ---- Battery drain -----------------------------------------------------------
+// drain: {factor, event: {after_stop, factor} | null}; actual energy = model energy × factor
+export const NO_DRAIN = { factor: 1, event: null };
+export const drainActive = (drain) => !!drain && (drain.factor !== 1 || !!drain.event);
+
+// Drain factor on the leg after `deliveries` stops have been made (benchmark/simulate.py _drain_at).
+// A truck's leg k always starts after k deliveries: dropped stops leave its order.
+export const drainAt = (drain, deliveries) => {
+  const d = drain || NO_DRAIN;
+  return d.event && deliveries >= d.event.after_stop ? d.event.factor : d.factor;
+};
+
+// Actual (drained) kWh of legs 0..lastLeg
+export const drainedKwh = (legs, lastLeg, drain) => legs.slice(0, lastLeg + 1)
+  .reduce((sum, l, j) => sum + (l.energyKwh || 0) * drainAt(drain, j), 0);
+
+// Drain seen once legs 0..lastLeg are driven: the worst of the running average and the
+// last leg, so a sudden change counts at once (benchmark/simulate.py _check). 1 before any leg.
+export const drainEstimate = (legs, lastLeg, drain) => {
+  const done = legs.slice(0, lastLeg + 1);
+  const planned = done.reduce((sum, l) => sum + (l.energyKwh || 0), 0);
+  if (!(planned > 0)) return 1;
+  const ratio = drainedKwh(legs, lastLeg, drain) / planned;
+  return Math.max(ratio, drainAt(drain, lastLeg));
+};
+
+const socPct = (kwh, capacity) => Math.round(kwh / capacity * 1000) / 10;
+
+// State of charge on arrival at each stop when `legs` are driven at `drain`, with no replanning
+export const socTrace = (legs, batteryKwh, drain) => {
+  let battery = batteryKwh;
+  let ranOutAt = null;
+  const trace = [{ name: 'Depot', soc_pct: 100 }];
+  legs.forEach((l, j) => {
+    battery -= (l.energyKwh || 0) * drainAt(drain, j);
+    if (battery < 0 && ranOutAt === null) ranOutAt = l.toLabel;
+    trace.push({ name: l.toLabel, soc_pct: socPct(battery, batteryKwh) });
+  });
+  const socs = trace.map(p => p.soc_pct);
+  return { soc_trace: trace, final_soc_pct: socs[socs.length - 1], min_soc_pct: Math.min(...socs), ran_out_at: ranOutAt };
+};
+
 // When the next replan runs: the next multiple of the interval after t (seconds
 // since departure), how long until then, and how many replans have already passed.
 export const replanSchedule = (t, intervalS = REPLAN_INTERVAL_S) => {
@@ -106,8 +153,9 @@ export const replanSchedule = (t, intervalS = REPLAN_INTERVAL_S) => {
 
 // What /api/replan_tick needs about one truck at sim time t, or null when there is
 // nothing to re-sequence (done, heading home, or one stop left after its locked one).
-// The truck is locked to the stop it is driving to or unloading at.
-export const tickTruckState = (tr, t, meta) => {
+// The truck is locked to the stop it is driving to or unloading at. Energy used counts
+// the locked leg in full, at the drain on that leg; the drain seen counts finished legs.
+export const tickTruckState = (tr, t, meta, drain = NO_DRAIN) => {
   if (tr.phase === 'done' || !tr.order) return null;
   const k = tr.leg;
   const fromNode = tr.order[k + 1];
@@ -123,8 +171,9 @@ export const tickTruckState = (tr, t, meta) => {
     from_node: fromNode,
     start_s: Math.round(t + leaveIn),
     remaining,
-    used_kwh: tr.legs.slice(0, k + 1).reduce((sum, l) => sum + (l.energyKwh || 0), 0),
+    used_kwh: drainedKwh(tr.legs, k, drain),
     cargo_per_stop_lbs: meta.cargoPerStopLbs || 0,
+    drain_estimate: Math.round(drainEstimate(tr.legs, tr.phase === 'unloading' ? k : k - 1, drain) * 1000) / 1000,
   };
 };
 
@@ -155,9 +204,13 @@ export const placeAccidents = (accidents, legs, fromLeg) => accidents.flatMap(a 
 // Planned time for a truck's day: driving (planned leg times) plus unloading at every stop
 const plannedTotalS = (truck) => truck.legs.reduce((s, l) => s + l.plannedS, 0) + truck.unloadS * (truck.legs.length - 1);
 
+// What the battery report shows for one replan result (the decision rows of the drain what-if)
+const replanAction = (r) => (r.alert === 'battery' ? 'return_to_depot'
+  : r.changed && r.dropped?.length ? 'drop' : r.changed ? 'reorder' : 'continue');
+
 /**
  * trucks: [{id, label, color, unloadS, order (node indices, ending at the depot), vehicleIndex,
- *           cargoPerStopLbs,
+ *           cargoPerStopLbs, batteryKwh,
  *           legs: [{path: [{lat, lng}], durationS (measured), plannedS, energyKwh, toLabel, to: {lat, lng},
  *                   reroute: precomputed detour for its active accidents or null}],
  *           accidents: active accidents on this truck's route [{id, lat, lng, leg_index (on this truck), road}]}]
@@ -165,8 +218,11 @@ const plannedTotalS = (truck) => truck.legs.reduce((s, l) => s + l.plannedS, 0) 
  * departureTime: 'YYYY-MM-DDTHH:MM' (local time of the traffic data)
  * overlay: DOM node over the map for the clock, notifications and prompts
  * replanContext: {request, inputs, locations} of the plan, for rolling replans; null turns them off
+ * drain: battery drain what-if ({factor, event}), fixed for the run
+ * onReport: called with the battery report ({reserve, trucks: [...]}) whenever it changes
  */
-export default function DriveSimulation({ trucks, departureTime, speed, overlay, onEnd, replanContext = null }) {
+export default function DriveSimulation({ trucks, departureTime, speed, overlay, onEnd, replanContext = null,
+                                          drain = NO_DRAIN, onReport = null }) {
   const sim = useRef(null);
   const [view, setView] = useState(null);       // what the map and overlay show
   const [prompt, setPrompt] = useState(null);   // a truck waiting for the operator: {truck, accident, option}
@@ -181,6 +237,10 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
   ctxRef.current = replanContext;
   const onEndRef = useRef(onEnd);
   onEndRef.current = onEnd;
+  const onReportRef = useRef(onReport);
+  onReportRef.current = onReport;
+  const drainRef = useRef(drain);
+  drainRef.current = drain;
   const handlers = useRef({});
   const seq = useRef(0);
 
@@ -190,6 +250,11 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
   const plannedEndS = Math.max(...plannedS);
   const replanOn = !!replanContext && trucks.every(t => t.order);
   const allAccidents = [...new Map(trucks.flatMap(t => t.accidents).map(a => [a.id, a])).values()];
+  // Reserve the battery is checked against: the plan's goal; with a drain what-if and no
+  // goal, the app's default reserve, so extra drain can trigger a replan.
+  const goalReserve = replanContext?.request?.goals?.battery_reserve_pct;
+  const reservePct = goalReserve ?? DEFAULT_RESERVE_PCT;
+  const sendReserve = goalReserve ?? (drainActive(drain) ? DEFAULT_RESERVE_PCT : null);
 
   const addLog = (entry) => setLog(l => [...l, entry]);
   const toast = (text, tone = 'info', undo = null, canUndo = null) => {
@@ -207,7 +272,12 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
         index, phase: 'driving', unloadLeft: 0, finishT: null, hold: null,
         legs: [...truck.legs], order: truck.order ? [...truck.order] : null,
         accidents: [...truck.accidents], handled: new Set(),
+        // Battery drain report: state of charge on arrival at each stop, decisions, dropped stops
+        battery: truck.batteryKwh, trace: [{ name: 'Depot', soc_pct: 100 }], served: 0, events: [], dropped: [],
+        planned: truck.batteryKwh ? socTrace(truck.legs, truck.batteryKwh, NO_DRAIN) : null,
+        blind: truck.batteryKwh ? socTrace(truck.legs, truck.batteryKwh, drainRef.current) : null,
       })),
+      reportDirty: true,
       replan: { nextS: REPLAN_INTERVAL_S, inFlight: null, runs: 0, changes: 0, skipped: 0, last: null },
       queue: [],     // trucks waiting for an operator prompt while another one is open
       promptOpen: false,
@@ -234,6 +304,7 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
         }
         if (tr.along >= tr.line.length) {
           tr.along = tr.line.length;
+          arrive(tr);
           if (tr.leg === tr.legs.length - 1) {
             tr.phase = 'done';
             tr.finishT = s.t;
@@ -251,6 +322,17 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
         }
       }
       return null;
+    };
+
+    // A leg is finished: take its drained energy off the battery
+    const arrive = (tr) => {
+      const leg = tr.legs[tr.leg];
+      if (tr.battery != null) {
+        tr.battery -= (leg.energyKwh || 0) * drainAt(drainRef.current, tr.leg);
+        tr.trace.push({ name: leg.toLabel, soc_pct: socPct(tr.battery, trucks[tr.index].batteryKwh) });
+      }
+      if (tr.leg < tr.legs.length - 1) tr.served += 1;
+      s.reportDirty = true;
     };
 
     let last = performance.now();
@@ -277,6 +359,10 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
           s.phase = 'done';
           onEndRef.current && onEndRef.current();
         }
+      }
+      if (s.reportDirty) {
+        s.reportDirty = false;
+        handlers.current.report(s);
       }
       setView({
         phase: s.phase, t: s.t,
@@ -433,7 +519,7 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
     s.replan.runs += 1;
     const tickT = s.t;
     const states = s.trucks
-      .map(tr => tickTruckState(tr, tickT, trucks[tr.index]))
+      .map(tr => tickTruckState(tr, tickT, trucks[tr.index], drainRef.current))
       .filter(Boolean);
     if (!states.length) {
       s.replan.last = { t: tickT, text: 'nothing left to re-sequence' };
@@ -447,7 +533,8 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         locations: ctx.locations, vehicles: req.vehicles, energy_params: req.energy_params,
-        goals: req.goals, priority_stops: req.priority_stops, elevations: ctx.inputs.elevations,
+        goals: { ...req.goals, battery_reserve_pct: sendReserve },
+        priority_stops: req.priority_stops, elevations: ctx.inputs.elevations,
         departure_time: departureTime, now_s: tickT, trucks: states,
         expected_energy_model: req.expected_energy_model,
       }),
@@ -470,9 +557,10 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
     const alerts = data.trucks.filter(r => r.alert);
     let changed = 0, late = 0;
     for (const r of data.trucks) {
-      if (r.alert || !r.changed) continue;
       const tr = s.trucks.find(x => trucks[x.index].vehicleIndex === r.vehicle_index);
       if (!tr) continue;
+      logDecision(s, tr, r, tickT);
+      if (r.alert || !r.changed) continue;
       if (swapIn(s, tr, r, tickT, true)) changed += 1;
       else late += 1;
     }
@@ -494,10 +582,12 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
       addLog({ t: s.t, who, text: `replan from ${fmtClock(departureMs + tickT * 1000)} arrived after its next stop; kept its plan` });
       return false;
     }
-    const prev = { legs: tr.legs, order: tr.order, accidents: tr.accidents, leg: tr.leg };
+    const prev = { legs: tr.legs, order: tr.order, accidents: tr.accidents, leg: tr.leg, dropped: tr.dropped };
     const k = tr.leg;
     tr.legs = next.legs;
     tr.order = next.order;
+    if (r.dropped?.length) tr.dropped = [...tr.dropped, ...r.dropped];
+    s.reportDirty = true;
     // Accidents on legs already driven keep their place; every other active accident
     // (any truck's) is placed on whichever new leg passes it.
     const keep = prev.accidents.filter(a => a.leg_index <= k);
@@ -516,11 +606,48 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
         tr.legs = prev.legs;
         tr.order = prev.order;
         tr.accidents = prev.accidents;
+        tr.dropped = prev.dropped;
+        s.reportDirty = true;
         setReplanned(m => { const c = { ...m }; delete c[tr.index]; return c; });
         addLog({ t: s.t, who, text: 'replan undone, back to the previous order' });
       }, canUndo);
     }
     return true;
+  };
+
+  // ---- Battery report -------------------------------------------------------------
+  // One decision row per truck per replan: drain seen, what the rest needs, the battery above the reserve
+  const logDecision = (s, tr, r, tickT) => {
+    if (tr.battery == null) return;
+    tr.events.push({
+      t: tickT, name: tr.legs[r.locked_leg]?.toLabel ?? '', soc_pct: socPct(tr.battery, trucks[tr.index].batteryKwh),
+      drain_estimate: r.drain_estimate, predicted_need_kwh: r.need_kwh, budget_kwh: r.budget_kwh,
+      action: replanAction(r), dropped: r.dropped || [],
+      remaining_after: r.alert === 'battery' ? [] : r.order.slice(1, -1),
+    });
+    s.reportDirty = true;
+  };
+
+  const report = (s) => {
+    if (!onReportRef.current || !trucks.every(t => t.batteryKwh)) return;
+    onReportRef.current({
+      reserve: reservePct,
+      drain: drainRef.current,
+      done: s.phase === 'done',
+      trucks: s.trucks.map(tr => {
+        const truck = trucks[tr.index];
+        const socs = tr.trace.map(p => p.soc_pct);
+        return {
+          label: truck.label, color: truck.color, batteryKwh: truck.batteryKwh,
+          planned_stops: truck.legs.length - 1, served: tr.served, dropped: tr.dropped,
+          done: tr.phase === 'done', replans: tr.events.filter(e => e.action !== 'continue').length,
+          soc_trace: [...tr.trace], final_soc_pct: socs[socs.length - 1], min_soc_pct: Math.min(...socs),
+          below_reserve: Math.min(...socs) < reservePct, events: [...tr.events],
+          planned: tr.planned,
+          blind: tr.blind && { ...tr.blind, below_reserve: tr.blind.min_soc_pct < reservePct },
+        };
+      }),
+    });
   };
 
   // A big event: resume, optionally applying what the replan found
@@ -541,7 +668,7 @@ export default function DriveSimulation({ trucks, departureTime, speed, overlay,
     s.phase = 'running';
   };
 
-  handlers.current = { startLeg, onCrashAhead, fireReplan, replanOn: () => replanOn };
+  handlers.current = { startLeg, onCrashAhead, fireReplan, report, replanOn: () => replanOn };
 
   if (!view) return null;
   const nowMs = departureMs + view.t * 1000;

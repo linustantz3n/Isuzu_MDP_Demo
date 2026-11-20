@@ -57,9 +57,10 @@ previously served stops or lower the reserve. See [driver workflow](docs/chat-as
 | The chat assistant and driver memory | [docs/chat-assistant.md](docs/chat-assistant.md) |
 | **Optimization goals (weights), battery reserve, priority stops, breakdown re-planning, truck limits** | [docs/planning.md](docs/planning.md) · code: [`objective_matrix()`](route_optimizer_backend.py#L907), [`solve_fleet()`](route_optimizer_backend.py#L1175), [`replan_breakdown()`](route_optimizer_backend.py#L1298) |
 | The before / after comparison | [`PlanComparison.jsx`](route-optimizer-frontend/src/PlanComparison.jsx), [`planDiff.js`](route-optimizer-frontend/src/planDiff.js) |
-| The algorithm benchmark and battery-drain simulation | [docs/solvers.md#benchmark](docs/solvers.md#benchmark), [benchmark/README.md](benchmark/README.md) · code: [`benchmark/`](benchmark/) |
+| The algorithm benchmark | [docs/solvers.md#benchmark](docs/solvers.md#benchmark), [benchmark/README.md](benchmark/README.md) · code: [`benchmark/`](benchmark/) |
 | Traffic data package (measured / forecast speeds) | [Traffic data](#traffic-data-optional) below · code: [`traffic_data.py`](traffic_data.py) |
-| Accident replanning at crash hotspots, charging stops | [Incident replanning](#incident-replanning-demo) below · code: `replan_route_around_hotspots()`, `plan_charging_stop()` |
+| **The Simulation tab**: drive simulation, crash hotspots, battery-drain what-if | [Incident replanning](#incident-replanning-demo) below · code: [`SimulationPanel.jsx`](route-optimizer-frontend/src/SimulationPanel.jsx), [`DriveSimulation.jsx`](route-optimizer-frontend/src/DriveSimulation.jsx), `replan_tick()`, `replan_route_around_hotspots()` |
+| Charging stops | [Incident replanning](#incident-replanning-demo) below · code: `plan_charging_stop()` |
 | The web UI | [`route-optimizer-frontend/src/RouteOptimizer.jsx`](route-optimizer-frontend/src/RouteOptimizer.jsx) |
 
 ## How a request flows
@@ -84,9 +85,12 @@ RouteOptimizer.jsx
 AIChatbot.jsx ───────── /api/chat ─────────────► lexicon → GPT-4o-mini → validation → one change, goals,
      │                                            truck limits, or a breakdown action
      └─ after the turn: re-solve (/api/optimize) or ── /api/replan ──► replan_breakdown()
+  Find Charging Stops ─ /api/plan_charging ────► plan_charging_stop()            Places API (New)
+SimulationPanel.jsx (Simulation tab: same stops and fleet inputs, solved on measured traffic)
+  Optimize on Measured Traffic ── /api/optimize (traffic_source: ground_truth) ─► optimize_route()
   Find Crash Hotspots ─ /api/replan_incidents ─► replan_route_around_hotspots()   Routes API alternatives
   Drive simulation ──── /api/reroute_from ─────► reroute_from_position()
-  Find Charging Stops ─ /api/plan_charging ────► plan_charging_stop()            Places API (New)
+                    └── /api/replan_tick ──────► replan_tick()   rolling replan, drain-aware battery check
 BenchmarkPanel.jsx ──── /api/benchmark/* ──────► benchmark/ (saved scenarios, no Google calls)
 ```
 
@@ -220,7 +224,7 @@ LLM key; other natural-language requests need a configured LLM endpoint.
 | Measured / forecast traffic replays of four past days (traffic data package, Cerritos–Stanton only) | |
 | Accidents at historical crash hotspots: the road between two stops is rerouted, stop order kept | |
 | One charging stop for a fleet truck that would end below its battery reserve | |
-| Battery-drain simulation with re-planning at every stop (benchmark) | |
+| Battery-drain what-if in the drive simulation: extra drain, re-planning every 5 sim minutes | |
 
 ## Traffic data (optional)
 
@@ -229,7 +233,7 @@ LLM key; other natural-language requests need a configured LLM endpoint.
 - **Setup:** unzip the package to `poc_route_planning_v1/` in the repo root (or set `POC_TRAFFIC_DIR`). The data is licensed for this project only and is git-ignored, so never commit it.
 - **Request:** add `"traffic_source": "forecast" | "historical" | "ground_truth"` and `"departure_time": "2025-11-12T07:30"` (days: 2025-11-12, 11-18, 11-22, 11-23). `historical` uses the ground truth of a comparable other day (Wed↔Tue, Sat↔Sun) at the same times. A traffic data source overrides the Google `traffic` departure setting.
 - **Plan vs reality:** the Held-Karp result gets `traffic.actual_travel_time_s`, which is the planned route driven on the measured speeds with the clock running (unload time at each stop).
-- **Dashboard:** choose the source under *Travel Times* and load the *Demo 0* stops (all stops must be inside the area). Raise the *Time* goal so traffic can change the stop order.
+- **Dashboard:** on the Solver tab, choose forecast or historical under *Travel Times*; measured traffic (`ground_truth`) is chosen on the Simulation tab instead. Load the *Demo 0* stops (all stops must be inside the area). Raise the *Time* goal so traffic can change the stop order.
 - **Simplifications:** every pair in the matrix is timed as if it started at the departure time; freeway speeds are capped at 88 km/h (the data has car speeds); stops snap to the nearest non-freeway road, so the short stretch from the address to that road is not counted.
 
 ## Incident replanning (demo)
@@ -238,7 +242,9 @@ Routes are planned ahead and trucks are loaded for that plan. On the day, the pl
 
 Accidents are placed where fatal crashes actually happened along the route, using NHTSA FARS data (2019–2023, all US fatal crashes, public domain) in `data/crash_history.csv.gz`. Crashes within 150 m of each leg's road are grouped into 1 km stretches; the stretches with the most crashes become the accidents (default 3, spread over different legs, none next to a stop). To refresh the data, download newer `FARS<YEAR>NationalCSV.zip` files and run `python scripts/build_crash_history.py FARS*.zip`.
 
-`/api/replan_incidents` takes the planned legs (Held-Karp order, or with several vehicles every OR-Tools route's legs tagged with `vehicle_id`) and only replaces the road between the two stops an accident sits on (stop i → stop i+1), via a Google alternative route or a forced detour. With a fleet, hotspots are spread over the vehicles first. Stops are never added, removed or reordered. `/api/reroute_from` reroutes a truck that is already driving, for the **drive simulation**: with traffic data, **Simulate Drive** animates the Held-Karp route, or with a fleet every truck at once on one shared clock, each leg taking its measured time. When a truck nears an active accident the whole simulation pauses and asks whether that truck should reroute; the panel shows each truck's status and when it gets back versus plan. `tests/test_replanning.py` checks this offline.
+`/api/replan_incidents` takes the planned legs (Held-Karp order, or with several vehicles every OR-Tools route's legs tagged with `vehicle_id`) and only replaces the road between the two stops an accident sits on (stop i → stop i+1), via a Google alternative route or a forced detour. With a fleet, hotspots are spread over the vehicles first. Stops are never added, removed or reordered. `/api/reroute_from` reroutes a truck that is already driving, for the **drive simulation** on the **Simulation** tab: with traffic data, **Simulate Drive** animates the Held-Karp route, or with a fleet every truck at once on one shared clock, each leg taking its measured time. When a truck nears an active accident the whole simulation pauses and asks whether that truck should reroute; the panel shows each truck's status and when it gets back versus plan. `tests/test_replanning.py` checks this offline.
+
+**Simulation tab.** The Solver tab only plans, with Google traffic or the traffic data package's forecast or historical speeds. Measured traffic (hindsight) is used only on the **Simulation** tab, where everything happens without switching tabs. Its sidebar shows the same stops, fleet, goals and conditions as the Solver tab: they share state, so an edit on either tab shows on both. Pick a day and departure, then **Optimize on Measured Traffic** to solve on the measured speeds. The result is the Simulation tab's own plan; the Solver tab's plan is unaffected. Then use: **Find Crash Hotspots** and the accident switches, **Simulate Drive**, the rolling replan every 5 simulated minutes, and the **battery-drain what-if**. Each leg uses the City NN energy times a drain factor (optionally a different factor after the Nth delivery). Each rolling replan sends `/api/replan_tick` the drained energy used so far and the drain seen so far (the worst of the running average and the last leg). `replan_tick()` scales its upper-bound energy by that drain, so the truck reorders, or drops the fewest stops, to stay above its reserve. With a drain set and no reserve goal, the 20% default reserve is used. The panel charts each truck's battery as planned, as driven with replanning, and without replanning, and lists the decision at every replan. The same what-if on saved benchmark scenarios is still available offline: `python -m benchmark.simulate` or `/api/benchmark/simulate`.
 
 **Charging stops.** A fleet truck that would end below its battery reserve (the reserve goal, or 20% when none is set) is flagged, and **Find Charging Stops** calls `/api/plan_charging`: it locates where the battery would hit the reserve (energy spread evenly over each leg), searches DC fast chargers (CCS1, 50 kW+) along the legs up to that point with Google Places Text Search, and inserts the charger that adds the least time (detour + charging) into its leg. The truck charges just enough to finish with the reserve; stops are not reordered. Charging time assumes the truck accepts at most 50 kW (`VEHICLE_MAX_CHARGE_KW`, to be confirmed against the Isuzu spec) and a flat charging curve. Routes that need more than one stop are reported, not planned. `tests/test_charging.py` checks the rules offline.
 

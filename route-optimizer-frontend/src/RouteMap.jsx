@@ -70,7 +70,8 @@ export function stopSequence(results) {
 //   the fleet's trucks when there is a fleet, otherwise the Held-Karp route.
 // replanContext: {request, inputs, locations} of the plan on screen, for the drive
 //   simulation's rolling replan (/api/replan_tick); null turns rolling replans off.
-export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd, replanContext = null }) {
+// drive.drain: the battery drain what-if for that run; onDriveReport gets its battery report.
+export default function RouteMap({ results, locations, replan, activeAccidents = [], activeLegs = [], chargingPlans = [], drive = null, onDriveEnd, onDriveReport, replanContext = null }) {
   const { isLoaded, loadError } = useJsApiLoader({
     googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_API_KEY,
   });
@@ -142,6 +143,7 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
           order: nodesOf(route, legs),
           vehicleIndex: route.vehicle_index ?? idx,
           cargoPerStopLbs: route.vehicle_config?.weight_per_stop_lbs || 0,
+          batteryKwh: route.battery_capacity_kwh,
         });
         offset += route.legs.length;
       }
@@ -153,7 +155,8 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
     return [{ id: 'hk', label: 'The truck', color: SINGLE_COLOR, legs,
               accidents: accidentsOn(0, legs.length), unloadS: unloadOf(hk, hk.ordered_locations.length - 1),
               order: nodesOf(hk, legs), vehicleIndex: 0,
-              cargoPerStopLbs: hk.weight_params?.weight_per_stop_lbs || 0 }];
+              cargoPerStopLbs: hk.weight_params?.weight_per_stop_lbs || 0,
+              batteryKwh: hk.battery_capacity_kwh }];
   }, [results, routeDirections, activeLegs, replan, activeAccidents]);
   const driveDeparture = results?.ortools_fleet?.routes?.[0]?.traffic?.departure_time
     || results?.optimal?.traffic?.departure_time;
@@ -545,6 +548,8 @@ export default function RouteMap({ results, locations, replan, activeAccidents =
               overlay={overlay}
               onEnd={onDriveEnd}
               replanContext={replanContext}
+              drain={drive.drain}
+              onReport={onDriveReport}
             />
           )}
 

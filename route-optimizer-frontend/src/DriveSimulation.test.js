@@ -1,4 +1,7 @@
-import { replanSchedule, REPLAN_INTERVAL_S, tickTruckState, spliceReplan, placeAccidents } from './DriveSimulation';
+import {
+  replanSchedule, REPLAN_INTERVAL_S, tickTruckState, spliceReplan, placeAccidents,
+  drainAt, drainActive, drainedKwh, drainEstimate, socTrace, NO_DRAIN,
+} from './DriveSimulation';
 
 jest.mock('@react-google-maps/api', () => ({ MarkerF: () => null, PolylineF: () => null }));
 
@@ -25,11 +28,45 @@ const meta = { vehicleIndex: 1, unloadS: 600, cargoPerStopLbs: 900 };
 test('a tick locks the stop the truck is driving to and sends what is left', () => {
   expect(tickTruckState(truck(), 1000, meta)).toEqual({
     vehicle_index: 1, locked_leg: 0, from_node: 3, start_s: 1000 + 60 + 600,
-    remaining: [1, 4, 2], used_kwh: 1, cargo_per_stop_lbs: 900,
+    remaining: [1, 4, 2], used_kwh: 1, cargo_per_stop_lbs: 900, drain_estimate: 1,
   });
   // Unloading at stop 1 (end of leg 1): it leaves when the unloading is done
   const unloading = tickTruckState(truck({ phase: 'unloading', leg: 1, unloadLeft: 120 }), 2000, meta);
   expect(unloading).toMatchObject({ locked_leg: 1, from_node: 1, start_s: 2120, remaining: [4, 2], used_kwh: 3 });
+});
+
+const drain = { factor: 1.5, event: { after_stop: 2, factor: 2 } };
+
+test('drain factor jumps after the Nth delivery', () => {
+  expect(drainAt(NO_DRAIN, 5)).toBe(1);
+  expect(drainAt(undefined, 0)).toBe(1);
+  expect([0, 1, 2, 3].map(k => drainAt(drain, k))).toEqual([1.5, 1.5, 2, 2]);
+  expect(drainActive(NO_DRAIN)).toBe(false);
+  expect(drainActive({ factor: 1, event: { after_stop: 1, factor: 1.2 } })).toBe(true);
+  expect(drainActive({ factor: 1.3, event: null })).toBe(true);
+});
+
+test('a tick sends drained energy and the drain seen on finished legs', () => {
+  const legs = truck().legs;                                          // 1, 2, 3, 4, 5 kWh
+  expect(drainedKwh(legs, 2, drain)).toBeCloseTo(1 * 1.5 + 2 * 1.5 + 3 * 2);
+  expect(drainEstimate(legs, -1, drain)).toBe(1);                     // nothing driven yet
+  expect(drainEstimate(legs, 1, drain)).toBeCloseTo(1.5);
+  expect(drainEstimate(legs, 2, drain)).toBe(2);                      // the last leg's jump counts at once
+  // Driving leg 2 (to stop 4): its energy is counted in full, the drain seen covers legs 0-1
+  expect(tickTruckState(truck({ leg: 1 }), 0, meta, drain))
+    .toMatchObject({ used_kwh: 1 * 1.5 + 2 * 1.5, drain_estimate: 1.5 });
+  expect(tickTruckState(truck({ phase: 'unloading', leg: 1, unloadLeft: 60 }), 0, meta, drain))
+    .toMatchObject({ used_kwh: 4.5, drain_estimate: 1.5 });
+});
+
+test('state-of-charge trace drives the legs at the drain with no replanning', () => {
+  const legs = [1, 2, 3].map((e, k) => ({ energyKwh: e * 10, toLabel: k === 2 ? 'Depot' : `S${k + 1}` }));
+  const planned = socTrace(legs, 100, NO_DRAIN);
+  expect(planned.soc_trace.map(p => p.soc_pct)).toEqual([100, 90, 70, 40]);
+  expect(planned).toMatchObject({ final_soc_pct: 40, min_soc_pct: 40, ran_out_at: null });
+  const drained = socTrace(legs, 100, { factor: 2, event: { after_stop: 2, factor: 3 } });
+  expect(drained.soc_trace.map(p => p.soc_pct)).toEqual([100, 80, 40, -50]);
+  expect(drained.ran_out_at).toBe('Depot');
 });
 
 test('nothing to send when only one stop is left after the locked one, or the truck is heading home', () => {
