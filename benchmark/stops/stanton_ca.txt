@@ -1,0 +1,22 @@
+# Case 4 - Stanton, CA (North Orange County / SE Los Angeles County): depot + 19 freight customers (address | lat, lng | demand | name)
+# Same depot as Demo 0. Stops verified with Google Places (New), all OPERATIONAL on 2026-11-22. Spread 4-23 km from the depot; outside the traffic data area.
+11232 Knott Ave, Stanton, CA 90680 | 33.799927, -118.007222 |  | Stanton Depot
+13225 Beach Blvd, Westminster, CA 92683 | 33.768539, -117.993080 |  | Costco Business Center Westminster
+11000 Garden Grove Blvd, Garden Grove, CA 92843 | 33.772799, -117.940644 |  | Costco Wholesale Garden Grove
+440 N Euclid St, Anaheim, CA 92801 | 33.836100, -117.938355 |  | Walmart Supercenter Anaheim
+7250 Carson Blvd, Long Beach, CA 90808 | 33.829064, -118.091068 |  | Walmart Supercenter Long Beach
+11525 South St, Cerritos, CA 90703 | 33.859376, -118.087212 |  | Target Cerritos
+500 Lakewood Ctr Mall, Lakewood, CA 90712 | 33.850270, -118.137474 |  | Costco Wholesale Lakewood
+3400 E South St, Lakewood, CA 90805 | 33.858818, -118.152196 |  | WinCo Foods Lakewood
+12324 Hoxie Ave, Norwalk, CA 90650 | 33.919526, -118.102676 |  | Costco Wholesale Norwalk
+13003 Whittier Blvd, Whittier, CA 90602 | 33.966563, -118.036785 |  | Smart & Final Extra! Whittier
+5871 Firestone Blvd, South Gate, CA 90280 | 33.949651, -118.162463 |  | Sam's Club South Gate
+603 S Placentia Ave, Fullerton, CA 92831 | 33.866389, -117.882500 |  | Sam's Club Fullerton
+1265 N Kraemer Blvd, Anaheim, CA 92806 | 33.856461, -117.860115 |  | Restaurant Depot Anaheim
+1400 S Douglass Rd #100, Anaheim, CA 92806 | 33.811324, -117.877003 |  | Isuzu Commercial Truck of America HQ
+2300 N Tustin St, Orange, CA 92865 | 33.828156, -117.838652 |  | Walmart Orange
+315 E 1st St, Santa Ana, CA 92701 | 33.746699, -117.864739 |  | Food 4 Less Santa Ana
+2700 Park Ave, Tustin, CA 92782 | 33.699911, -117.822905 |  | Costco Wholesale Tustin
+1475 S Coast Dr, Costa Mesa, CA 92626 | 33.690955, -117.916414 |  | IKEA Costa Mesa
+17900 Newhope St, Fountain Valley, CA 92708 | 33.703390, -117.931930 |  | Costco Wholesale Fountain Valley
+7100 Warner Ave, Huntington Beach, CA 92647 | 33.714085, -118.005241 |  | The Home Depot Huntington Beach

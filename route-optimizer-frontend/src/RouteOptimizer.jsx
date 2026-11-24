@@ -1070,6 +1070,13 @@ function RouteOptimizer() {
           >
             <Download className="w-3 h-3" /> Demo 1
           </button>
+          <button
+            onClick={() => loadDemoAddresses('/demo_stops_oc_freight.txt')}
+            title="Stanton depot with 19 freight stops (warehouse clubs, supercenters, home improvement) across North OC / SE LA County; for 5 trucks"
+            className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+          >
+            <Download className="w-3 h-3" /> Demo 2
+          </button>
         </div>
       </div>
 
@@ -1586,8 +1593,8 @@ function RouteOptimizer() {
                       <tr className="border-b border-slate-800 bg-slate-900/50">
                         <th className="text-left px-5 py-3 text-slate-500 font-medium text-xs uppercase tracking-wider w-36">Metric</th>
                         <th className="text-center px-5 py-3">
-                          <span className="text-yellow-400 font-semibold">Held-Karp</span>
-                          <span className="block text-[10px] text-slate-600 font-normal mt-0.5">single vehicle · exact optimal</span>
+                          <span className="text-yellow-400 font-semibold">{results.solver?.baseline_label || 'Held-Karp'}</span>
+                          <span className="block text-[10px] text-slate-600 font-normal mt-0.5">single vehicle · {results.solver?.baseline_exact === false ? 'heuristic' : 'exact optimal'}</span>
                         </th>
                         {fleet && (
                           <th className="text-center px-5 py-3">
@@ -1676,7 +1683,7 @@ function RouteOptimizer() {
                     rel="noopener noreferrer"
                     className="flex items-center gap-2 px-4 py-2 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-500/25 text-yellow-400 rounded-lg transition-colors text-sm"
                   >
-                    <Navigation className="w-3.5 h-3.5" /> Held-Karp Route
+                    <Navigation className="w-3.5 h-3.5" /> {results.solver?.baseline_label || 'Held-Karp'} Route
                   </a>
                   {fleet && fleet.routes.map((route) => (
                     <a
